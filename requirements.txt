@@ -1,0 +1,22 @@
+# Agent framework
+langgraph
+langchain
+langchain-core
+
+# AWS
+boto3
+
+# Backend
+fastapi
+uvicorn
+python-dotenv
+pydantic
+
+# Database
+sqlalchemy
+psycopg2-binary
+pgvector
+
+# Document processing
+pypdf
+python-multipart
