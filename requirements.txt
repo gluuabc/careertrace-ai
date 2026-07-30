@@ -5,6 +5,7 @@ langchain-core
 
 # AWS
 boto3
+langchain-aws
 
 # Backend
 fastapi
