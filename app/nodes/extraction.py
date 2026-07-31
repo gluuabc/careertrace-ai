@@ -21,14 +21,17 @@ def extract_profile(state: ProfileState) -> dict[str, dict]:
         [
             SystemMessage(
                 content=(
-                    "Extract only facts explicitly supported by the resume. "
-                    "Do not guess missing details. Use empty lists or null values "
-                    "when the resume does not provide a field."
+                    "Extract only facts explicitly supported by the resume. Do not "
+                    "guess missing details. Separate each project into a title and "
+                    "description, and each experience into organization, role, and "
+                    "description. Use empty strings, empty lists, or null values when "
+                    "the resume does not provide a field. Career preferences usually "
+                    "cannot be inferred from a resume and should remain empty."
                 )
             ),
             HumanMessage(
                 content=(
-                    "Extract the candidate's education, school, major, "
+                    "Extract the candidate's name, email, education, school, major, "
                     "graduation_year, skills, projects, and experience from this "
                     f"resume:\n\n{state['resume_text']}"
                 )

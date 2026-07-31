@@ -144,15 +144,21 @@ Extract Resume Text
 LLM Extract Facts
  |
  v
-User Confirmation
+Validate Required Fields
  |
- +---- rejected ----> Edit Profile
- |
- v
-Save Confirmed Facts
+ +---- missing ----> Collect Missing Information
  |
  v
-Generate Career Profile
+Editable User Confirmation
+ |
+ v
+Save Profile to SQL
+ |
+ v
+Generate Career Analysis
+ |
+ v
+Save Career Analysis to SQL
  |
 END
 ```
@@ -161,9 +167,12 @@ The workflow currently supports:
 
 - PDF resume upload
 - Resume text extraction
-- LLM-based profile extraction
-- User confirmation
-- Career profile generation
+- Structured LLM-based profile extraction
+- Missing-information detection and collection
+- Editable human confirmation using LangGraph interrupts
+- Persistent SQLite profile storage
+- Career profile generation and analysis history
+- Streamlit profile viewing and editing
 
 Example generated information:
 
@@ -197,7 +206,14 @@ Store:
 Current storage:
 
 ```
-data/profile_memory.json
+SQLite
+ ├── users
+ ├── profiles
+ ├── career_preferences
+ ├── skills
+ ├── projects
+ ├── experience
+ └── career_analysis
 ```
 
 Future storage:
@@ -330,8 +346,17 @@ careertrace-ai/
 │   │   ├── resume.py
 │   │   ├── extraction.py
 │   │   ├── confirmation.py
+│   │   ├── validation.py
 │   │   ├── profile.py
 │   │   └── memory.py
+│   │
+│   ├── database/
+│   │   ├── database.py
+│   │   ├── models.py
+│   │   └── repository.py
+│   │
+│   ├── ui/
+│   │   └── app.py
 │   │
 │   ├── llm/
 │   │   └── model.py
@@ -340,8 +365,9 @@ careertrace-ai/
 │       └── schema.py
 │
 ├── data/
-│   └── profile_memory.json
+│   └── careertrace.db  # generated locally and ignored by Git
 │
+├── tests/
 ├── requirements.txt
 ├── README.md
 └── .gitignore
@@ -407,11 +433,32 @@ BEDROCK_MODEL_REASONING=<claude-model-id>
 LANGSMITH_TRACING=true
 LANGSMITH_API_KEY=<your-key>
 LANGSMITH_PROJECT=CareerTrace
+
+# Local SQL memory
+DATABASE_URL=sqlite:///data/careertrace.db
 ```
 
 ---
 
-# Running the Current Workflow
+# Running CareerTrace
+
+## Web interface
+
+Start the Streamlit application from the repository root:
+
+```bash
+streamlit run app/ui/app.py
+```
+
+The web interface provides:
+
+- PDF resume onboarding
+- Missing-field collection and final profile review
+- Database-backed profile viewing and editing
+- Career preferences
+- Stored career analysis and controlled regeneration
+
+## Command-line workflow
 
 Place a resume PDF in:
 
@@ -434,9 +481,28 @@ python -m app.main data/resume.pdf
 The workflow will:
 
 1. Extract resume information
-2. Ask for confirmation
-3. Generate a career profile
-4. Save memory
+2. Ask for required missing information
+3. Ask for final confirmation
+4. Save the profile to SQLite
+5. Generate and save career analysis
+
+---
+
+# SQL Memory Design
+
+Graph nodes and the UI access SQL through `app/database/repository.py`; they do
+not issue SQLite-specific queries. `DATABASE_URL` and engine creation are
+isolated in `app/database/database.py`.
+
+To migrate to CockroachDB later:
+
+1. Provision CockroachDB and set a Cockroach-compatible `DATABASE_URL`.
+2. Add Alembic migrations for the existing SQLAlchemy models.
+3. Replace SQLite table creation with migrations.
+4. Keep graph nodes, repository method contracts, and Streamlit views unchanged.
+
+Application-generated UUID keys and transaction-scoped profile writes are used
+to keep the schema portable to a distributed SQL deployment.
 
 ---
 
@@ -444,10 +510,10 @@ The workflow will:
 
 ## Current priority
 
-1. Complete profile memory
-2. Add Streamlit web interface
+1. Add authentication and multi-user authorization
+2. Add migration management with Alembic
 3. Build job search workflow
-4. Add CockroachDB memory layer
+4. Move the SQL repository to CockroachDB
 5. Add autonomous reasoning components
 
 ---

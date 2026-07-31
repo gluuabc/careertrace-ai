@@ -1,29 +1,35 @@
-import json
-from pathlib import Path
+from typing import Any
 
+from app.database import init_db, profile_repository
 from app.state.schema import ProfileState
 
-
-PROFILE_MEMORY_PATH = (
-    Path(__file__).resolve().parents[2] / "data" / "profile_memory.json"
-)
-
-
 def save_profile(state: ProfileState) -> dict[str, dict]:
-    """Deterministically persist confirmed facts to temporary JSON memory."""
+    """Deterministically persist one confirmed profile transactionally."""
 
     if not state.get("confirmed"):
         raise ValueError("Profile data must be confirmed before it can be saved.")
 
+    init_db()
     profile = state["extracted_profile"]
-    PROFILE_MEMORY_PATH.parent.mkdir(parents=True, exist_ok=True)
+    user_id = state.get("user_id")
+    if not user_id:
+        user = profile_repository.get_or_create_user(
+            name=profile.get("name") or "CareerTrace User",
+            email=profile.get("email"),
+        )
+        user_id = user["user_id"]
 
-    # Replace the file atomically so an interrupted write does not corrupt memory.
-    temporary_path = PROFILE_MEMORY_PATH.with_suffix(".json.tmp")
-    temporary_path.write_text(
-        json.dumps(profile, indent=2, ensure_ascii=False) + "\n",
-        encoding="utf-8",
+    saved_profile = profile_repository.upsert_profile(user_id, profile)
+    return {
+        "user_id": user_id,
+        "saved_profile": saved_profile,
+    }
+
+
+def save_career_analysis(state: ProfileState) -> dict[str, Any]:
+    """Persist generated analysis separately so analysis history is retained."""
+
+    analysis = profile_repository.save_analysis(
+        state["user_id"], state["career_profile"]
     )
-    temporary_path.replace(PROFILE_MEMORY_PATH)
-
-    return {"saved_profile": profile}
+    return {"analysis_id": analysis["analysis_id"]}
