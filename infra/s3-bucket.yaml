@@ -1,0 +1,51 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Private document bucket for CareerTrace resumes and portfolios.
+
+Parameters:
+  BucketName:
+    Type: String
+    Default: careertrace-resumes
+
+Resources:
+  CareerTraceDocumentsBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Ref BucketName
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  RequireTransportSecurity:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref CareerTraceDocumentsBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !Sub "${CareerTraceDocumentsBucket.Arn}"
+              - !Sub "${CareerTraceDocumentsBucket.Arn}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+
+Outputs:
+  BucketName:
+    Value: !Ref CareerTraceDocumentsBucket
+  BucketArn:
+    Value: !GetAtt CareerTraceDocumentsBucket.Arn

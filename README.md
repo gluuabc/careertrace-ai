@@ -135,7 +135,7 @@ Current LangGraph flow:
 START
  |
  v
-Upload Resume
+Store Original Resume in Private S3
  |
  v
 Extract Resume Text
@@ -165,14 +165,18 @@ END
 
 The workflow currently supports:
 
-- PDF resume upload
-- Resume text extraction
+- Google OpenID Connect login, a synthetic judge workspace, and UUID-backed
+  multi-user isolation
+- PDF and DOCX upload to private S3
+- PDF and DOCX text extraction
 - Structured LLM-based profile extraction
-- Missing-information detection and collection
+- Required school, major, graduation year, skills, and experience validation
 - Editable human confirmation using LangGraph interrupts
 - Persistent SQLite profile storage
-- Career profile generation and analysis history
+- Versioned career analysis with stale-result detection
+- No-op profile saves that do not create false versions or duplicate analyses
 - Streamlit profile viewing and editing
+- Per-user document upload, download, and deletion
 
 Example generated information:
 
@@ -213,7 +217,8 @@ SQLite
  ├── skills
  ├── projects
  ├── experience
- └── career_analysis
+ ├── career_analysis
+ └── documents
 ```
 
 Future storage:
@@ -354,9 +359,18 @@ careertrace-ai/
 │   │   ├── database.py
 │   │   ├── models.py
 │   │   └── repository.py
+│   ├── auth/
+│   │   ├── google_oauth.py
+│   │   └── session.py
+│   ├── services/
+│   │   ├── demo.py
+│   │   └── documents.py
+│   ├── storage/
+│   │   ├── base.py
+│   │   └── s3.py
 │   │
 │   ├── ui/
-│   │   └── app.py
+│   │   └── dashboard.py
 │   │
 │   ├── llm/
 │   │   └── model.py
@@ -364,8 +378,11 @@ careertrace-ai/
 │   └── state/
 │       └── schema.py
 │
-├── data/
-│   └── careertrace.db  # generated locally and ignored by Git
+├── migrations/
+├── infra/
+│   ├── s3-bucket.yaml
+│   └── application-s3-policy.json
+├── data/  # local runtime files are ignored by Git
 │
 ├── tests/
 ├── requirements.txt
@@ -436,7 +453,46 @@ LANGSMITH_PROJECT=CareerTrace
 
 # Local SQL memory
 DATABASE_URL=sqlite:///data/careertrace.db
+
+# Private S3 document storage
+S3_BUCKET_NAME=careertrace-resumes
+S3_REGION=us-east-1
+MAX_DOCUMENT_SIZE_MIB=10
+
+# Google OpenID Connect
+GOOGLE_CLIENT_ID=<google-client-id>
+GOOGLE_CLIENT_SECRET=<google-client-secret>
+AUTH_COOKIE_SECRET=<strong-random-cookie-signing-secret>
+OAUTH_REDIRECT_URI=http://localhost:8501/oauth2callback
 ```
+
+Register the exact `OAUTH_REDIRECT_URI` as an authorized redirect URI in the
+Google OAuth client. Generate a cookie secret with:
+
+```bash
+python -c "import secrets; print(secrets.token_urlsafe(48))"
+```
+
+Credentials stay server-side. Streamlit's native OIDC implementation validates
+authorization state and nonce; CareerTrace additionally validates the Google
+issuer, audience, authorized party, verified email, issue time, and expiration.
+
+## 5. Provision private S3 storage
+
+An AWS administrator with bucket-provisioning permissions can deploy the
+included retained, encrypted, public-access-blocked bucket:
+
+```bash
+aws cloudformation deploy \
+  --region us-east-1 \
+  --stack-name careertrace-document-storage \
+  --template-file infra/s3-bucket.yaml \
+  --parameter-overrides BucketName=careertrace-resumes
+```
+
+Attach `infra/application-s3-policy.json` to the application role or user. It
+allows only `PutObject`, `GetObject`, and `DeleteObject` beneath the bucket.
+The 10 MiB maximum is enforced before the backend sends a request to S3.
 
 ---
 
@@ -447,20 +503,45 @@ DATABASE_URL=sqlite:///data/careertrace.db
 Start the Streamlit application from the repository root:
 
 ```bash
-streamlit run app/ui/app.py
+streamlit run app/ui/dashboard.py
 ```
 
 The web interface provides:
 
-- PDF resume onboarding
+- Google login, judge-demo access, and logout
+- PDF/DOCX resume onboarding
 - Missing-field collection and final profile review
 - Database-backed profile viewing and editing
 - Career preferences
 - Stored career analysis and controlled regeneration
+- Private per-user document management
+
+## Judge Testing Instructions
+
+Use the deployed CareerTrace URL supplied with the hackathon submission. For a
+local review, the demo URL is `http://localhost:8501` after starting Streamlit.
+
+1. Open the demo URL and click **Enter Judge Demo**.
+2. No Google account or OAuth test-user allowlisting is required.
+3. Confirm the **Demo workspace — uses synthetic data** label is visible.
+4. Open **My Profile** to review and edit the seeded student profile, including
+   skills, projects, experience, and career preferences.
+5. Open **Career Analysis** to inspect the seeded analysis and exercise analysis
+   regeneration when Bedrock is configured.
+6. Use **Reset demo data** in the sidebar to restore the deterministic synthetic
+   profile and analysis, then use **Logout** to clear the active identity.
+
+Judge mode uses one fixed anonymous UUID marked as a demo account in SQL. It has
+no email, Google identity, credentials, or real personal information. The UI
+does not accept a user ID through URL parameters, and all profile and analysis
+operations use the identity returned by the authentication gate. Resume and
+document uploads are disabled in the shared judge workspace so it remains
+synthetic-only; normal Google-authenticated users retain the complete upload
+workflow and private, per-user S3 document storage.
 
 ## Command-line workflow
 
-Place a resume PDF in:
+The CLI also requires S3 configuration and accepts a PDF or DOCX:
 
 ```
 data/
@@ -475,7 +556,7 @@ data/resume.pdf
 Run:
 
 ```bash
-python -m app.main data/resume.pdf
+python -m app.main data/resume.pdf --name "Ada Student" --email ada@example.com
 ```
 
 The workflow will:
@@ -490,16 +571,17 @@ The workflow will:
 
 # SQL Memory Design
 
-Graph nodes and the UI access SQL through `app/database/repository.py`; they do
-not issue SQLite-specific queries. `DATABASE_URL` and engine creation are
-isolated in `app/database/database.py`.
+Graph nodes, authentication, document services, and the UI access SQL through
+`app/database/repository.py`; they do not issue SQLite-specific queries.
+`DATABASE_URL` and engine creation are isolated in `app/database/database.py`.
+Alembic migrations run on application startup.
 
 To migrate to CockroachDB later:
 
 1. Provision CockroachDB and set a Cockroach-compatible `DATABASE_URL`.
-2. Add Alembic migrations for the existing SQLAlchemy models.
-3. Replace SQLite table creation with migrations.
-4. Keep graph nodes, repository method contracts, and Streamlit views unchanged.
+2. Run the existing Alembic migrations against the CockroachDB URL.
+3. Review transaction retry behavior for CockroachDB serialization failures.
+4. Keep graph nodes, storage service contracts, and Streamlit views unchanged.
 
 Application-generated UUID keys and transaction-scoped profile writes are used
 to keep the schema portable to a distributed SQL deployment.
@@ -510,11 +592,11 @@ to keep the schema portable to a distributed SQL deployment.
 
 ## Current priority
 
-1. Add authentication and multi-user authorization
-2. Add migration management with Alembic
-3. Build job search workflow
-4. Move the SQL repository to CockroachDB
-5. Add autonomous reasoning components
+1. Add application/job tracking tables
+2. Build job search workflow
+3. Move the SQL repository to CockroachDB
+4. Add vector retrieval
+5. Add bounded autonomous reasoning components
 
 ---
 
@@ -525,4 +607,4 @@ to keep the schema portable to a distributed SQL deployment.
 - **LangSmith** — tracing and debugging
 - **CockroachDB** — persistent memory (planned)
 - **Vector Search** — semantic retrieval (planned)
-- **Streamlit** — web interface (planned)
+- **Streamlit** — authenticated web interface

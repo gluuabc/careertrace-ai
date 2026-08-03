@@ -13,3 +13,14 @@ __pycache__/
 
 # IDE
 .vscode/
+
+
+# Local AI agent skills
+.agents/
+
+# Local database
+data/*.db
+
+# Uploaded user files
+*.pdf
+uploads/

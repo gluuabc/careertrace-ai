@@ -1,4 +1,5 @@
 import os
+import threading
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
@@ -12,6 +13,7 @@ load_dotenv()
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_DATABASE_URL = f"sqlite:///{PROJECT_ROOT / 'data' / 'careertrace.db'}"
+_migration_lock = threading.Lock()
 
 
 class Base(DeclarativeBase):
@@ -56,11 +58,24 @@ SessionLocal = create_session_factory(engine)
 
 
 def init_db(target_engine: Engine | None = None) -> None:
-    """Create prototype tables. Alembic migrations can replace this later."""
+    """Create test schemas directly or migrate the configured runtime database."""
 
     from app.database import models  # noqa: F401
 
-    Base.metadata.create_all(bind=target_engine or engine)
+    if target_engine is not None:
+        Base.metadata.create_all(bind=target_engine)
+        return
+
+    from alembic import command
+    from alembic.config import Config
+
+    with _migration_lock:
+        config = Config(str(PROJECT_ROOT / "alembic.ini"))
+        config.set_main_option("script_location", str(PROJECT_ROOT / "migrations"))
+        config.set_main_option(
+            "sqlalchemy.url", os.getenv("DATABASE_URL", DEFAULT_DATABASE_URL)
+        )
+        command.upgrade(config, "head")
 
 
 @contextmanager

@@ -10,15 +10,18 @@ langchain-aws
 # Backend
 fastapi
 uvicorn
-streamlit
+streamlit>=1.60,<2
+Authlib>=1.3.2
 python-dotenv
 pydantic
 
 # Database
 sqlalchemy
+alembic
 psycopg2-binary
 pgvector
 
 # Document processing
 pypdf
+python-docx
 python-multipart
