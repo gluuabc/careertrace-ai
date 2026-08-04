@@ -2,7 +2,6 @@ import unittest
 
 from app.auth.google_oauth import InvalidGoogleIdentity, validate_google_claims
 from app.auth.session import clear_auth_state, set_active_identity
-from app.services.demo import DEMO_USER_ID
 
 
 class GoogleOAuthTests(unittest.TestCase):
@@ -58,23 +57,23 @@ class AuthenticationSessionTests(unittest.TestCase):
         self.assertEqual(state["auth_mode"], "google")
         self.assertNotIn("workflow_result", state)
 
-    def test_judge_mode_accepts_only_the_fixed_demo_identity(self):
+    def test_judge_mode_accepts_only_an_isolated_demo_identity(self):
         state = {}
         demo_user = {
-            "user_id": DEMO_USER_ID,
-            "name": "CareerTrace Demo Student",
+            "user_id": "demo-session-user-id",
+            "name": "Judge Demo",
             "email": None,
             "is_demo": True,
         }
 
         set_active_identity(state, demo_user, "judge")
 
-        self.assertEqual(state["current_user_id"], DEMO_USER_ID)
+        self.assertEqual(state["current_user_id"], "demo-session-user-id")
         self.assertTrue(state["is_demo"])
-        with self.assertRaisesRegex(ValueError, "fixed synthetic demo"):
+        with self.assertRaisesRegex(ValueError, "isolated demo"):
             set_active_identity(
                 {},
-                {**demo_user, "user_id": "another-user-id"},
+                {**demo_user, "is_demo": False},
                 "judge",
             )
 
@@ -83,7 +82,7 @@ class AuthenticationSessionTests(unittest.TestCase):
             set_active_identity(
                 {},
                 {
-                    "user_id": DEMO_USER_ID,
+                    "user_id": "demo-session-user-id",
                     "name": "CareerTrace Demo Student",
                     "email": None,
                     "is_demo": True,
@@ -95,8 +94,8 @@ class AuthenticationSessionTests(unittest.TestCase):
         state = {
             "authenticated": True,
             "auth_mode": "judge",
-            "current_user_id": DEMO_USER_ID,
-            "user_name": "CareerTrace Demo Student",
+            "current_user_id": "demo-session-user-id",
+            "user_name": "Judge Demo",
             "workflow_result": {"profile": {}},
             "edit_major": "Computer Science",
             "unrelated_preference": "kept",

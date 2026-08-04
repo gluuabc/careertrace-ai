@@ -135,10 +135,10 @@ Current LangGraph flow:
 START
  |
  v
-Store Original Resume in Private S3
+Store Original Documents in Private S3
  |
  v
-Extract Resume Text
+Extract and Combine Document Text
  |
  v
 LLM Extract Facts
@@ -165,15 +165,20 @@ END
 
 The workflow currently supports:
 
-- Google OpenID Connect login, a synthetic judge workspace, and UUID-backed
+- Google OpenID Connect login, per-session judge users, and UUID-backed
   multi-user isolation
-- PDF and DOCX upload to private S3
-- PDF and DOCX text extraction
+- Multi-document PDF and DOCX upload to private S3
+- Resume, portfolio, transcript, certificate, and other document classification
+- Combined extraction merged with the current confirmed SQL profile
 - Structured LLM-based profile extraction
 - Required school, major, graduation year, skills, and experience validation
 - Editable human confirmation using LangGraph interrupts
-- Persistent SQLite profile storage
-- Versioned career analysis with stale-result detection
+- Persistent SQLite profile, analysis, document, and conversation storage
+- Durable SQLite LangGraph checkpoints for interrupted workflow recovery
+- Immutable profile and career-analysis versions with pointer-only rollback
+- Profile-version links to multiple source documents
+- Approved flexible memories separated from pending memory candidates
+- SQL-backed Career Assistant conversation history without automatic profile edits
 - No-op profile saves that do not create false versions or duplicate analyses
 - Streamlit profile viewing and editing
 - Per-user document upload, download, and deletion
@@ -190,24 +195,9 @@ Example generated information:
 
 ---
 
-# Planned Development
+# Persistence Foundation
 
-## Phase 1: Profile Memory
-
-Improve profile storage:
-
-Store:
-
-- Education
-- Skills
-- Projects
-- Experience
-- Career strengths
-- Recommended roles
-- Skill recommendations
-
-
-Current storage:
+Current local SQL storage:
 
 ```
 SQLite
@@ -218,10 +208,17 @@ SQLite
  ├── projects
  ├── experience
  ├── career_analysis
- └── documents
+ ├── career_analysis_versions
+ ├── profile_versions
+ ├── profile_document_sources
+ ├── documents
+ ├── memory_candidates
+ ├── memories
+ ├── conversations
+ └── messages
 ```
 
-Future storage:
+Planned production storage:
 
 ```
 CockroachDB
@@ -231,7 +228,9 @@ CockroachDB
 
 ---
 
-## Phase 2: Job Search Agent
+# Planned Development
+
+## Job Search Agent
 
 Flow:
 
@@ -256,7 +255,7 @@ Save Candidates
 
 ---
 
-## Phase 3: Alumni Networking Agent
+## Alumni Networking Agent
 
 Flow:
 
@@ -345,6 +344,7 @@ careertrace-ai/
 │   ├── main.py
 │   │
 │   ├── graph/
+│   │   ├── checkpoint.py
 │   │   └── profile_graph.py
 │   │
 │   ├── nodes/
@@ -363,7 +363,7 @@ careertrace-ai/
 │   │   ├── google_oauth.py
 │   │   └── session.py
 │   ├── services/
-│   │   ├── demo.py
+│   │   ├── career_assistant.py
 │   │   └── documents.py
 │   ├── storage/
 │   │   ├── base.py
@@ -379,6 +379,9 @@ careertrace-ai/
 │       └── schema.py
 │
 ├── migrations/
+├── demo/
+│   ├── Demo_Resume.pdf
+│   └── Demo_Portfolio.pdf
 ├── infra/
 │   ├── s3-bucket.yaml
 │   └── application-s3-policy.json
@@ -453,6 +456,7 @@ LANGSMITH_PROJECT=CareerTrace
 
 # Local SQL memory
 DATABASE_URL=sqlite:///data/careertrace.db
+LANGGRAPH_CHECKPOINT_DB=data/langgraph_checkpoints.sqlite
 
 # Private S3 document storage
 S3_BUCKET_NAME=careertrace-resumes
@@ -509,35 +513,45 @@ streamlit run app/ui/dashboard.py
 The web interface provides:
 
 - Google login, judge-demo access, and logout
-- PDF/DOCX resume onboarding
+- Multi-document PDF/DOCX onboarding
 - Missing-field collection and final profile review
 - Database-backed profile viewing and editing
 - Career preferences
 - Stored career analysis and controlled regeneration
 - Private per-user document management
+- Profile and analysis history with rollback
+- Approved-memory review and persistent Career Assistant conversations
 
 ## Judge Testing Instructions
 
 Use the deployed CareerTrace URL supplied with the hackathon submission. For a
 local review, the demo URL is `http://localhost:8501` after starting Streamlit.
 
-1. Open the demo URL and click **Enter Judge Demo**.
+1. Open the demo URL and click **Try Judge Demo**.
 2. No Google account or OAuth test-user allowlisting is required.
 3. Confirm the **Demo workspace — uses synthetic data** label is visible.
-4. Open **My Profile** to review and edit the seeded student profile, including
-   skills, projects, experience, and career preferences.
-5. Open **Career Analysis** to inspect the seeded analysis and exercise analysis
-   regeneration when Bedrock is configured.
-6. Use **Reset demo data** in the sidebar to restore the deterministic synthetic
-   profile and analysis, then use **Logout** to clear the active identity.
+4. Download `Demo_Resume.pdf` and `Demo_Portfolio.pdf` from the Document Upload
+   page.
+5. Upload both files together, select their document types, and click
+   **Analyze documents**.
+6. Complete required-field collection and review the merged profile before
+   selecting **Confirm and save**.
+7. Explore **My Profile**, **Career Analysis**, **Documents**, **Memory**, and
+   **Career Assistant**.
+8. Use **Logout** to clear the active browser identity.
 
-Judge mode uses one fixed anonymous UUID marked as a demo account in SQL. It has
-no email, Google identity, credentials, or real personal information. The UI
-does not accept a user ID through URL parameters, and all profile and analysis
-operations use the identity returned by the authentication gate. Resume and
-document uploads are disabled in the shared judge workspace so it remains
-synthetic-only; normal Google-authenticated users retain the complete upload
-workflow and private, per-user S3 document storage.
+Each judge browser session creates a new ordinary UUID-backed `users` row marked
+as a demo identity. It starts without a profile or analysis and uses the same S3,
+LangGraph, validation, confirmation, SQL repository, versioning, and Bedrock
+paths as a Google-authenticated user. The repository contains no demo credentials
+or hard-coded analysis. The supplied documents are wholly synthetic and contain
+no real personal information.
+
+The committed demo PDFs can be reproduced with:
+
+```bash
+python scripts/generate_demo_documents.py
+```
 
 ## Command-line workflow
 
@@ -575,6 +589,19 @@ Graph nodes, authentication, document services, and the UI access SQL through
 `app/database/repository.py`; they do not issue SQLite-specific queries.
 `DATABASE_URL` and engine creation are isolated in `app/database/database.py`.
 Alembic migrations run on application startup.
+
+Relative SQLite paths are resolved against the repository root, so launching
+Streamlit from another directory does not silently open a different database.
+Completed user memory is always read from SQL. `LANGGRAPH_CHECKPOINT_DB` is a
+separate SQLite file used only to resume interrupted LangGraph workflows.
+
+Profile facts are written to immutable `profile_versions` JSON snapshots.
+`profiles.current_version_id` selects the active snapshot, and
+`profile_document_sources` records all supporting documents. Career analysis
+uses the equivalent `career_analysis.current_version_id` pointer and immutable
+`career_analysis_versions` linked to the profile version that produced them.
+Rollback changes a pointer only; the next edit receives the next unused version
+number.
 
 To migrate to CockroachDB later:
 

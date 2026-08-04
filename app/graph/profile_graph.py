@@ -1,6 +1,6 @@
-from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 
+from app.graph.checkpoint import get_default_checkpointer
 from app.nodes.confirmation import confirm_profile
 from app.nodes.documents import store_document
 from app.nodes.extraction import extract_profile
@@ -84,7 +84,11 @@ def build_profile_graph(checkpointer=None):
     workflow.add_edge("generate_profile", "save_career_analysis")
     workflow.add_edge("save_career_analysis", END)
 
-    return workflow.compile(checkpointer=checkpointer or MemorySaver())
+    return workflow.compile(
+        checkpointer=(
+            checkpointer if checkpointer is not None else get_default_checkpointer()
+        )
+    )
 
 
 profile_graph = build_profile_graph()

@@ -25,25 +25,53 @@ def _extract_docx(path: Path) -> str:
     )
 
 
-def extract_resume(state: ProfileState) -> dict[str, str]:
-    """Deterministically extract text from a validated PDF or DOCX."""
+def _extract_path(path: Path) -> str:
+    """Extract one supported career document without using an LLM."""
 
-    resume_path = Path(state["resume_path"]).expanduser()
-
-    if not resume_path.is_file():
-        raise FileNotFoundError(f"Resume PDF was not found: {resume_path}")
-    extension = resume_path.suffix.lower()
+    if not path.is_file():
+        raise FileNotFoundError(f"Career document was not found: {path}")
+    extension = path.suffix.lower()
     if extension == ".pdf":
-        resume_text = _extract_pdf(resume_path)
+        text = _extract_pdf(path)
     elif extension == ".docx":
-        resume_text = _extract_docx(resume_path)
+        text = _extract_docx(path)
     else:
-        raise ValueError(f"Resume must be a PDF or DOCX file: {resume_path}")
+        raise ValueError(f"Document must be a PDF or DOCX file: {path}")
 
-    if not resume_text:
+    if not text:
         raise ValueError(
-            "No text could be extracted from the resume. "
+            "No text could be extracted from the document. "
             "The document may contain scanned images and require OCR."
         )
+    return text
 
-    return {"resume_text": resume_text}
+
+def extract_resume(state: ProfileState) -> dict[str, str | list[dict[str, str]]]:
+    """Deterministically extract and label one or more career documents."""
+
+    pending = state.get("documents") or [
+        {
+            "path": state["resume_path"],
+            "original_filename": state.get("original_filename"),
+            "document_type": state.get("document_type") or "resume",
+        }
+    ]
+    extracted: list[dict[str, str]] = []
+    sections: list[str] = []
+    for item in pending:
+        path = Path(item["path"]).expanduser()
+        text = _extract_path(path)
+        filename = item.get("original_filename") or path.name
+        document_type = item.get("document_type") or "other"
+        extracted.append(
+            {
+                "filename": filename,
+                "document_type": document_type,
+                "text": text,
+            }
+        )
+        sections.append(
+            f"DOCUMENT: {filename}\nTYPE: {document_type}\nCONTENT:\n{text}"
+        )
+
+    return {"resume_text": "\n\n---\n\n".join(sections), "document_texts": extracted}

@@ -7,6 +7,7 @@ __pycache__/
 
 # Environment variables
 .env
+.streamlit/secrets.toml
 
 # OS files
 .DS_Store
@@ -14,12 +15,18 @@ __pycache__/
 # IDE
 .vscode/
 
-
 # Local AI agent skills
 .agents/
 
-# Local database
+# Local runtime data and uploads
 data/*.db
+data/*.db-*
+data/*.sqlite
+data/*.sqlite3
+data/langgraph_checkpoints.sqlite*
+data/*.pdf
+data/*.docx
+data/profile_memory.json
 
 # Uploaded user files
 *.pdf

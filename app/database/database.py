@@ -6,6 +6,7 @@ from typing import Iterator
 
 from dotenv import load_dotenv
 from sqlalchemy import Engine, create_engine, event
+from sqlalchemy.engine import make_url
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
@@ -20,10 +21,28 @@ class Base(DeclarativeBase):
     """Base class shared by all SQLAlchemy models."""
 
 
+def resolve_database_url(database_url: str | None = None) -> str:
+    """Resolve relative SQLite files against the repository, not process CWD."""
+
+    raw_url = database_url or os.getenv("DATABASE_URL", DEFAULT_DATABASE_URL)
+    parsed = make_url(raw_url)
+    if parsed.drivername.startswith("sqlite") and parsed.database not in {
+        None,
+        "",
+        ":memory:",
+    }:
+        database_path = Path(parsed.database).expanduser()
+        if not database_path.is_absolute():
+            database_path = (PROJECT_ROOT / database_path).resolve()
+        database_path.parent.mkdir(parents=True, exist_ok=True)
+        return str(parsed.set(database=str(database_path)))
+    return raw_url
+
+
 def create_database_engine(database_url: str | None = None) -> Engine:
     """Create a portable engine with SQLite behavior isolated here."""
 
-    url = database_url or os.getenv("DATABASE_URL", DEFAULT_DATABASE_URL)
+    url = resolve_database_url(database_url)
     options: dict = {"future": True}
 
     if url.startswith("sqlite"):
@@ -73,7 +92,7 @@ def init_db(target_engine: Engine | None = None) -> None:
         config = Config(str(PROJECT_ROOT / "alembic.ini"))
         config.set_main_option("script_location", str(PROJECT_ROOT / "migrations"))
         config.set_main_option(
-            "sqlalchemy.url", os.getenv("DATABASE_URL", DEFAULT_DATABASE_URL)
+            "sqlalchemy.url", resolve_database_url()
         )
         command.upgrade(config, "head")
 

@@ -1,4 +1,4 @@
-"""Mark fixed synthetic judge-demo users.
+"""Mark judge-demo users without creating separate account tables.
 
 Revision ID: 20260803_03
 Revises: 20260731_02

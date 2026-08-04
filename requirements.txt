@@ -1,5 +1,6 @@
 # Agent framework
 langgraph
+langgraph-checkpoint-sqlite>=3,<4
 langchain
 langchain-core
 
@@ -23,5 +24,6 @@ pgvector
 
 # Document processing
 pypdf
+reportlab
 python-docx
 python-multipart

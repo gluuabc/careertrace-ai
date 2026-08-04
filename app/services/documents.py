@@ -19,7 +19,13 @@ ALLOWED_DOCUMENTS = {
     ".pdf": PDF_MIME,
     ".docx": DOCX_MIME,
 }
-ALLOWED_DOCUMENT_TYPES = {"resume", "portfolio"}
+ALLOWED_DOCUMENT_TYPES = {
+    "resume",
+    "portfolio",
+    "transcript",
+    "certificate",
+    "other",
+}
 HARD_MAX_DOCUMENT_SIZE_MIB = 10
 
 
@@ -118,7 +124,7 @@ class DocumentService:
     ) -> dict[str, Any]:
         if document_type not in ALLOWED_DOCUMENT_TYPES:
             raise DocumentValidationError(
-                "Document type must be either resume or portfolio."
+                "Unsupported career document type."
             )
         validated = validate_document(
             filename=filename,

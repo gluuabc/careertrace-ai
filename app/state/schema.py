@@ -38,6 +38,9 @@ class ProfileFacts(BaseModel):
     major: str | None = None
     graduation_year: int | None = None
     skills: list[str] = Field(default_factory=list)
+    courses: list[str] = Field(default_factory=list)
+    achievements: list[str] = Field(default_factory=list)
+    certifications: list[str] = Field(default_factory=list)
     projects: list[ProjectFact] = Field(default_factory=list)
     experience: list[ExperienceFact] = Field(default_factory=list)
     career_goal: str | None = None
@@ -67,6 +70,9 @@ class ProfileFacts(BaseModel):
     @field_validator(
         "education",
         "skills",
+        "courses",
+        "achievements",
+        "certifications",
         "target_roles",
         "preferred_locations",
         "employment_types",
@@ -93,6 +99,10 @@ class ProfileState(TypedDict, total=False):
     """Shared state for the controlled profile-onboarding workflow."""
 
     resume_path: str
+    documents: list[dict[str, Any]]
+    stored_documents: list[dict[str, Any]]
+    document_texts: list[dict[str, str]]
+    document_ids: list[str]
     original_filename: str
     content_type: str
     document_type: str
@@ -100,6 +110,7 @@ class ProfileState(TypedDict, total=False):
     s3_key: str
     resume_text: str
     extracted_profile: dict[str, Any]
+    existing_profile: dict[str, Any]
     missing_fields: list[str]
     validation_errors: list[str]
     profile_updates: dict[str, Any]

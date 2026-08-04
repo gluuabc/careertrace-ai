@@ -4,12 +4,13 @@ from logging.config import fileConfig
 from alembic import context
 from sqlalchemy import engine_from_config, pool
 
-from app.database.database import Base
+from app.database.database import Base, resolve_database_url
 from app.database import models  # noqa: F401
 
 config = context.config
-if database_url := os.getenv("DATABASE_URL"):
-    config.set_main_option("sqlalchemy.url", database_url)
+config.set_main_option(
+    "sqlalchemy.url", resolve_database_url(os.getenv("DATABASE_URL"))
+)
 if config.config_file_name:
     fileConfig(config.config_file_name)
 

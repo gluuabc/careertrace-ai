@@ -19,7 +19,12 @@ def save_profile(state: ProfileState) -> dict[str, dict]:
         )
         user_id = user["user_id"]
 
-    saved_profile = profile_repository.upsert_profile(user_id, profile)
+    document_ids = state.get("document_ids") or []
+    if state.get("document_id"):
+        document_ids = [*document_ids, state["document_id"]]
+    saved_profile = profile_repository.upsert_profile(
+        user_id, profile, document_ids=document_ids
+    )
     return {
         "user_id": user_id,
         "saved_profile": saved_profile,

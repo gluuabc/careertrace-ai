@@ -1,6 +1,7 @@
 import unittest
 
 from app.nodes.validation import find_profile_issues, merge_profile_updates
+from app.nodes.extraction import merge_candidate_profile
 
 
 class ProfileValidationTests(unittest.TestCase):
@@ -52,6 +53,27 @@ class ProfileValidationTests(unittest.TestCase):
         self.assertEqual(
             merged["experience"][0]["organization"], "Example Lab"
         )
+
+    def test_new_document_facts_merge_with_existing_confirmed_profile(self):
+        existing = {
+            "school": "Example University",
+            "major": "Computer Science",
+            "graduation_year": 2028,
+            "skills": ["Python", "Java"],
+            "projects": [],
+            "experience": [{"role": "Intern"}],
+        }
+        candidate = {
+            "skills": ["React", "LangGraph"],
+            "projects": [{"title": "Portfolio Project"}],
+        }
+
+        merged = merge_candidate_profile(existing, candidate)
+
+        self.assertEqual(
+            merged["skills"], ["Python", "Java", "React", "LangGraph"]
+        )
+        self.assertEqual(merged["school"], "Example University")
 
 
 if __name__ == "__main__":

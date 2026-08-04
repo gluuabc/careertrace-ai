@@ -10,11 +10,6 @@ from app.auth.google_oauth import (
     validate_google_claims,
 )
 from app.database.repository import ProfileRepository, profile_repository
-from app.services.demo import (
-    DEMO_USER_ID,
-    get_or_seed_demo_user,
-    reset_demo_data,
-)
 
 AUTH_SESSION_KEYS = (
     "authenticated",
@@ -23,14 +18,25 @@ AUTH_SESSION_KEYS = (
     "user_email",
     "user_name",
     "is_demo",
-    "demo_reset_notice",
 )
 USER_WORKSPACE_KEYS = (
     "workflow_result",
     "workflow_thread_id",
     "selected_user_id",
+    "active_conversation_id",
+    "conversation_selector",
 )
-USER_WIDGET_PREFIXES = ("edit_", "confirm_", "cancel_", "missing_fields_")
+USER_WIDGET_PREFIXES = (
+    "edit_",
+    "confirm_",
+    "cancel_",
+    "missing_fields_",
+    "onboarding_type_",
+    "document_",
+    "rollback_",
+    "accept_memory_",
+    "reject_memory_",
+)
 
 
 def clear_auth_state(state: MutableMapping[str, Any]) -> None:
@@ -52,10 +58,8 @@ def set_active_identity(
 
     if mode not in {"google", "judge"}:
         raise ValueError("Authentication mode must be google or judge.")
-    if mode == "judge" and (
-        user.get("user_id") != DEMO_USER_ID or user.get("is_demo") is not True
-    ):
-        raise ValueError("Judge mode requires the fixed synthetic demo user.")
+    if mode == "judge" and user.get("is_demo") is not True:
+        raise ValueError("Judge mode requires an isolated demo user.")
     if mode == "google" and user.get("is_demo") is True:
         raise ValueError("Google authentication cannot assume the demo identity.")
 
@@ -84,18 +88,6 @@ def _render_account_sidebar(
         else:
             st.caption("Anonymous judge workspace")
 
-        if mode == "judge" and st.button(
-            "Reset demo data", icon=":material/restart_alt:"
-        ):
-            reset_user = reset_demo_data(repository)
-            clear_auth_state(st.session_state)
-            set_active_identity(st.session_state, reset_user, "judge")
-            st.session_state.demo_reset_notice = True
-            st.rerun()
-
-        if st.session_state.pop("demo_reset_notice", False):
-            st.success("Demo data restored to the synthetic seed.")
-
         if st.button("Logout", icon=":material/logout:"):
             clear_auth_state(st.session_state)
             if mode == "google":
@@ -121,8 +113,8 @@ def _render_login_page(
     if google_error:
         st.caption(f"Google sign-in is unavailable: {google_error}")
 
-    if st.button("Enter Judge Demo", icon=":material/science:"):
-        demo_user = get_or_seed_demo_user(repository)
+    if st.button("Try Judge Demo", icon=":material/science:"):
+        demo_user = repository.create_demo_user()
         clear_auth_state(st.session_state)
         set_active_identity(st.session_state, demo_user, "judge")
         st.rerun()
@@ -164,9 +156,13 @@ def require_authenticated_user(
 
     if st.session_state.get("auth_mode") == "judge":
         try:
-            user = repository.get_demo_user(DEMO_USER_ID)
+            user = repository.get_demo_user(
+                str(st.session_state.get("current_user_id") or "")
+            )
         except ValueError:
-            user = get_or_seed_demo_user(repository)
+            clear_auth_state(st.session_state)
+            _render_login_page(repository, google_client_id, google_error)
+            return None
         set_active_identity(st.session_state, user, "judge")
         _render_account_sidebar(user, "judge", repository)
         return user

@@ -6,11 +6,16 @@ from app.database.database import (
     init_db,
 )
 from app.database.repository import ProfileRepository
-from app.services.demo import (
-    DEMO_PROFILE,
-    DEMO_USER_ID,
-    reset_demo_data,
-)
+
+
+def _profile(major: str) -> dict:
+    return {
+        "school": "Northstar Institute of Technology",
+        "major": major,
+        "graduation_year": 2028,
+        "skills": ["Python"],
+        "experience": [{"role": "Student Research Assistant"}],
+    }
 
 
 class JudgeDemoTests(unittest.TestCase):
@@ -22,73 +27,56 @@ class JudgeDemoTests(unittest.TestCase):
     def tearDown(self):
         self.engine.dispose()
 
-    def test_judge_mode_loads_fixed_synthetic_demo_user(self):
-        user = reset_demo_data(self.repository)
-        profile = self.repository.get_profile(DEMO_USER_ID)
-        analysis = self.repository.get_latest_analysis(DEMO_USER_ID)
+    def test_each_judge_session_gets_a_distinct_empty_uuid_user(self):
+        first = self.repository.create_demo_user()
+        second = self.repository.create_demo_user()
 
-        self.assertEqual(user["user_id"], DEMO_USER_ID)
-        self.assertTrue(user["is_demo"])
-        self.assertIsNone(user["email"])
-        self.assertEqual(profile["school"], DEMO_PROFILE["school"])
-        self.assertTrue(profile["skills"])
-        self.assertIsNotNone(analysis)
+        self.assertNotEqual(first["user_id"], second["user_id"])
+        self.assertTrue(first["is_demo"])
+        self.assertIsNone(self.repository.get_profile(first["user_id"]))
+        self.assertIsNone(self.repository.get_latest_analysis(first["user_id"]))
 
-    def test_judge_identity_cannot_be_resolved_as_another_user(self):
-        reset_demo_data(self.repository)
-        real_user = self.repository.get_or_create_user(
-            "Real Student", "real@example.com"
+        shared_synthetic_identity = {
+            **_profile("Computer Science"),
+            "name": "Maya Chen",
+            "email": "maya.chen.demo@example.com",
+        }
+        self.repository.upsert_profile(first["user_id"], shared_synthetic_identity)
+        self.repository.upsert_profile(second["user_id"], shared_synthetic_identity)
+        self.assertIsNone(self.repository.get_user(first["user_id"])["email"])
+        self.assertEqual(
+            self.repository.get_profile(first["user_id"])["email"],
+            "maya.chen.demo@example.com",
         )
-        self.repository.upsert_profile(
-            real_user["user_id"],
+
+    def test_judge_uses_normal_profile_and_analysis_repository_workflow(self):
+        judge = self.repository.create_demo_user()
+        saved = self.repository.upsert_profile(judge["user_id"], _profile("CS"))
+        analysis = self.repository.save_analysis(
+            judge["user_id"],
             {
-                "school": "Real University",
-                "major": "History",
-                "graduation_year": 2027,
-                "skills": ["Research"],
-                "experience": [{"role": "Tutor"}],
+                "strengths": ["Python"],
+                "possible_roles": ["Engineer"],
+                "recommended_next_skills": ["MLOps"],
             },
         )
 
-        demo_user = self.repository.get_demo_user(DEMO_USER_ID)
-        demo_profile = self.repository.get_profile(demo_user["user_id"])
+        self.assertEqual(saved["profile_version"], 1)
+        self.assertEqual(analysis["profile_version_used"], 1)
+        self.assertEqual(
+            self.repository.get_profile(judge["user_id"])["major"], "CS"
+        )
 
-        self.assertEqual(demo_profile["school"], DEMO_PROFILE["school"])
-        self.assertNotEqual(demo_profile["school"], "Real University")
+    def test_judge_cannot_resolve_another_user_as_its_demo_identity(self):
+        judge = self.repository.create_demo_user()
+        other = self.repository.get_or_create_user("Real", "real@example.com")
+
+        self.assertEqual(
+            self.repository.get_demo_user(judge["user_id"])["user_id"],
+            judge["user_id"],
+        )
         with self.assertRaisesRegex(ValueError, "not available"):
-            self.repository.get_demo_user(real_user["user_id"])
-
-    def test_reset_restores_seeded_profile_analysis_and_empty_documents(self):
-        reset_demo_data(self.repository)
-        changed = {**DEMO_PROFILE, "major": "Changed Major", "skills": ["Changed"]}
-        self.repository.upsert_profile(DEMO_USER_ID, changed)
-        self.repository.save_analysis(
-            DEMO_USER_ID,
-            {
-                "strengths": ["Changed"],
-                "possible_roles": ["Changed"],
-                "recommended_next_skills": ["Changed"],
-            },
-        )
-        self.repository.create_document(
-            document_id="demo-document",
-            user_id=DEMO_USER_ID,
-            filename="synthetic.pdf",
-            s3_key=f"{DEMO_USER_ID}/demo-document/synthetic.pdf",
-            document_type="resume",
-            content_type="application/pdf",
-            size_bytes=10,
-        )
-
-        reset_demo_data(self.repository)
-        restored = self.repository.get_profile(DEMO_USER_ID)
-        analysis = self.repository.get_latest_analysis(DEMO_USER_ID)
-
-        self.assertEqual(restored["major"], DEMO_PROFILE["major"])
-        self.assertEqual(restored["skills"], DEMO_PROFILE["skills"])
-        self.assertEqual(restored["profile_version"], 1)
-        self.assertNotEqual(analysis["strengths"], ["Changed"])
-        self.assertEqual(self.repository.list_documents(DEMO_USER_ID), [])
+            self.repository.get_demo_user(other["user_id"])
 
 
 if __name__ == "__main__":

@@ -11,7 +11,6 @@ if str(ROOT) not in sys.path:
 import tempfile
 import os
 from typing import Any
-from uuid import uuid4
 
 import streamlit as st
 
@@ -22,7 +21,7 @@ from app.database import init_db, profile_repository
 from app.graph.profile_graph import profile_graph
 from app.nodes.profile import generate_profile
 from app.nodes.validation import find_profile_issues
-from app.services import document_service
+from app.services import document_service, respond_to_user
 
 
 def _comma_list(value: str) -> list[str]:
@@ -110,7 +109,7 @@ def _profile_form(
     left, right = st.columns(2)
     with left:
         name = st.text_input(
-            "Name (Google account)" if identity_locked else "Name (optional)",
+            "Account name" if identity_locked else "Name (optional)",
             value=profile.get("name") or "",
             key=f"{key_prefix}_name",
             disabled=identity_locked,
@@ -139,7 +138,7 @@ def _profile_form(
         )
     with right:
         email = st.text_input(
-            "Email (Google account)" if identity_locked else "Email (optional)",
+            "Account email" if identity_locked else "Email (optional)",
             value=profile.get("email") or "",
             key=f"{key_prefix}_email",
             disabled=identity_locked,
@@ -170,6 +169,21 @@ def _profile_form(
     )
     if show_required and not _comma_list(skills):
         st.caption(":red[At least one skill is required.]")
+    courses = st.text_input(
+        "Courses (optional, comma-separated)",
+        value=", ".join(profile.get("courses") or []),
+        key=f"{key_prefix}_courses",
+    )
+    certifications = st.text_input(
+        "Certifications (optional, comma-separated)",
+        value=", ".join(profile.get("certifications") or []),
+        key=f"{key_prefix}_certifications",
+    )
+    achievements = st.text_area(
+        "Achievements (optional, one per line)",
+        value="\n".join(profile.get("achievements") or []),
+        key=f"{key_prefix}_achievements",
+    )
     projects = st.text_area(
         "Projects (optional) — one per line: title | description",
         value=_projects_to_text(profile.get("projects") or []),
@@ -217,6 +231,9 @@ def _profile_form(
         "graduation_year": int(graduation_year),
         "career_goal": career_goal.strip() or None,
         "skills": _comma_list(skills),
+        "courses": _comma_list(courses),
+        "achievements": _line_list(achievements),
+        "certifications": _comma_list(certifications),
         "projects": _projects_from_text(projects),
         "experience": _experience_from_text(experience),
         "target_roles": _comma_list(target_roles),
@@ -235,6 +252,27 @@ def _resume_graph(command: Any, thread_id: str) -> dict[str, Any]:
         )
     st.session_state.workflow_result = result
     return result
+
+
+def _workflow_thread_id(user_id: str) -> str:
+    return f"profile-onboarding:{user_id}"
+
+
+def _restore_pending_workflow(user_id: str) -> None:
+    """Reconnect Streamlit to a durable interrupted LangGraph workflow."""
+
+    if st.session_state.get("workflow_result"):
+        return
+    thread_id = _workflow_thread_id(user_id)
+    snapshot = profile_graph.get_state(
+        {"configurable": {"thread_id": thread_id}}
+    )
+    if not snapshot.interrupts:
+        return
+    result = dict(snapshot.values)
+    result["__interrupt__"] = snapshot.interrupts
+    st.session_state.workflow_thread_id = thread_id
+    st.session_state.workflow_result = result
 
 
 def _render_workflow(user_id: str) -> None:
@@ -284,16 +322,14 @@ def _render_workflow(user_id: str) -> None:
             "required according to the existing onboarding rules."
         )
         account = profile_repository.get_user(user_id)
-        review_profile = {
-            **pending["profile"],
-            "name": account["name"],
-            "email": account["email"],
-        }
+        review_profile = dict(pending["profile"])
+        if account.get("google_id"):
+            review_profile.update(name=account["name"], email=account["email"])
         profile = _profile_form(
             review_profile,
             f"confirm_{thread_id}",
             show_required=True,
-            identity_locked=True,
+            identity_locked=bool(account.get("google_id")),
         )
         missing_fields, errors = find_profile_issues(profile)
         if missing_fields:
@@ -340,45 +376,81 @@ def _render_workflow(user_id: str) -> None:
 
 
 def _render_upload(user_id: str, *, is_demo: bool = False) -> None:
-    st.subheader("Resume onboarding")
+    st.subheader("Career document onboarding")
+    _restore_pending_workflow(user_id)
     if is_demo:
         st.info(
-            "Judge mode starts with a synthetic seeded profile. Resume and "
-            "document uploads are disabled so the shared demo workspace never "
-            "mixes judge files with real-user storage. Test profile editing and "
-            "career analysis in the adjacent tabs."
+            "Download the synthetic files below, then upload them together to "
+            "exercise the same S3, extraction, confirmation, and SQL workflow "
+            "used by Google-authenticated users."
         )
-        return
+        with st.container(horizontal=True):
+            for filename, label in (
+                ("Demo_Resume.pdf", "Download demo resume"),
+                ("Demo_Portfolio.pdf", "Download demo portfolio"),
+            ):
+                path = ROOT / "demo" / filename
+                st.download_button(
+                    label,
+                    data=path.read_bytes(),
+                    file_name=filename,
+                    mime="application/pdf",
+                    key=f"download_{filename}",
+                    on_click="ignore",
+                )
     max_size_mib = min(int(os.getenv("MAX_DOCUMENT_SIZE_MIB", "10")), 10)
-    uploaded_file = st.file_uploader(
-        "Upload a PDF or DOCX resume",
+    uploaded_files = st.file_uploader(
+        "Upload one or more PDF or DOCX career documents",
         type=["pdf", "docx"],
+        accept_multiple_files=True,
         max_upload_size=max_size_mib,
         help=(
             f"Original documents are stored privately in S3. "
             f"Maximum size: {max_size_mib} MiB."
         ),
     )
+    document_types: list[str] = []
+    for index, uploaded_file in enumerate(uploaded_files or []):
+        document_types.append(
+            st.selectbox(
+                f"Type for {uploaded_file.name}",
+                ["resume", "portfolio", "transcript", "certificate", "other"],
+                index=0 if index == 0 else 1,
+                key=f"onboarding_type_{index}_{uploaded_file.name}",
+            )
+        )
+
     if st.button(
-        "Analyze resume",
+        "Analyze documents",
         type="primary",
         icon=":material/description:",
-        disabled=uploaded_file is None,
+        disabled=not uploaded_files,
     ):
-        thread_id = str(uuid4())
-        suffix = Path(uploaded_file.name).suffix.lower()
-        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as resume_file:
-            resume_file.write(uploaded_file.getvalue())
-            resume_path = Path(resume_file.name)
+        thread_id = _workflow_thread_id(user_id)
+        profile_graph.checkpointer.delete_thread(thread_id)
+        pending_documents: list[dict[str, Any]] = []
+        temporary_paths: list[Path] = []
+        for index, uploaded_file in enumerate(uploaded_files):
+            suffix = Path(uploaded_file.name).suffix.lower()
+            with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as stream:
+                stream.write(uploaded_file.getvalue())
+                path = Path(stream.name)
+            temporary_paths.append(path)
+            pending_documents.append(
+                {
+                    "path": str(path),
+                    "original_filename": uploaded_file.name,
+                    "content_type": uploaded_file.type,
+                    "document_type": document_types[index],
+                }
+            )
         try:
             st.session_state.workflow_thread_id = thread_id
             try:
                 _resume_graph(
                     {
-                        "resume_path": str(resume_path),
-                        "original_filename": uploaded_file.name,
-                        "content_type": uploaded_file.type,
-                        "document_type": "resume",
+                        "documents": pending_documents,
+                        "existing_profile": profile_repository.get_profile(user_id),
                         "user_id": user_id,
                         "confirmed": False,
                     },
@@ -388,7 +460,8 @@ def _render_upload(user_id: str, *, is_demo: bool = False) -> None:
                 st.error(f"Resume processing failed: {error}")
                 return
         finally:
-            resume_path.unlink(missing_ok=True)
+            for path in temporary_paths:
+                path.unlink(missing_ok=True)
         st.rerun()
 
     _render_workflow(user_id)
@@ -401,12 +474,21 @@ def _render_profile(user_id: str) -> None:
         return
 
     st.subheader("My profile")
+    st.caption(f"Current profile version: v{profile['profile_version']}")
+    if profile.get("source_documents"):
+        st.caption(
+            "Sources: "
+            + ", ".join(
+                item["filename"] for item in profile["source_documents"]
+            )
+        )
     with st.form("edit_profile"):
+        account = profile_repository.get_user(user_id)
         updated_profile = _profile_form(
             profile,
             "edit",
             show_required=True,
-            identity_locked=True,
+            identity_locked=bool(account.get("google_id")),
         )
         if st.form_submit_button("Save profile changes", type="primary"):
             missing_fields, errors = find_profile_issues(updated_profile)
@@ -432,6 +514,11 @@ def _render_analysis(user_id: str) -> None:
 
     st.subheader("Career analysis")
     if analysis:
+        st.caption(
+            f"Analysis v{analysis['analysis_version']} · generated "
+            f"{analysis['generated_at']} · profile v"
+            f"{analysis['profile_version_used']}"
+        )
         if analysis["is_stale"]:
             st.warning(
                 "Your profile has changed since this analysis was generated."
@@ -458,30 +545,25 @@ def _render_analysis(user_id: str) -> None:
         st.rerun()
 
 
-def _render_documents(user_id: str, *, is_demo: bool = False) -> None:
+def _render_documents(user_id: str) -> None:
     st.subheader("Documents")
-    if is_demo:
-        st.info(
-            "Document storage is disabled in the shared judge workspace. "
-            "Google-authenticated accounts remain isolated in private S3 paths."
-        )
-        return
     st.caption(
         "Documents are private S3 objects. SQLite stores only their metadata."
     )
     max_size_mib = min(int(os.getenv("MAX_DOCUMENT_SIZE_MIB", "10")), 10)
 
     with st.form("document_upload"):
-        uploaded = st.file_uploader(
-            "Upload a PDF or DOCX document",
+        uploaded_documents = st.file_uploader(
+            "Upload PDF or DOCX documents",
             type=["pdf", "docx"],
+            accept_multiple_files=True,
             max_upload_size=max_size_mib,
             key="document_file",
         )
-        document_type = st.segmented_control(
-            "Document type",
-            ["resume", "portfolio"],
-            default="portfolio",
+        document_type = st.selectbox(
+            "Document type for this batch",
+            ["resume", "portfolio", "transcript", "certificate", "other"],
+            index=1,
             key="document_type",
         )
         submitted = st.form_submit_button(
@@ -491,18 +573,19 @@ def _render_documents(user_id: str, *, is_demo: bool = False) -> None:
         )
 
     if submitted:
-        if uploaded is None:
-            st.warning("Choose a PDF or DOCX document first.")
+        if not uploaded_documents:
+            st.warning("Choose at least one PDF or DOCX document first.")
         else:
             try:
-                document_service.upload(
-                    user_id=user_id,
-                    filename=uploaded.name,
-                    content_type=uploaded.type,
-                    data=uploaded.getvalue(),
-                    document_type=document_type or "portfolio",
-                )
-                st.success("Document stored privately.")
+                for uploaded in uploaded_documents:
+                    document_service.upload(
+                        user_id=user_id,
+                        filename=uploaded.name,
+                        content_type=uploaded.type,
+                        data=uploaded.getvalue(),
+                        document_type=document_type or "other",
+                    )
+                st.success(f"Stored {len(uploaded_documents)} document(s) privately.")
                 st.rerun()
             except Exception as error:
                 st.error(f"Document upload failed: {error}")
@@ -519,6 +602,15 @@ def _render_documents(user_id: str, *, is_demo: bool = False) -> None:
                 f"{document['document_type']} · "
                 f"{document['size_bytes'] / 1024:.1f} KiB · "
                 f"uploaded {document['uploaded_at']}"
+            )
+            related_versions = document.get("profile_versions") or []
+            st.caption(
+                "Related profile versions: "
+                + (
+                    ", ".join(f"v{number}" for number in related_versions)
+                    if related_versions
+                    else "None"
+                )
             )
             with st.container(horizontal=True):
                 st.download_button(
@@ -545,6 +637,161 @@ def _render_documents(user_id: str, *, is_demo: bool = False) -> None:
                         st.error(f"Document deletion failed: {error}")
 
 
+def _render_memory(user_id: str) -> None:
+    st.subheader("Memory")
+    st.caption(
+        "Profile and analysis versions are immutable. Rollback changes only the "
+        "current pointer."
+    )
+
+    st.markdown("### Profile history")
+    profile_versions = profile_repository.list_profile_versions(user_id)
+    if not profile_versions:
+        st.info("No confirmed profile versions yet.")
+    for version in profile_versions:
+        label = f"Profile v{version['version_number']}"
+        if version["is_current"]:
+            label += " (Current)"
+        with st.expander(label, expanded=version["is_current"]):
+            st.caption(f"Created: {version['created_at']}")
+            sources = version.get("source_documents") or []
+            st.write(
+                "Sources: "
+                + (", ".join(item["filename"] for item in sources) or "Manual edit")
+            )
+            st.json(version["snapshot_data"])
+            if not version["is_current"] and st.button(
+                "Rollback to this profile version",
+                key=f"rollback_profile_{version['version_id']}",
+            ):
+                profile_repository.rollback_profile(user_id, version["version_id"])
+                for key in list(st.session_state):
+                    if key.startswith("edit_"):
+                        del st.session_state[key]
+                st.success("Current profile pointer updated.")
+                st.rerun()
+
+    st.markdown("### Career analysis history")
+    analysis_versions = profile_repository.list_analysis_versions(user_id)
+    if not analysis_versions:
+        st.info("No career analysis versions yet.")
+    for version in analysis_versions:
+        label = f"Career Analysis v{version['analysis_version']}"
+        if version["is_current"]:
+            label += " (Current)"
+        with st.expander(label, expanded=version["is_current"]):
+            st.caption(
+                f"Generated: {version['generated_at']} · Profile v"
+                f"{version['profile_version_used']}"
+            )
+            st.json(
+                {
+                    "strengths": version["strengths"],
+                    "possible_roles": version["possible_roles"],
+                    "recommended_next_skills": version[
+                        "recommended_next_skills"
+                    ],
+                }
+            )
+            if not version["is_current"] and st.button(
+                "Rollback to this analysis",
+                key=f"rollback_analysis_{version['analysis_version_id']}",
+            ):
+                profile_repository.rollback_analysis(
+                    user_id, version["analysis_version_id"]
+                )
+                st.success("Current analysis pointer updated.")
+                st.rerun()
+
+    st.markdown("### Memory candidates")
+    candidates = profile_repository.list_memory_candidates(user_id)
+    pending = [item for item in candidates if item["status"] == "pending"]
+    if not pending:
+        st.info("No AI memory suggestions are waiting for review.")
+    for candidate in pending:
+        with st.container(border=True):
+            st.write(f"**{candidate['category']}** — {candidate['content']}")
+            confidence = (
+                candidate["confidence"]
+                if candidate["confidence"] is not None
+                else "n/a"
+            )
+            st.caption(
+                f"Source: {candidate['source']} · confidence: "
+                f"{confidence}"
+            )
+            with st.container(horizontal=True):
+                if st.button(
+                    "Accept",
+                    key=f"accept_memory_{candidate['candidate_id']}",
+                ):
+                    profile_repository.review_memory_candidate(
+                        user_id, candidate["candidate_id"], accept=True
+                    )
+                    st.rerun()
+                if st.button(
+                    "Reject",
+                    key=f"reject_memory_{candidate['candidate_id']}",
+                ):
+                    profile_repository.review_memory_candidate(
+                        user_id, candidate["candidate_id"], accept=False
+                    )
+                    st.rerun()
+
+    st.markdown("### Approved flexible memory")
+    memories = profile_repository.list_memories(user_id)
+    if not memories:
+        st.info("No approved flexible memories yet.")
+    for memory in memories:
+        st.markdown(f"- **{memory['category']}**: {memory['content']}")
+
+
+def _render_career_assistant(user_id: str) -> None:
+    st.subheader("Career Assistant")
+    st.caption(
+        "Conversations are stored in SQL. Chat does not automatically change "
+        "your profile or memory."
+    )
+    conversations = profile_repository.list_conversations(user_id)
+    if st.button("New conversation", icon=":material/add:"):
+        conversation = profile_repository.create_conversation(
+            user_id, f"Career conversation {len(conversations) + 1}"
+        )
+        st.session_state.active_conversation_id = conversation["conversation_id"]
+        st.rerun()
+
+    if not conversations:
+        st.info("Create a conversation to start chatting.")
+        return
+    conversation_ids = [item["conversation_id"] for item in conversations]
+    active_id = st.session_state.get("active_conversation_id")
+    if active_id not in conversation_ids:
+        active_id = conversation_ids[0]
+    active_id = st.selectbox(
+        "Conversation",
+        conversation_ids,
+        index=conversation_ids.index(active_id),
+        key="conversation_selector",
+        format_func=lambda item_id: next(
+            item["title"] for item in conversations if item["conversation_id"] == item_id
+        ),
+    )
+    st.session_state.active_conversation_id = active_id
+    conversation = profile_repository.get_conversation(user_id, active_id)
+    for message in conversation["messages"]:
+        with st.chat_message(message["role"]):
+            st.write(message["content"])
+
+    prompt = st.chat_input("Ask CareerTrace about your career")
+    if prompt:
+        try:
+            with st.spinner("CareerTrace is thinking…"):
+                respond_to_user(user_id, active_id, prompt)
+            st.rerun()
+        except Exception as error:
+            st.error(f"Career Assistant failed: {error}")
+
+
 def main() -> None:
     st.set_page_config(page_title="CareerTrace AI", page_icon="🧭", layout="wide")
     init_db()
@@ -559,8 +806,22 @@ def main() -> None:
     st.caption("Persistent career profile management with bounded AI reasoning")
     if is_demo:
         st.warning("Demo workspace — uses synthetic data")
-    upload_tab, profile_tab, analysis_tab, documents_tab = st.tabs(
-        ["Resume upload", "My profile", "Career analysis", "Documents"]
+    (
+        upload_tab,
+        profile_tab,
+        analysis_tab,
+        documents_tab,
+        memory_tab,
+        assistant_tab,
+    ) = st.tabs(
+        [
+            "Document upload",
+            "My profile",
+            "Career analysis",
+            "Documents",
+            "Memory",
+            "Career Assistant",
+        ]
     )
     with upload_tab:
         _render_upload(user_id, is_demo=is_demo)
@@ -569,7 +830,11 @@ def main() -> None:
     with analysis_tab:
         _render_analysis(user_id)
     with documents_tab:
-        _render_documents(user_id, is_demo=is_demo)
+        _render_documents(user_id)
+    with memory_tab:
+        _render_memory(user_id)
+    with assistant_tab:
+        _render_career_assistant(user_id)
 
 
 if __name__ == "__main__":

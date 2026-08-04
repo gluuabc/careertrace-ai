@@ -18,5 +18,6 @@ def get_llm(model_type="cheap"):
     return ChatBedrockConverse(
         model=model_id,
         region_name=os.getenv("AWS_REGION"),
-        temperature=0.3,
+        temperature=0,
+        max_tokens=4096,
     )
