@@ -25,6 +25,7 @@ USER_WORKSPACE_KEYS = (
     "selected_user_id",
     "active_conversation_id",
     "conversation_selector",
+    "agent_last_result",
 )
 USER_WIDGET_PREFIXES = (
     "edit_",

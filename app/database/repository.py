@@ -6,6 +6,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.database.database import SessionLocal, session_scope
+from app.database.agent_repository import AgentRepositoryMixin
 from app.database.models import (
     CareerAnalysis,
     CareerAnalysisVersion,
@@ -25,7 +26,7 @@ from app.database.models import (
 )
 
 
-class ProfileRepository:
+class ProfileRepository(AgentRepositoryMixin):
     """User-scoped SQL persistence boundary for CareerTrace."""
 
     def __init__(self, session_factory: Callable[[], Session] = SessionLocal):

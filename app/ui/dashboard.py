@@ -22,6 +22,8 @@ from app.graph.profile_graph import profile_graph
 from app.nodes.profile import generate_profile
 from app.nodes.validation import find_profile_issues
 from app.services import document_service, respond_to_user
+from app.services.outreach import outreach_service
+from app.services.people_search import validate_connection_csv
 
 
 def _comma_list(value: str) -> list[str]:
@@ -746,12 +748,152 @@ def _render_memory(user_id: str) -> None:
         st.markdown(f"- **{memory['category']}**: {memory['content']}")
 
 
+def _render_connections(user_id: str) -> None:
+    with st.expander("People Search connections"):
+        st.caption(
+            "Optional private inputs. Public-source evidence is still required for "
+            "external identity claims."
+        )
+        uploaded = st.file_uploader(
+            "Import connections CSV",
+            type=["csv"],
+            key="connection_csv",
+            help="Required column: name. Maximum 500 rows.",
+        )
+        if uploaded and st.button("Validate and import CSV", key="import_connections"):
+            rows, errors = validate_connection_csv(
+                uploaded.getvalue().decode("utf-8-sig", errors="replace")
+            )
+            for error in errors:
+                st.error(error)
+            if not errors:
+                for row in rows:
+                    profile_repository.create_connection(user_id, row)
+                st.success(f"Imported {len(rows)} connections.")
+                st.rerun()
+        with st.form("manual_connection"):
+            name = st.text_input("Name *")
+            role = st.text_input("Current role")
+            organization = st.text_input("Organization")
+            public_url = st.text_input("Public professional/profile URL")
+            email = st.text_input("User-provided email (private)")
+            notes = st.text_area("Private notes")
+            if st.form_submit_button("Add connection"):
+                try:
+                    profile_repository.create_connection(
+                        user_id,
+                        {
+                            "name": name,
+                            "current_role": role,
+                            "organization": organization,
+                            "public_profile_url": public_url,
+                            "user_provided_email": email,
+                            "notes": notes,
+                            "source_type": "manual",
+                        },
+                    )
+                    st.success("Connection saved.")
+                    st.rerun()
+                except ValueError as error:
+                    st.error(str(error))
+        connections = profile_repository.list_connections(user_id)
+        if connections:
+            st.caption(f"{len(connections)} private connection records available.")
+
+
+def _render_agent_activity(user_id: str, conversation_id: str) -> None:
+    runs = profile_repository.list_agent_runs(user_id, conversation_id)
+    if not runs:
+        return
+    latest = runs[0]
+    with st.expander("Agent Activity", expanded=True):
+        st.write(f"**Goal:** {latest['goal'] or 'Not set'}")
+        st.caption(
+            f"Intent: {latest['intent'] or 'classifying'} · Status: "
+            f"{latest['status']} · Sources/tools: {len(latest['tool_calls'])}"
+        )
+        for step in latest["steps"]:
+            marker = "✅" if step["status"] == "completed" else "⚠️" if step["status"] == "failed" else "⏳"
+            st.markdown(f"{marker} **{step['stage']}** — {step['display_summary']}")
+        for call in latest["tool_calls"]:
+            duration = f"{call['duration_ms']} ms" if call["duration_ms"] is not None else "duration unknown"
+            st.caption(
+                f"Tool: {call['tool_name']} · {call['status']} · {duration}"
+            )
+            if call["error_message"]:
+                st.warning(call["error_message"])
+
+
+def _render_agent_results(user_id: str, conversation_id: str) -> None:
+    result = st.session_state.get("agent_last_result") or {}
+    if result.get("conversation_id") == conversation_id:
+        jobs = result.get("job_candidates") or []
+        verified = [item for item in jobs if item.get("hard_constraints_met")]
+        unverified = [item for item in jobs if not item.get("hard_constraints_met")]
+        if verified:
+            st.markdown("### Verified job candidates")
+            for item in verified:
+                with st.container(border=True):
+                    st.write(f"**{item.get('title') or 'unknown'} — {item.get('company') or 'unknown'}**")
+                    st.write(f"Location: {item.get('location') or 'unknown'} · Employment: {item.get('employment_type') or 'unknown'}")
+                    st.write(f"Eligibility: {item.get('eligibility') or 'unknown'}")
+                    if item.get("application_url"):
+                        st.link_button("Official application", item["application_url"])
+                    st.caption(f"Source: {item.get('source_url')} · Retrieved: {item.get('retrieved_at')}")
+        if unverified:
+            st.markdown("### Eligibility not verified")
+            st.caption("These candidates do not count toward the verified total.")
+            for item in unverified:
+                st.markdown(f"- **{item.get('title') or 'unknown'} — {item.get('company') or 'unknown'}** · [source]({item.get('source_url')})")
+        people = result.get("people_candidates") or []
+        if people:
+            st.markdown("### People candidates")
+            for item in people:
+                with st.container(border=True):
+                    st.write(f"**{item.get('name')}** — {item.get('current_role') or 'role unknown'}")
+                    st.write(f"Organization: {item.get('organization') or 'unknown'}")
+                    st.write("Relevant connection: " + ("; ".join(item.get("relevant_connection") or []) or "unknown"))
+                    st.write(f"Public contact: {item.get('public_contact') or 'unavailable'}")
+                    st.link_button("Public source", item["public_source_url"])
+
+    resume_drafts = profile_repository.list_resume_revision_drafts(user_id)
+    if resume_drafts:
+        st.markdown("### Resume revision drafts")
+        for draft in resume_drafts:
+            with st.expander(f"Draft / Not applied — {draft['summary']}"):
+                for change in draft["changes"]:
+                    st.write(f"**{change['section']}**")
+                    st.write(f"Original: {change['original_text'] or 'unknown'}")
+                    st.write(f"Proposed: {change['proposed_text']}")
+                    st.caption(f"Reason: {change['rationale']} · Evidence: {', '.join(change['profile_evidence_ids'] + change['job_evidence_ids']) or 'none'}")
+                    for warning in change["warnings"]:
+                        st.warning(warning)
+    outreach_drafts = profile_repository.list_outreach_drafts(user_id)
+    if outreach_drafts:
+        st.markdown("### Outreach drafts")
+        for draft in outreach_drafts:
+            with st.expander(f"{draft['status'].title()} / {'Sent' if draft['sent_at'] else 'Not sent'} — {draft['recipient_name']}"):
+                st.text_input("Subject", value=draft["subject"], disabled=True, key=f"draft_subject_{draft['draft_id']}")
+                st.text_area("Body", value=draft["body"], disabled=True, key=f"draft_body_{draft['draft_id']}")
+                with st.container(horizontal=True):
+                    if draft["status"] == "draft" and st.button("Mark ready", key=f"ready_{draft['draft_id']}"):
+                        outreach_service.mark_status(user_id, draft["draft_id"], "ready", explicit_user_action=True)
+                        st.rerun()
+                    if draft["status"] == "ready" and st.button("Mark sent", key=f"sent_{draft['draft_id']}"):
+                        outreach_service.mark_status(user_id, draft["draft_id"], "sent", explicit_user_action=True)
+                        st.rerun()
+                    if draft["status"] != "archived" and st.button("Archive", key=f"archive_{draft['draft_id']}"):
+                        outreach_service.mark_status(user_id, draft["draft_id"], "archived", explicit_user_action=True)
+                        st.rerun()
+
+
 def _render_career_assistant(user_id: str) -> None:
     st.subheader("Career Assistant")
     st.caption(
         "Conversations are stored in SQL. Chat does not automatically change "
         "your profile or memory."
     )
+    _render_connections(user_id)
     conversations = profile_repository.list_conversations(user_id)
     if st.button("New conversation", icon=":material/add:"):
         conversation = profile_repository.create_conversation(
@@ -777,6 +919,8 @@ def _render_career_assistant(user_id: str) -> None:
         ),
     )
     st.session_state.active_conversation_id = active_id
+    _render_agent_activity(user_id, active_id)
+    _render_agent_results(user_id, active_id)
     conversation = profile_repository.get_conversation(user_id, active_id)
     for message in conversation["messages"]:
         with st.chat_message(message["role"]):
@@ -785,8 +929,20 @@ def _render_career_assistant(user_id: str) -> None:
     prompt = st.chat_input("Ask CareerTrace about your career")
     if prompt:
         try:
+            events: list[dict[str, Any]] = []
             with st.spinner("CareerTrace is thinking…"):
-                respond_to_user(user_id, active_id, prompt)
+                respond_to_user(
+                    user_id,
+                    active_id,
+                    prompt,
+                    event_handler=events.append,
+                )
+            final_event = next(
+                (item for item in reversed(events) if item.get("type") == "final"),
+                None,
+            )
+            if final_event:
+                st.session_state.agent_last_result = final_event
             st.rerun()
         except Exception as error:
             st.error(f"Career Assistant failed: {error}")

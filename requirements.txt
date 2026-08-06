@@ -27,3 +27,8 @@ pypdf
 reportlab
 python-docx
 python-multipart
+
+# Public source adapters
+requests>=2.31,<3
+beautifulsoup4>=4.12,<5
+PyYAML>=6,<7

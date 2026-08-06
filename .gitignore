@@ -9,12 +9,6 @@ __pycache__/
 .env
 .streamlit/secrets.toml
 
-# OS files
-.DS_Store
-
-# IDE
-.vscode/
-
 # Local AI agent skills
 .agents/
 
@@ -27,6 +21,12 @@ data/langgraph_checkpoints.sqlite*
 data/*.pdf
 data/*.docx
 data/profile_memory.json
+
+# OS files
+.DS_Store
+
+# IDE
+.vscode/
 
 # Uploaded user files
 *.pdf

@@ -1,24 +1,15 @@
-import json
+from __future__ import annotations
+
+from collections.abc import Callable
 from typing import Any
 
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
-
 from app.database.repository import ProfileRepository, profile_repository
+from app.graph.career_agent_graph import build_career_agent_graph
 from app.llm.model import get_llm
+from app.services.context_manager import ContextManager
+from app.services.skill_registry import skill_registry
 
-
-def _message_text(content: Any) -> str:
-    if isinstance(content, str):
-        return content.strip()
-    if isinstance(content, list):
-        parts = []
-        for item in content:
-            if isinstance(item, dict) and item.get("text"):
-                parts.append(str(item["text"]))
-            else:
-                parts.append(str(item))
-        return "\n".join(parts).strip()
-    return str(content).strip()
+ObservableEventHandler = Callable[[dict[str, Any]], None]
 
 
 def respond_to_user(
@@ -26,53 +17,49 @@ def respond_to_user(
     conversation_id: str,
     prompt: str,
     repository: ProfileRepository = profile_repository,
+    event_handler: ObservableEventHandler | None = None,
 ) -> str:
-    """Generate and persist chat without modifying career memory or profile."""
+    """Persist a request, invoke the bounded Career Agent, and persist its reply."""
 
-    repository.add_message(user_id, conversation_id, "user", prompt)
-    conversation = repository.get_conversation(user_id, conversation_id)
-    profile = repository.get_profile(user_id)
-    memories = repository.list_memories(user_id)
-    profile_context = None
-    if profile:
-        profile_context = {
-            key: value
-            for key, value in profile.items()
-            if key
-            not in {
-                "user_id",
-                "email",
-                "updated_at",
-                "source_documents",
-                "profile_changed",
-            }
+    clean_prompt = prompt.strip()
+    if not clean_prompt:
+        raise ValueError("A career request is required.")
+    repository.add_message(user_id, conversation_id, "user", clean_prompt)
+    if event_handler:
+        event_handler({"type": "status", "workflow_stage": "initializing"})
+
+    context = ContextManager(repository, skill_registry)
+    agent = build_career_agent_graph(
+        repository=repository,
+        context=context,
+        registry=skill_registry,
+        checkpointer=None,
+        model_factory=get_llm,
+    )
+    result = agent.invoke(
+        {
+            "user_id": user_id,
+            "conversation_id": conversation_id,
+            "current_request": clean_prompt,
+            "messages": [],
         }
-    context = {
-        "confirmed_profile": profile_context,
-        "approved_flexible_memories": [
-            {"category": item["category"], "content": item["content"]}
-            for item in memories
-        ],
-    }
-    messages = [
-        SystemMessage(
-            content=(
-                "You are CareerTrace, a practical career assistant. Use only the "
-                "provided confirmed profile and approved memories as personal "
-                "context. Do not claim that chat changes the user's stored profile "
-                "or memory. Give concise, concrete career guidance.\n\n"
-                f"CONTEXT:\n{json.dumps(context, indent=2)}"
-            )
+    )
+    response = str(result.get("final_response") or "").strip()
+    if not response:
+        raise ValueError("The Career Agent returned an empty response.")
+    repository.add_message(user_id, conversation_id, "assistant", response)
+    if event_handler:
+        event_handler(
+            {
+                "type": "final",
+                "run_id": result.get("run_id"),
+                "conversation_id": conversation_id,
+                "status": result.get("status"),
+                "todo_items": result.get("todo_items", []),
+                "warnings": result.get("warnings", []),
+                "job_candidates": result.get("job_candidates", []),
+                "people_candidates": result.get("people_candidates", []),
+                "workflow_stage": result.get("workflow_stage"),
+            }
         )
-    ]
-    for item in conversation["messages"][-20:]:
-        if item["role"] == "user":
-            messages.append(HumanMessage(content=item["content"]))
-        else:
-            messages.append(AIMessage(content=item["content"]))
-    response = get_llm("reasoning").invoke(messages)
-    text = _message_text(response.content)
-    if not text:
-        raise ValueError("The career assistant returned an empty response.")
-    repository.add_message(user_id, conversation_id, "assistant", text)
-    return text
+    return response

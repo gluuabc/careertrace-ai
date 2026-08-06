@@ -178,7 +178,10 @@ The workflow currently supports:
 - Immutable profile and career-analysis versions with pointer-only rollback
 - Profile-version links to multiple source documents
 - Approved flexible memories separated from pending memory candidates
-- SQL-backed Career Assistant conversation history without automatic profile edits
+- SQL-backed, bounded Career Agent with observable tool trajectories and no automatic profile edits
+- Official public-source job search with deterministic hard filtering and evidence
+- Permitted people search across user connections, OpenAlex, and Wikidata
+- SQL-backed resume-revision drafts and unsent outreach drafts
 - No-op profile saves that do not create false versions or duplicate analyses
 - Streamlit profile viewing and editing
 - Per-user document upload, download, and deletion
@@ -192,6 +195,83 @@ Example generated information:
   "recommended_next_skills": []
 }
 ```
+
+### Stateful Career Agent
+
+The Career Assistant is a thin facade over `app/graph/career_agent_graph.py`.
+Every user request creates a user-scoped `agent_runs` row, follows a closed intent
+router, loads the relevant Skill, executes a bounded structured-tool loop, and
+stores only observable steps and sanitized tool calls. Hidden model reasoning is
+neither displayed nor persisted.
+
+Supported routes:
+
+```text
+START -> initialize_run -> classify_intent -> prepare_workflow
+  ├── concise_guidance / action_plan / clarification -> agent_model
+  └── job_search / people_search / resume_revision / outreach
+        -> plan_action -> execute_tools -> agent_model
+agent_model -> execute_tools (bounded) | finalize -> END
+```
+
+The model-visible tools are:
+
+- `read_skill` and `read_skill_file`
+- `search_jobs` and `get_job_details`
+- `search_people` and `get_person_details`
+- `save_resume_revision_draft`
+- `save_outreach_draft`
+- `update_outreach_status` (cannot mark `sent`; that requires a UI action)
+
+The LLM never selects `user_id`; identity is injected from trusted graph state.
+Tool results remain proper `ToolMessage` objects. Source, iteration, and no-new-
+result stopping conditions are enforced by code.
+
+#### Job sources and limitations
+
+`config/job_sources.yaml` is the single version-controlled company catalog.
+Sources start disabled and unverified. On 2026-08-06, public Greenhouse GET
+endpoints were validated for the enabled catalog entries; unverified companies
+remain disabled rather than receiving guessed ATS identifiers. Lever and official
+public-page adapters are available when a validated catalog record selects them.
+Firecrawl and Playwright are optional, disabled by default, and return structured
+skips when unavailable.
+
+Job fields are normalized without inference. Eligibility is a hard constraint by
+default: unknown eligibility does not count toward the verified target and is
+shown separately as **Eligibility not verified**. No source adapter applies to a
+job.
+
+#### People sources and limitations
+
+People Search accepts optional private manual/CSV connections and searches
+OpenAlex for academic discovery or Wikidata for public identity discovery. CSV
+imports are user-scoped, row-limited, field-limited, and reject executable
+spreadsheet formulas. LinkedIn, protected directories, inferred email patterns,
+phone numbers, private addresses, and data brokers are prohibited. Recruiter
+results require explicit public recruiting/talent-acquisition role evidence.
+
+#### Drafts and approval boundaries
+
+Resume revisions are structured SQL drafts linked to an immutable profile version
+and do not modify the profile or original S3 document. Outreach is saved with
+status `draft` and no sending side effect. Only an explicit user UI action can
+mark outreach `sent`, which records `sent_at`.
+
+#### Evidence and context
+
+Every external source result receives an `ev_<uuid>` evidence ID, URL, retrieval
+time, hash, excerpt, and provenance. Small evidence stays in SQL. Evidence above
+`EVIDENCE_S3_THRESHOLD_BYTES` is gzip-compressed into the existing S3 bucket at
+`agent-evidence/{user_id}/{run_id}/...`; safe SQL fallback is bounded and warnings
+are retained.
+
+The immutable system prompt contains no user data. A fresh `<runtime_context>`
+block supplies the current profile, approved memories, task, selected entities,
+loaded Skills, and one current status per model call. Adaptive compression starts
+only above the configured threshold, preserves evidence IDs and hard constraints,
+and stores a query-aware summary boundary while leaving original SQL messages
+unchanged.
 
 ---
 
@@ -215,7 +295,13 @@ SQLite
  ├── memory_candidates
  ├── memories
  ├── conversations
- └── messages
+ ├── messages
+ ├── agent_runs / agent_steps / agent_tool_calls
+ ├── agent_evidence
+ ├── conversation_context_summaries
+ ├── user_connections
+ ├── resume_revision_drafts / resume_revision_changes
+ └── outreach_drafts
 ```
 
 Planned production storage:
@@ -521,6 +607,7 @@ The web interface provides:
 - Private per-user document management
 - Profile and analysis history with rollback
 - Approved-memory review and persistent Career Assistant conversations
+- Agent Activity, evidence-backed candidate results, saved drafts, and optional connections
 
 ## Judge Testing Instructions
 
@@ -619,11 +706,11 @@ to keep the schema portable to a distributed SQL deployment.
 
 ## Current priority
 
-1. Add application/job tracking tables
-2. Build job search workflow
-3. Move the SQL repository to CockroachDB
-4. Add vector retrieval
-5. Add bounded autonomous reasoning components
+1. Move the SQL repository to CockroachDB
+2. Add conversation-to-memory candidate extraction and vector retrieval
+3. Add scheduled proactive searches and notifications
+4. Add PDF/DOCX resume-draft export
+5. Add separately approved sending and application actions
 
 ---
 
