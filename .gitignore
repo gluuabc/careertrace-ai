@@ -9,6 +9,9 @@ __pycache__/
 .env
 .streamlit/secrets.toml
 
+# Local AI agent skills
+.agents/
+
 # Local runtime data and uploads
 data/*.db
 data/*.db-*
@@ -24,3 +27,7 @@ data/profile_memory.json
 
 # IDE
 .vscode/
+
+# Uploaded user files
+*.pdf
+uploads/
