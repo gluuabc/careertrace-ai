@@ -14,6 +14,26 @@ def _interrupt_value(result):
 
 
 class ProfileGraphTests(unittest.TestCase):
+    def test_invalid_confirmation_routes_back_to_confirmation(self):
+        self.assertEqual(
+            graph_module._route_after_confirmation(
+                {
+                    "confirmed": False,
+                    "missing_fields": ["major"],
+                    "validation_errors": [],
+                }
+            ),
+            "invalid",
+        )
+
+    def test_unchanged_profile_skips_new_analysis(self):
+        self.assertEqual(
+            graph_module._route_after_save(
+                {"saved_profile": {"profile_changed": False}}
+            ),
+            "unchanged",
+        )
+
     def test_missing_information_and_confirmation_flow(self):
         extracted = {
             "name": "Ada Student",
@@ -34,6 +54,10 @@ class ProfileGraphTests(unittest.TestCase):
         }
 
         fake_nodes = {
+            "store_document": lambda _state: {
+                "document_id": "document-1",
+                "s3_key": "user-1/document-1/resume.pdf",
+            },
             "extract_resume": lambda _state: {"resume_text": "resume text"},
             "extract_profile": lambda _state: {"extracted_profile": extracted},
             "save_profile": lambda state: {
@@ -41,6 +65,7 @@ class ProfileGraphTests(unittest.TestCase):
                 "saved_profile": {
                     **state["extracted_profile"],
                     "profile_version": 1,
+                    "profile_changed": True,
                 },
             },
             "generate_profile": lambda _state: {
@@ -54,6 +79,9 @@ class ProfileGraphTests(unittest.TestCase):
         }
 
         with (
+            patch.object(
+                graph_module, "store_document", fake_nodes["store_document"]
+            ),
             patch.object(graph_module, "extract_resume", fake_nodes["extract_resume"]),
             patch.object(
                 graph_module, "extract_profile", fake_nodes["extract_profile"]
@@ -71,7 +99,9 @@ class ProfileGraphTests(unittest.TestCase):
             graph = graph_module.build_profile_graph(MemorySaver())
 
         config = {"configurable": {"thread_id": str(uuid4())}}
-        result = graph.invoke({"resume_path": "resume.pdf"}, config=config)
+        result = graph.invoke(
+            {"resume_path": "resume.pdf", "user_id": "user-1"}, config=config
+        )
         pending = _interrupt_value(result)
         self.assertEqual(pending["type"], "missing_profile_fields")
 
@@ -105,6 +135,7 @@ class ProfileGraphTests(unittest.TestCase):
         )
         self.assertTrue(result["confirmed"])
         self.assertEqual(result["analysis_id"], "analysis-1")
+        self.assertEqual(result["document_id"], "document-1")
 
 
 if __name__ == "__main__":

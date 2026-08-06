@@ -1,5 +1,6 @@
 # Agent framework
 langgraph
+langgraph-checkpoint-sqlite>=3,<4
 langchain
 langchain-core
 
@@ -10,15 +11,24 @@ langchain-aws
 # Backend
 fastapi
 uvicorn
-streamlit
+streamlit>=1.60,<2
+Authlib>=1.3.2
 python-dotenv
 pydantic
 
 # Database
 sqlalchemy
+alembic
 psycopg2-binary
 pgvector
 
 # Document processing
 pypdf
+reportlab
+python-docx
 python-multipart
+
+# Public source adapters
+requests>=2.31,<3
+beautifulsoup4>=4.12,<5
+PyYAML>=6,<7

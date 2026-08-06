@@ -9,17 +9,21 @@ if str(ROOT) not in sys.path:
 
 
 import tempfile
+import os
 from typing import Any
-from uuid import uuid4
 
 import streamlit as st
 
 from langgraph.types import Command
 
+from app.auth import require_authenticated_user
 from app.database import init_db, profile_repository
 from app.graph.profile_graph import profile_graph
 from app.nodes.profile import generate_profile
 from app.nodes.validation import find_profile_issues
+from app.services import document_service, respond_to_user
+from app.services.outreach import outreach_service
+from app.services.people_search import validate_connection_csv
 
 
 def _comma_list(value: str) -> list[str]:
@@ -98,21 +102,36 @@ def _interrupt_value(result: dict[str, Any]) -> dict[str, Any] | None:
 
 
 def _profile_form(
-    profile: dict[str, Any], key_prefix: str
+    profile: dict[str, Any],
+    key_prefix: str,
+    show_required: bool = False,
+    identity_locked: bool = False,
 ) -> dict[str, Any]:
+    required = " *" if show_required else ""
     left, right = st.columns(2)
     with left:
         name = st.text_input(
-            "Name", value=profile.get("name") or "", key=f"{key_prefix}_name"
+            "Account name" if identity_locked else "Name (optional)",
+            value=profile.get("name") or "",
+            key=f"{key_prefix}_name",
+            disabled=identity_locked,
         )
         school = st.text_input(
-            "School", value=profile.get("school") or "", key=f"{key_prefix}_school"
+            f"School{required}",
+            value=profile.get("school") or "",
+            key=f"{key_prefix}_school",
         )
+        if show_required and not school.strip():
+            st.caption(":red[School is required.]")
         major = st.text_input(
-            "Major", value=profile.get("major") or "", key=f"{key_prefix}_major"
+            f"Major{required}",
+            value=profile.get("major") or "",
+            key=f"{key_prefix}_major",
         )
+        if show_required and not major.strip():
+            st.caption(":red[Major is required.]")
         graduation_year = st.number_input(
-            "Graduation year",
+            f"Graduation year{required}",
             min_value=1950,
             max_value=2100,
             value=int(profile.get("graduation_year") or 2030),
@@ -121,17 +140,18 @@ def _profile_form(
         )
     with right:
         email = st.text_input(
-            "Email (optional)",
+            "Account email" if identity_locked else "Email (optional)",
             value=profile.get("email") or "",
             key=f"{key_prefix}_email",
+            disabled=identity_locked,
         )
         career_goal = st.text_area(
-            "Career goal",
+            "Career goal (optional)",
             value=profile.get("career_goal") or "",
             key=f"{key_prefix}_career_goal",
         )
         remote_preference = st.selectbox(
-            "Remote preference",
+            "Remote preference (optional)",
             ["", "Remote", "Hybrid", "On-site", "Flexible"],
             index=(
                 ["", "Remote", "Hybrid", "On-site", "Flexible"].index(
@@ -145,34 +165,56 @@ def _profile_form(
         )
 
     skills = st.text_input(
-        "Skills (comma-separated)",
+        f"Skills{required} (comma-separated)",
         value=", ".join(profile.get("skills") or []),
         key=f"{key_prefix}_skills",
     )
+    if show_required and not _comma_list(skills):
+        st.caption(":red[At least one skill is required.]")
+    courses = st.text_input(
+        "Courses (optional, comma-separated)",
+        value=", ".join(profile.get("courses") or []),
+        key=f"{key_prefix}_courses",
+    )
+    certifications = st.text_input(
+        "Certifications (optional, comma-separated)",
+        value=", ".join(profile.get("certifications") or []),
+        key=f"{key_prefix}_certifications",
+    )
+    achievements = st.text_area(
+        "Achievements (optional, one per line)",
+        value="\n".join(profile.get("achievements") or []),
+        key=f"{key_prefix}_achievements",
+    )
     projects = st.text_area(
-        "Projects — one per line: title | description",
+        "Projects (optional) — one per line: title | description",
         value=_projects_to_text(profile.get("projects") or []),
         key=f"{key_prefix}_projects",
     )
     experience = st.text_area(
-        "Experience — one per line: organization | role | description",
+        (
+            f"Experience{required} — one per line: "
+            "organization | role | description"
+        ),
         value=_experience_to_text(profile.get("experience") or []),
         key=f"{key_prefix}_experience",
     )
+    if show_required and not _experience_from_text(experience):
+        st.caption(":red[At least one experience entry is required.]")
 
     st.caption("Career preferences")
     target_roles = st.text_input(
-        "Target roles (comma-separated)",
+        "Target roles (optional, comma-separated)",
         value=", ".join(profile.get("target_roles") or []),
         key=f"{key_prefix}_target_roles",
     )
     preferred_locations = st.text_input(
-        "Preferred locations (comma-separated)",
+        "Preferred locations (optional, comma-separated)",
         value=", ".join(profile.get("preferred_locations") or []),
         key=f"{key_prefix}_locations",
     )
     employment_types = st.text_input(
-        "Employment types (comma-separated)",
+        "Employment types (optional, comma-separated)",
         value=", ".join(profile.get("employment_types") or []),
         key=f"{key_prefix}_employment",
     )
@@ -191,6 +233,9 @@ def _profile_form(
         "graduation_year": int(graduation_year),
         "career_goal": career_goal.strip() or None,
         "skills": _comma_list(skills),
+        "courses": _comma_list(courses),
+        "achievements": _line_list(achievements),
+        "certifications": _comma_list(certifications),
         "projects": _projects_from_text(projects),
         "experience": _experience_from_text(experience),
         "target_roles": _comma_list(target_roles),
@@ -211,6 +256,27 @@ def _resume_graph(command: Any, thread_id: str) -> dict[str, Any]:
     return result
 
 
+def _workflow_thread_id(user_id: str) -> str:
+    return f"profile-onboarding:{user_id}"
+
+
+def _restore_pending_workflow(user_id: str) -> None:
+    """Reconnect Streamlit to a durable interrupted LangGraph workflow."""
+
+    if st.session_state.get("workflow_result"):
+        return
+    thread_id = _workflow_thread_id(user_id)
+    snapshot = profile_graph.get_state(
+        {"configurable": {"thread_id": thread_id}}
+    )
+    if not snapshot.interrupts:
+        return
+    result = dict(snapshot.values)
+    result["__interrupt__"] = snapshot.interrupts
+    st.session_state.workflow_thread_id = thread_id
+    st.session_state.workflow_result = result
+
+
 def _render_workflow(user_id: str) -> None:
     result = st.session_state.get("workflow_result")
     thread_id = st.session_state.get("workflow_thread_id")
@@ -227,19 +293,23 @@ def _render_workflow(user_id: str) -> None:
         with st.form(f"missing_fields_{thread_id}"):
             updates: dict[str, Any] = {}
             if "school" in missing:
-                updates["school"] = st.text_input("School")
+                updates["school"] = st.text_input("School *")
             if "major" in missing:
-                updates["major"] = st.text_input("Major")
+                updates["major"] = st.text_input("Major *")
             if "graduation_year" in missing:
                 updates["graduation_year"] = st.number_input(
-                    "Graduation year", min_value=1950, max_value=2100, value=2030
+                    "Graduation year *",
+                    min_value=1950,
+                    max_value=2100,
+                    value=None,
                 )
             if "skills" in missing:
-                skills = st.text_input("Skills (comma-separated)")
+                skills = st.text_input("Skills * (comma-separated)")
                 updates["skills"] = _comma_list(skills)
             if "experience" in missing:
                 experience = st.text_area(
-                    "Experience — one per line: organization | role | description"
+                    "Experience * — one per line: "
+                    "organization | role | description"
                 )
                 updates["experience"] = _experience_from_text(experience)
 
@@ -249,83 +319,151 @@ def _render_workflow(user_id: str) -> None:
 
     elif pending and pending.get("type") == "confirm_profile":
         st.subheader("Review your profile")
-        with st.form(f"confirm_profile_{thread_id}"):
-            profile = _profile_form(pending["profile"], f"confirm_{thread_id}")
-            confirm_col, cancel_col = st.columns(2)
-            with confirm_col:
-                confirmed = st.form_submit_button(
-                    "Confirm and save", type="primary"
-                )
-            with cancel_col:
-                cancelled = st.form_submit_button("Cancel")
+        st.caption(
+            "Fields marked with * are required. Skills and experience remain "
+            "required according to the existing onboarding rules."
+        )
+        account = profile_repository.get_user(user_id)
+        review_profile = dict(pending["profile"])
+        if account.get("google_id"):
+            review_profile.update(name=account["name"], email=account["email"])
+        profile = _profile_form(
+            review_profile,
+            f"confirm_{thread_id}",
+            show_required=True,
+            identity_locked=bool(account.get("google_id")),
+        )
+        missing_fields, errors = find_profile_issues(profile)
+        if missing_fields:
+            st.warning(
+                "Complete the required fields: "
+                + ", ".join(field.replace("_", " ") for field in missing_fields)
+            )
+        for error in errors:
+            st.error(error)
 
-            if confirmed or cancelled:
-                response = {
-                    "confirmed": confirmed,
-                    "profile": profile,
-                }
-                _resume_graph(Command(resume=response), thread_id)
-                st.rerun()
+        with st.container(horizontal=True, horizontal_alignment="right"):
+            cancelled = st.button(
+                "Cancel",
+                key=f"cancel_{thread_id}",
+                icon=":material/close:",
+            )
+            confirmed = st.button(
+                "Confirm and save",
+                type="primary",
+                key=f"confirm_{thread_id}",
+                icon=":material/check:",
+                disabled=bool(missing_fields or errors),
+            )
+
+        if confirmed or cancelled:
+            response = {
+                "confirmed": confirmed,
+                "profile": profile,
+            }
+            _resume_graph(Command(resume=response), thread_id)
+            st.rerun()
 
     elif result.get("confirmed"):
-        st.success("Profile and career analysis were saved to SQL memory.")
-        st.json(result.get("career_profile") or {})
+        if result.get("saved_profile", {}).get("profile_changed") is False:
+            st.info(
+                "No profile changes detected. The profile version and existing "
+                "career analysis were not updated."
+            )
+        else:
+            st.success("Profile and career analysis were saved to SQL memory.")
+            st.json(result.get("career_profile") or {})
     else:
         st.info("Onboarding was cancelled. No profile changes were saved.")
 
 
-def _select_user() -> str | None:
-    users = profile_repository.list_users()
-    if not users:
-        st.info("Create a local profile before uploading a resume.")
-        with st.form("create_user"):
-            name = st.text_input("Name")
-            email = st.text_input("Email (optional)")
-            if st.form_submit_button("Create profile", type="primary"):
-                user = profile_repository.get_or_create_user(name, email)
-                st.session_state.selected_user_id = user["user_id"]
-                st.rerun()
-        return None
-
-    user_ids = [user["user_id"] for user in users]
-    selected_id = st.session_state.get("selected_user_id")
-    if selected_id not in user_ids:
-        selected_id = user_ids[0]
-
-    selected_id = st.sidebar.selectbox(
-        "Active profile",
-        user_ids,
-        index=user_ids.index(selected_id),
-        format_func=lambda user_id: next(
-            user["name"] for user in users if user["user_id"] == user_id
+def _render_upload(user_id: str, *, is_demo: bool = False) -> None:
+    st.subheader("Career document onboarding")
+    _restore_pending_workflow(user_id)
+    if is_demo:
+        st.info(
+            "Download the synthetic files below, then upload them together to "
+            "exercise the same S3, extraction, confirmation, and SQL workflow "
+            "used by Google-authenticated users."
+        )
+        with st.container(horizontal=True):
+            for filename, label in (
+                ("Demo_Resume.pdf", "Download demo resume"),
+                ("Demo_Portfolio.pdf", "Download demo portfolio"),
+            ):
+                path = ROOT / "demo" / filename
+                st.download_button(
+                    label,
+                    data=path.read_bytes(),
+                    file_name=filename,
+                    mime="application/pdf",
+                    key=f"download_{filename}",
+                    on_click="ignore",
+                )
+    max_size_mib = min(int(os.getenv("MAX_DOCUMENT_SIZE_MIB", "10")), 10)
+    uploaded_files = st.file_uploader(
+        "Upload one or more PDF or DOCX career documents",
+        type=["pdf", "docx"],
+        accept_multiple_files=True,
+        max_upload_size=max_size_mib,
+        help=(
+            f"Original documents are stored privately in S3. "
+            f"Maximum size: {max_size_mib} MiB."
         ),
     )
-    st.session_state.selected_user_id = selected_id
-    return selected_id
+    document_types: list[str] = []
+    for index, uploaded_file in enumerate(uploaded_files or []):
+        document_types.append(
+            st.selectbox(
+                f"Type for {uploaded_file.name}",
+                ["resume", "portfolio", "transcript", "certificate", "other"],
+                index=0 if index == 0 else 1,
+                key=f"onboarding_type_{index}_{uploaded_file.name}",
+            )
+        )
 
-
-def _render_upload(user_id: str) -> None:
-    st.subheader("Resume onboarding")
-    uploaded_file = st.file_uploader("Upload a PDF resume", type=["pdf"])
     if st.button(
-        "Analyze resume", type="primary", disabled=uploaded_file is None
+        "Analyze documents",
+        type="primary",
+        icon=":material/description:",
+        disabled=not uploaded_files,
     ):
-        thread_id = str(uuid4())
-        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as resume_file:
-            resume_file.write(uploaded_file.getvalue())
-            resume_path = Path(resume_file.name)
+        thread_id = _workflow_thread_id(user_id)
+        profile_graph.checkpointer.delete_thread(thread_id)
+        pending_documents: list[dict[str, Any]] = []
+        temporary_paths: list[Path] = []
+        for index, uploaded_file in enumerate(uploaded_files):
+            suffix = Path(uploaded_file.name).suffix.lower()
+            with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as stream:
+                stream.write(uploaded_file.getvalue())
+                path = Path(stream.name)
+            temporary_paths.append(path)
+            pending_documents.append(
+                {
+                    "path": str(path),
+                    "original_filename": uploaded_file.name,
+                    "content_type": uploaded_file.type,
+                    "document_type": document_types[index],
+                }
+            )
         try:
             st.session_state.workflow_thread_id = thread_id
-            _resume_graph(
-                {
-                    "resume_path": str(resume_path),
-                    "user_id": user_id,
-                    "confirmed": False,
-                },
-                thread_id,
-            )
+            try:
+                _resume_graph(
+                    {
+                        "documents": pending_documents,
+                        "existing_profile": profile_repository.get_profile(user_id),
+                        "user_id": user_id,
+                        "confirmed": False,
+                    },
+                    thread_id,
+                )
+            except Exception as error:
+                st.error(f"Resume processing failed: {error}")
+                return
         finally:
-            resume_path.unlink(missing_ok=True)
+            for path in temporary_paths:
+                path.unlink(missing_ok=True)
         st.rerun()
 
     _render_workflow(user_id)
@@ -338,17 +476,35 @@ def _render_profile(user_id: str) -> None:
         return
 
     st.subheader("My profile")
+    st.caption(f"Current profile version: v{profile['profile_version']}")
+    if profile.get("source_documents"):
+        st.caption(
+            "Sources: "
+            + ", ".join(
+                item["filename"] for item in profile["source_documents"]
+            )
+        )
     with st.form("edit_profile"):
-        updated_profile = _profile_form(profile, "edit")
+        account = profile_repository.get_user(user_id)
+        updated_profile = _profile_form(
+            profile,
+            "edit",
+            show_required=True,
+            identity_locked=bool(account.get("google_id")),
+        )
         if st.form_submit_button("Save profile changes", type="primary"):
             missing_fields, errors = find_profile_issues(updated_profile)
             if missing_fields or errors:
                 details = ", ".join(missing_fields + errors)
                 st.error(f"Please correct the required profile fields: {details}")
             else:
-                profile_repository.upsert_profile(user_id, updated_profile)
-                st.success("Profile changes saved.")
-                st.rerun()
+                result = profile_repository.upsert_profile(
+                    user_id, updated_profile
+                )
+                if result["profile_changed"]:
+                    st.success("Profile changes saved. Career analysis is now stale.")
+                else:
+                    st.info("No changes detected. Profile version was not updated.")
 
 
 def _render_analysis(user_id: str) -> None:
@@ -360,7 +516,12 @@ def _render_analysis(user_id: str) -> None:
 
     st.subheader("Career analysis")
     if analysis:
-        if analysis["profile_version"] < profile["profile_version"]:
+        st.caption(
+            f"Analysis v{analysis['analysis_version']} · generated "
+            f"{analysis['generated_at']} · profile v"
+            f"{analysis['profile_version_used']}"
+        )
+        if analysis["is_stale"]:
             st.warning(
                 "Your profile has changed since this analysis was generated."
             )
@@ -386,25 +547,450 @@ def _render_analysis(user_id: str) -> None:
         st.rerun()
 
 
+def _render_documents(user_id: str) -> None:
+    st.subheader("Documents")
+    st.caption(
+        "Documents are private S3 objects. SQLite stores only their metadata."
+    )
+    max_size_mib = min(int(os.getenv("MAX_DOCUMENT_SIZE_MIB", "10")), 10)
+
+    with st.form("document_upload"):
+        uploaded_documents = st.file_uploader(
+            "Upload PDF or DOCX documents",
+            type=["pdf", "docx"],
+            accept_multiple_files=True,
+            max_upload_size=max_size_mib,
+            key="document_file",
+        )
+        document_type = st.selectbox(
+            "Document type for this batch",
+            ["resume", "portfolio", "transcript", "certificate", "other"],
+            index=1,
+            key="document_type",
+        )
+        submitted = st.form_submit_button(
+            "Store document",
+            type="primary",
+            icon=":material/cloud_upload:",
+        )
+
+    if submitted:
+        if not uploaded_documents:
+            st.warning("Choose at least one PDF or DOCX document first.")
+        else:
+            try:
+                for uploaded in uploaded_documents:
+                    document_service.upload(
+                        user_id=user_id,
+                        filename=uploaded.name,
+                        content_type=uploaded.type,
+                        data=uploaded.getvalue(),
+                        document_type=document_type or "other",
+                    )
+                st.success(f"Stored {len(uploaded_documents)} document(s) privately.")
+                st.rerun()
+            except Exception as error:
+                st.error(f"Document upload failed: {error}")
+
+    documents = profile_repository.list_documents(user_id)
+    if not documents:
+        st.info("No stored documents yet.")
+        return
+
+    for document in documents:
+        with st.container(border=True):
+            st.markdown(f"**{document['filename']}**")
+            st.caption(
+                f"{document['document_type']} · "
+                f"{document['size_bytes'] / 1024:.1f} KiB · "
+                f"uploaded {document['uploaded_at']}"
+            )
+            related_versions = document.get("profile_versions") or []
+            st.caption(
+                "Related profile versions: "
+                + (
+                    ", ".join(f"v{number}" for number in related_versions)
+                    if related_versions
+                    else "None"
+                )
+            )
+            with st.container(horizontal=True):
+                st.download_button(
+                    "Download",
+                    data=lambda document_id=document["document_id"]: (
+                        document_service.download(user_id, document_id)
+                    ),
+                    file_name=document["filename"],
+                    mime=document["content_type"],
+                    key=f"download_{document['document_id']}",
+                    icon=":material/download:",
+                    on_click="ignore",
+                )
+                if st.button(
+                    "Delete",
+                    key=f"delete_{document['document_id']}",
+                    icon=":material/delete:",
+                ):
+                    try:
+                        document_service.delete(user_id, document["document_id"])
+                        st.success("Document deleted.")
+                        st.rerun()
+                    except Exception as error:
+                        st.error(f"Document deletion failed: {error}")
+
+
+def _render_memory(user_id: str) -> None:
+    st.subheader("Memory")
+    st.caption(
+        "Profile and analysis versions are immutable. Rollback changes only the "
+        "current pointer."
+    )
+
+    st.markdown("### Profile history")
+    profile_versions = profile_repository.list_profile_versions(user_id)
+    if not profile_versions:
+        st.info("No confirmed profile versions yet.")
+    for version in profile_versions:
+        label = f"Profile v{version['version_number']}"
+        if version["is_current"]:
+            label += " (Current)"
+        with st.expander(label, expanded=version["is_current"]):
+            st.caption(f"Created: {version['created_at']}")
+            sources = version.get("source_documents") or []
+            st.write(
+                "Sources: "
+                + (", ".join(item["filename"] for item in sources) or "Manual edit")
+            )
+            st.json(version["snapshot_data"])
+            if not version["is_current"] and st.button(
+                "Rollback to this profile version",
+                key=f"rollback_profile_{version['version_id']}",
+            ):
+                profile_repository.rollback_profile(user_id, version["version_id"])
+                for key in list(st.session_state):
+                    if key.startswith("edit_"):
+                        del st.session_state[key]
+                st.success("Current profile pointer updated.")
+                st.rerun()
+
+    st.markdown("### Career analysis history")
+    analysis_versions = profile_repository.list_analysis_versions(user_id)
+    if not analysis_versions:
+        st.info("No career analysis versions yet.")
+    for version in analysis_versions:
+        label = f"Career Analysis v{version['analysis_version']}"
+        if version["is_current"]:
+            label += " (Current)"
+        with st.expander(label, expanded=version["is_current"]):
+            st.caption(
+                f"Generated: {version['generated_at']} · Profile v"
+                f"{version['profile_version_used']}"
+            )
+            st.json(
+                {
+                    "strengths": version["strengths"],
+                    "possible_roles": version["possible_roles"],
+                    "recommended_next_skills": version[
+                        "recommended_next_skills"
+                    ],
+                }
+            )
+            if not version["is_current"] and st.button(
+                "Rollback to this analysis",
+                key=f"rollback_analysis_{version['analysis_version_id']}",
+            ):
+                profile_repository.rollback_analysis(
+                    user_id, version["analysis_version_id"]
+                )
+                st.success("Current analysis pointer updated.")
+                st.rerun()
+
+    st.markdown("### Memory candidates")
+    candidates = profile_repository.list_memory_candidates(user_id)
+    pending = [item for item in candidates if item["status"] == "pending"]
+    if not pending:
+        st.info("No AI memory suggestions are waiting for review.")
+    for candidate in pending:
+        with st.container(border=True):
+            st.write(f"**{candidate['category']}** — {candidate['content']}")
+            confidence = (
+                candidate["confidence"]
+                if candidate["confidence"] is not None
+                else "n/a"
+            )
+            st.caption(
+                f"Source: {candidate['source']} · confidence: "
+                f"{confidence}"
+            )
+            with st.container(horizontal=True):
+                if st.button(
+                    "Accept",
+                    key=f"accept_memory_{candidate['candidate_id']}",
+                ):
+                    profile_repository.review_memory_candidate(
+                        user_id, candidate["candidate_id"], accept=True
+                    )
+                    st.rerun()
+                if st.button(
+                    "Reject",
+                    key=f"reject_memory_{candidate['candidate_id']}",
+                ):
+                    profile_repository.review_memory_candidate(
+                        user_id, candidate["candidate_id"], accept=False
+                    )
+                    st.rerun()
+
+    st.markdown("### Approved flexible memory")
+    memories = profile_repository.list_memories(user_id)
+    if not memories:
+        st.info("No approved flexible memories yet.")
+    for memory in memories:
+        st.markdown(f"- **{memory['category']}**: {memory['content']}")
+
+
+def _render_connections(user_id: str) -> None:
+    with st.expander("People Search connections"):
+        st.caption(
+            "Optional private inputs. Public-source evidence is still required for "
+            "external identity claims."
+        )
+        uploaded = st.file_uploader(
+            "Import connections CSV",
+            type=["csv"],
+            key="connection_csv",
+            help="Required column: name. Maximum 500 rows.",
+        )
+        if uploaded and st.button("Validate and import CSV", key="import_connections"):
+            rows, errors = validate_connection_csv(
+                uploaded.getvalue().decode("utf-8-sig", errors="replace")
+            )
+            for error in errors:
+                st.error(error)
+            if not errors:
+                for row in rows:
+                    profile_repository.create_connection(user_id, row)
+                st.success(f"Imported {len(rows)} connections.")
+                st.rerun()
+        with st.form("manual_connection"):
+            name = st.text_input("Name *")
+            role = st.text_input("Current role")
+            organization = st.text_input("Organization")
+            public_url = st.text_input("Public professional/profile URL")
+            email = st.text_input("User-provided email (private)")
+            notes = st.text_area("Private notes")
+            if st.form_submit_button("Add connection"):
+                try:
+                    profile_repository.create_connection(
+                        user_id,
+                        {
+                            "name": name,
+                            "current_role": role,
+                            "organization": organization,
+                            "public_profile_url": public_url,
+                            "user_provided_email": email,
+                            "notes": notes,
+                            "source_type": "manual",
+                        },
+                    )
+                    st.success("Connection saved.")
+                    st.rerun()
+                except ValueError as error:
+                    st.error(str(error))
+        connections = profile_repository.list_connections(user_id)
+        if connections:
+            st.caption(f"{len(connections)} private connection records available.")
+
+
+def _render_agent_activity(user_id: str, conversation_id: str) -> None:
+    runs = profile_repository.list_agent_runs(user_id, conversation_id)
+    if not runs:
+        return
+    latest = runs[0]
+    with st.expander("Agent Activity", expanded=True):
+        st.write(f"**Goal:** {latest['goal'] or 'Not set'}")
+        st.caption(
+            f"Intent: {latest['intent'] or 'classifying'} · Status: "
+            f"{latest['status']} · Sources/tools: {len(latest['tool_calls'])}"
+        )
+        for step in latest["steps"]:
+            marker = "✅" if step["status"] == "completed" else "⚠️" if step["status"] == "failed" else "⏳"
+            st.markdown(f"{marker} **{step['stage']}** — {step['display_summary']}")
+        for call in latest["tool_calls"]:
+            duration = f"{call['duration_ms']} ms" if call["duration_ms"] is not None else "duration unknown"
+            st.caption(
+                f"Tool: {call['tool_name']} · {call['status']} · {duration}"
+            )
+            if call["error_message"]:
+                st.warning(call["error_message"])
+
+
+def _render_agent_results(user_id: str, conversation_id: str) -> None:
+    result = st.session_state.get("agent_last_result") or {}
+    if result.get("conversation_id") == conversation_id:
+        jobs = result.get("job_candidates") or []
+        verified = [item for item in jobs if item.get("hard_constraints_met")]
+        unverified = [item for item in jobs if not item.get("hard_constraints_met")]
+        if verified:
+            st.markdown("### Verified job candidates")
+            for item in verified:
+                with st.container(border=True):
+                    st.write(f"**{item.get('title') or 'unknown'} — {item.get('company') or 'unknown'}**")
+                    st.write(f"Location: {item.get('location') or 'unknown'} · Employment: {item.get('employment_type') or 'unknown'}")
+                    st.write(f"Eligibility: {item.get('eligibility') or 'unknown'}")
+                    if item.get("application_url"):
+                        st.link_button("Official application", item["application_url"])
+                    st.caption(f"Source: {item.get('source_url')} · Retrieved: {item.get('retrieved_at')}")
+        if unverified:
+            st.markdown("### Eligibility not verified")
+            st.caption("These candidates do not count toward the verified total.")
+            for item in unverified:
+                st.markdown(f"- **{item.get('title') or 'unknown'} — {item.get('company') or 'unknown'}** · [source]({item.get('source_url')})")
+        people = result.get("people_candidates") or []
+        if people:
+            st.markdown("### People candidates")
+            for item in people:
+                with st.container(border=True):
+                    st.write(f"**{item.get('name')}** — {item.get('current_role') or 'role unknown'}")
+                    st.write(f"Organization: {item.get('organization') or 'unknown'}")
+                    st.write("Relevant connection: " + ("; ".join(item.get("relevant_connection") or []) or "unknown"))
+                    st.write(f"Public contact: {item.get('public_contact') or 'unavailable'}")
+                    st.link_button("Public source", item["public_source_url"])
+
+    resume_drafts = profile_repository.list_resume_revision_drafts(user_id)
+    if resume_drafts:
+        st.markdown("### Resume revision drafts")
+        for draft in resume_drafts:
+            with st.expander(f"Draft / Not applied — {draft['summary']}"):
+                for change in draft["changes"]:
+                    st.write(f"**{change['section']}**")
+                    st.write(f"Original: {change['original_text'] or 'unknown'}")
+                    st.write(f"Proposed: {change['proposed_text']}")
+                    st.caption(f"Reason: {change['rationale']} · Evidence: {', '.join(change['profile_evidence_ids'] + change['job_evidence_ids']) or 'none'}")
+                    for warning in change["warnings"]:
+                        st.warning(warning)
+    outreach_drafts = profile_repository.list_outreach_drafts(user_id)
+    if outreach_drafts:
+        st.markdown("### Outreach drafts")
+        for draft in outreach_drafts:
+            with st.expander(f"{draft['status'].title()} / {'Sent' if draft['sent_at'] else 'Not sent'} — {draft['recipient_name']}"):
+                st.text_input("Subject", value=draft["subject"], disabled=True, key=f"draft_subject_{draft['draft_id']}")
+                st.text_area("Body", value=draft["body"], disabled=True, key=f"draft_body_{draft['draft_id']}")
+                with st.container(horizontal=True):
+                    if draft["status"] == "draft" and st.button("Mark ready", key=f"ready_{draft['draft_id']}"):
+                        outreach_service.mark_status(user_id, draft["draft_id"], "ready", explicit_user_action=True)
+                        st.rerun()
+                    if draft["status"] == "ready" and st.button("Mark sent", key=f"sent_{draft['draft_id']}"):
+                        outreach_service.mark_status(user_id, draft["draft_id"], "sent", explicit_user_action=True)
+                        st.rerun()
+                    if draft["status"] != "archived" and st.button("Archive", key=f"archive_{draft['draft_id']}"):
+                        outreach_service.mark_status(user_id, draft["draft_id"], "archived", explicit_user_action=True)
+                        st.rerun()
+
+
+def _render_career_assistant(user_id: str) -> None:
+    st.subheader("Career Assistant")
+    st.caption(
+        "Conversations are stored in SQL. Chat does not automatically change "
+        "your profile or memory."
+    )
+    _render_connections(user_id)
+    conversations = profile_repository.list_conversations(user_id)
+    if st.button("New conversation", icon=":material/add:"):
+        conversation = profile_repository.create_conversation(
+            user_id, f"Career conversation {len(conversations) + 1}"
+        )
+        st.session_state.active_conversation_id = conversation["conversation_id"]
+        st.rerun()
+
+    if not conversations:
+        st.info("Create a conversation to start chatting.")
+        return
+    conversation_ids = [item["conversation_id"] for item in conversations]
+    active_id = st.session_state.get("active_conversation_id")
+    if active_id not in conversation_ids:
+        active_id = conversation_ids[0]
+    active_id = st.selectbox(
+        "Conversation",
+        conversation_ids,
+        index=conversation_ids.index(active_id),
+        key="conversation_selector",
+        format_func=lambda item_id: next(
+            item["title"] for item in conversations if item["conversation_id"] == item_id
+        ),
+    )
+    st.session_state.active_conversation_id = active_id
+    _render_agent_activity(user_id, active_id)
+    _render_agent_results(user_id, active_id)
+    conversation = profile_repository.get_conversation(user_id, active_id)
+    for message in conversation["messages"]:
+        with st.chat_message(message["role"]):
+            st.write(message["content"])
+
+    prompt = st.chat_input("Ask CareerTrace about your career")
+    if prompt:
+        try:
+            events: list[dict[str, Any]] = []
+            with st.spinner("CareerTrace is thinking…"):
+                respond_to_user(
+                    user_id,
+                    active_id,
+                    prompt,
+                    event_handler=events.append,
+                )
+            final_event = next(
+                (item for item in reversed(events) if item.get("type") == "final"),
+                None,
+            )
+            if final_event:
+                st.session_state.agent_last_result = final_event
+            st.rerun()
+        except Exception as error:
+            st.error(f"Career Assistant failed: {error}")
+
+
 def main() -> None:
     st.set_page_config(page_title="CareerTrace AI", page_icon="🧭", layout="wide")
     init_db()
+
+    current_user = require_authenticated_user()
+    if current_user is None:
+        return
+    user_id = current_user["user_id"]
+    is_demo = current_user.get("is_demo") is True
+
     st.title("CareerTrace AI")
     st.caption("Persistent career profile management with bounded AI reasoning")
-
-    user_id = _select_user()
-    if not user_id:
-        return
-
-    upload_tab, profile_tab, analysis_tab = st.tabs(
-        ["Resume Upload", "My Profile", "Career Analysis"]
+    if is_demo:
+        st.warning("Demo workspace — uses synthetic data")
+    (
+        upload_tab,
+        profile_tab,
+        analysis_tab,
+        documents_tab,
+        memory_tab,
+        assistant_tab,
+    ) = st.tabs(
+        [
+            "Document upload",
+            "My profile",
+            "Career analysis",
+            "Documents",
+            "Memory",
+            "Career Assistant",
+        ]
     )
     with upload_tab:
-        _render_upload(user_id)
+        _render_upload(user_id, is_demo=is_demo)
     with profile_tab:
         _render_profile(user_id)
     with analysis_tab:
         _render_analysis(user_id)
+    with documents_tab:
+        _render_documents(user_id)
+    with memory_tab:
+        _render_memory(user_id)
+    with assistant_tab:
+        _render_career_assistant(user_id)
 
 
 if __name__ == "__main__":

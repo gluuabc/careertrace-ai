@@ -1,10 +1,12 @@
 import os
+import threading
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
 
 from dotenv import load_dotenv
 from sqlalchemy import Engine, create_engine, event
+from sqlalchemy.engine import make_url
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
@@ -12,16 +14,35 @@ load_dotenv()
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_DATABASE_URL = f"sqlite:///{PROJECT_ROOT / 'data' / 'careertrace.db'}"
+_migration_lock = threading.Lock()
 
 
 class Base(DeclarativeBase):
     """Base class shared by all SQLAlchemy models."""
 
 
+def resolve_database_url(database_url: str | None = None) -> str:
+    """Resolve relative SQLite files against the repository, not process CWD."""
+
+    raw_url = database_url or os.getenv("DATABASE_URL", DEFAULT_DATABASE_URL)
+    parsed = make_url(raw_url)
+    if parsed.drivername.startswith("sqlite") and parsed.database not in {
+        None,
+        "",
+        ":memory:",
+    }:
+        database_path = Path(parsed.database).expanduser()
+        if not database_path.is_absolute():
+            database_path = (PROJECT_ROOT / database_path).resolve()
+        database_path.parent.mkdir(parents=True, exist_ok=True)
+        return str(parsed.set(database=str(database_path)))
+    return raw_url
+
+
 def create_database_engine(database_url: str | None = None) -> Engine:
     """Create a portable engine with SQLite behavior isolated here."""
 
-    url = database_url or os.getenv("DATABASE_URL", DEFAULT_DATABASE_URL)
+    url = resolve_database_url(database_url)
     options: dict = {"future": True}
 
     if url.startswith("sqlite"):
@@ -56,11 +77,24 @@ SessionLocal = create_session_factory(engine)
 
 
 def init_db(target_engine: Engine | None = None) -> None:
-    """Create prototype tables. Alembic migrations can replace this later."""
+    """Create test schemas directly or migrate the configured runtime database."""
 
     from app.database import models  # noqa: F401
 
-    Base.metadata.create_all(bind=target_engine or engine)
+    if target_engine is not None:
+        Base.metadata.create_all(bind=target_engine)
+        return
+
+    from alembic import command
+    from alembic.config import Config
+
+    with _migration_lock:
+        config = Config(str(PROJECT_ROOT / "alembic.ini"))
+        config.set_main_option("script_location", str(PROJECT_ROOT / "migrations"))
+        config.set_main_option(
+            "sqlalchemy.url", resolve_database_url()
+        )
+        command.upgrade(config, "head")
 
 
 @contextmanager

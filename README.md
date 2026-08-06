@@ -135,10 +135,10 @@ Current LangGraph flow:
 START
  |
  v
-Upload Resume
+Store Original Documents in Private S3
  |
  v
-Extract Resume Text
+Extract and Combine Document Text
  |
  v
 LLM Extract Facts
@@ -165,14 +165,26 @@ END
 
 The workflow currently supports:
 
-- PDF resume upload
-- Resume text extraction
+- Google OpenID Connect login, per-session judge users, and UUID-backed
+  multi-user isolation
+- Multi-document PDF and DOCX upload to private S3
+- Resume, portfolio, transcript, certificate, and other document classification
+- Combined extraction merged with the current confirmed SQL profile
 - Structured LLM-based profile extraction
-- Missing-information detection and collection
+- Required school, major, graduation year, skills, and experience validation
 - Editable human confirmation using LangGraph interrupts
-- Persistent SQLite profile storage
-- Career profile generation and analysis history
+- Persistent SQLite profile, analysis, document, and conversation storage
+- Durable SQLite LangGraph checkpoints for interrupted workflow recovery
+- Immutable profile and career-analysis versions with pointer-only rollback
+- Profile-version links to multiple source documents
+- Approved flexible memories separated from pending memory candidates
+- SQL-backed, bounded Career Agent with observable tool trajectories and no automatic profile edits
+- Official public-source job search with deterministic hard filtering and evidence
+- Permitted people search across user connections, OpenAlex, and Wikidata
+- SQL-backed resume-revision drafts and unsent outreach drafts
+- No-op profile saves that do not create false versions or duplicate analyses
 - Streamlit profile viewing and editing
+- Per-user document upload, download, and deletion
 
 Example generated information:
 
@@ -184,26 +196,88 @@ Example generated information:
 }
 ```
 
+### Stateful Career Agent
+
+The Career Assistant is a thin facade over `app/graph/career_agent_graph.py`.
+Every user request creates a user-scoped `agent_runs` row, follows a closed intent
+router, loads the relevant Skill, executes a bounded structured-tool loop, and
+stores only observable steps and sanitized tool calls. Hidden model reasoning is
+neither displayed nor persisted.
+
+Supported routes:
+
+```text
+START -> initialize_run -> classify_intent -> prepare_workflow
+  ├── concise_guidance / action_plan / clarification -> agent_model
+  └── job_search / people_search / resume_revision / outreach
+        -> plan_action -> execute_tools -> agent_model
+agent_model -> execute_tools (bounded) | finalize -> END
+```
+
+The model-visible tools are:
+
+- `read_skill` and `read_skill_file`
+- `search_jobs` and `get_job_details`
+- `search_people` and `get_person_details`
+- `save_resume_revision_draft`
+- `save_outreach_draft`
+- `update_outreach_status` (cannot mark `sent`; that requires a UI action)
+
+The LLM never selects `user_id`; identity is injected from trusted graph state.
+Tool results remain proper `ToolMessage` objects. Source, iteration, and no-new-
+result stopping conditions are enforced by code.
+
+#### Job sources and limitations
+
+`config/job_sources.yaml` is the single version-controlled company catalog.
+Sources start disabled and unverified. On 2026-08-06, public Greenhouse GET
+endpoints were validated for the enabled catalog entries; unverified companies
+remain disabled rather than receiving guessed ATS identifiers. Lever and official
+public-page adapters are available when a validated catalog record selects them.
+Firecrawl and Playwright are optional, disabled by default, and return structured
+skips when unavailable.
+
+Job fields are normalized without inference. Eligibility is a hard constraint by
+default: unknown eligibility does not count toward the verified target and is
+shown separately as **Eligibility not verified**. No source adapter applies to a
+job.
+
+#### People sources and limitations
+
+People Search accepts optional private manual/CSV connections and searches
+OpenAlex for academic discovery or Wikidata for public identity discovery. CSV
+imports are user-scoped, row-limited, field-limited, and reject executable
+spreadsheet formulas. LinkedIn, protected directories, inferred email patterns,
+phone numbers, private addresses, and data brokers are prohibited. Recruiter
+results require explicit public recruiting/talent-acquisition role evidence.
+
+#### Drafts and approval boundaries
+
+Resume revisions are structured SQL drafts linked to an immutable profile version
+and do not modify the profile or original S3 document. Outreach is saved with
+status `draft` and no sending side effect. Only an explicit user UI action can
+mark outreach `sent`, which records `sent_at`.
+
+#### Evidence and context
+
+Every external source result receives an `ev_<uuid>` evidence ID, URL, retrieval
+time, hash, excerpt, and provenance. Small evidence stays in SQL. Evidence above
+`EVIDENCE_S3_THRESHOLD_BYTES` is gzip-compressed into the existing S3 bucket at
+`agent-evidence/{user_id}/{run_id}/...`; safe SQL fallback is bounded and warnings
+are retained.
+
+The immutable system prompt contains no user data. A fresh `<runtime_context>`
+block supplies the current profile, approved memories, task, selected entities,
+loaded Skills, and one current status per model call. Adaptive compression starts
+only above the configured threshold, preserves evidence IDs and hard constraints,
+and stores a query-aware summary boundary while leaving original SQL messages
+unchanged.
+
 ---
 
-# Planned Development
+# Persistence Foundation
 
-## Phase 1: Profile Memory
-
-Improve profile storage:
-
-Store:
-
-- Education
-- Skills
-- Projects
-- Experience
-- Career strengths
-- Recommended roles
-- Skill recommendations
-
-
-Current storage:
+Current local SQL storage:
 
 ```
 SQLite
@@ -213,10 +287,24 @@ SQLite
  ├── skills
  ├── projects
  ├── experience
- └── career_analysis
+ ├── career_analysis
+ ├── career_analysis_versions
+ ├── profile_versions
+ ├── profile_document_sources
+ ├── documents
+ ├── memory_candidates
+ ├── memories
+ ├── conversations
+ ├── messages
+ ├── agent_runs / agent_steps / agent_tool_calls
+ ├── agent_evidence
+ ├── conversation_context_summaries
+ ├── user_connections
+ ├── resume_revision_drafts / resume_revision_changes
+ └── outreach_drafts
 ```
 
-Future storage:
+Planned production storage:
 
 ```
 CockroachDB
@@ -226,7 +314,9 @@ CockroachDB
 
 ---
 
-## Phase 2: Job Search Agent
+# Planned Development
+
+## Job Search Agent
 
 Flow:
 
@@ -251,7 +341,7 @@ Save Candidates
 
 ---
 
-## Phase 3: Alumni Networking Agent
+## Alumni Networking Agent
 
 Flow:
 
@@ -340,6 +430,7 @@ careertrace-ai/
 │   ├── main.py
 │   │
 │   ├── graph/
+│   │   ├── checkpoint.py
 │   │   └── profile_graph.py
 │   │
 │   ├── nodes/
@@ -354,9 +445,18 @@ careertrace-ai/
 │   │   ├── database.py
 │   │   ├── models.py
 │   │   └── repository.py
+│   ├── auth/
+│   │   ├── google_oauth.py
+│   │   └── session.py
+│   ├── services/
+│   │   ├── career_assistant.py
+│   │   └── documents.py
+│   ├── storage/
+│   │   ├── base.py
+│   │   └── s3.py
 │   │
 │   ├── ui/
-│   │   └── app.py
+│   │   └── dashboard.py
 │   │
 │   ├── llm/
 │   │   └── model.py
@@ -364,8 +464,14 @@ careertrace-ai/
 │   └── state/
 │       └── schema.py
 │
-├── data/
-│   └── careertrace.db  # generated locally and ignored by Git
+├── migrations/
+├── demo/
+│   ├── Demo_Resume.pdf
+│   └── Demo_Portfolio.pdf
+├── infra/
+│   ├── s3-bucket.yaml
+│   └── application-s3-policy.json
+├── data/  # local runtime files are ignored by Git
 │
 ├── tests/
 ├── requirements.txt
@@ -436,7 +542,47 @@ LANGSMITH_PROJECT=CareerTrace
 
 # Local SQL memory
 DATABASE_URL=sqlite:///data/careertrace.db
+LANGGRAPH_CHECKPOINT_DB=data/langgraph_checkpoints.sqlite
+
+# Private S3 document storage
+S3_BUCKET_NAME=careertrace-resumes
+S3_REGION=us-east-1
+MAX_DOCUMENT_SIZE_MIB=10
+
+# Google OpenID Connect
+GOOGLE_CLIENT_ID=<google-client-id>
+GOOGLE_CLIENT_SECRET=<google-client-secret>
+AUTH_COOKIE_SECRET=<strong-random-cookie-signing-secret>
+OAUTH_REDIRECT_URI=http://localhost:8501/oauth2callback
 ```
+
+Register the exact `OAUTH_REDIRECT_URI` as an authorized redirect URI in the
+Google OAuth client. Generate a cookie secret with:
+
+```bash
+python -c "import secrets; print(secrets.token_urlsafe(48))"
+```
+
+Credentials stay server-side. Streamlit's native OIDC implementation validates
+authorization state and nonce; CareerTrace additionally validates the Google
+issuer, audience, authorized party, verified email, issue time, and expiration.
+
+## 5. Provision private S3 storage
+
+An AWS administrator with bucket-provisioning permissions can deploy the
+included retained, encrypted, public-access-blocked bucket:
+
+```bash
+aws cloudformation deploy \
+  --region us-east-1 \
+  --stack-name careertrace-document-storage \
+  --template-file infra/s3-bucket.yaml \
+  --parameter-overrides BucketName=careertrace-resumes
+```
+
+Attach `infra/application-s3-policy.json` to the application role or user. It
+allows only `PutObject`, `GetObject`, and `DeleteObject` beneath the bucket.
+The 10 MiB maximum is enforced before the backend sends a request to S3.
 
 ---
 
@@ -447,20 +593,56 @@ DATABASE_URL=sqlite:///data/careertrace.db
 Start the Streamlit application from the repository root:
 
 ```bash
-streamlit run app/ui/app.py
+streamlit run app/ui/dashboard.py
 ```
 
 The web interface provides:
 
-- PDF resume onboarding
+- Google login, judge-demo access, and logout
+- Multi-document PDF/DOCX onboarding
 - Missing-field collection and final profile review
 - Database-backed profile viewing and editing
 - Career preferences
 - Stored career analysis and controlled regeneration
+- Private per-user document management
+- Profile and analysis history with rollback
+- Approved-memory review and persistent Career Assistant conversations
+- Agent Activity, evidence-backed candidate results, saved drafts, and optional connections
+
+## Judge Testing Instructions
+
+Use the deployed CareerTrace URL supplied with the hackathon submission. For a
+local review, the demo URL is `http://localhost:8501` after starting Streamlit.
+
+1. Open the demo URL and click **Try Judge Demo**.
+2. No Google account or OAuth test-user allowlisting is required.
+3. Confirm the **Demo workspace — uses synthetic data** label is visible.
+4. Download `Demo_Resume.pdf` and `Demo_Portfolio.pdf` from the Document Upload
+   page.
+5. Upload both files together, select their document types, and click
+   **Analyze documents**.
+6. Complete required-field collection and review the merged profile before
+   selecting **Confirm and save**.
+7. Explore **My Profile**, **Career Analysis**, **Documents**, **Memory**, and
+   **Career Assistant**.
+8. Use **Logout** to clear the active browser identity.
+
+Each judge browser session creates a new ordinary UUID-backed `users` row marked
+as a demo identity. It starts without a profile or analysis and uses the same S3,
+LangGraph, validation, confirmation, SQL repository, versioning, and Bedrock
+paths as a Google-authenticated user. The repository contains no demo credentials
+or hard-coded analysis. The supplied documents are wholly synthetic and contain
+no real personal information.
+
+The committed demo PDFs can be reproduced with:
+
+```bash
+python scripts/generate_demo_documents.py
+```
 
 ## Command-line workflow
 
-Place a resume PDF in:
+The CLI also requires S3 configuration and accepts a PDF or DOCX:
 
 ```
 data/
@@ -475,7 +657,7 @@ data/resume.pdf
 Run:
 
 ```bash
-python -m app.main data/resume.pdf
+python -m app.main data/resume.pdf --name "Ada Student" --email ada@example.com
 ```
 
 The workflow will:
@@ -490,16 +672,30 @@ The workflow will:
 
 # SQL Memory Design
 
-Graph nodes and the UI access SQL through `app/database/repository.py`; they do
-not issue SQLite-specific queries. `DATABASE_URL` and engine creation are
-isolated in `app/database/database.py`.
+Graph nodes, authentication, document services, and the UI access SQL through
+`app/database/repository.py`; they do not issue SQLite-specific queries.
+`DATABASE_URL` and engine creation are isolated in `app/database/database.py`.
+Alembic migrations run on application startup.
+
+Relative SQLite paths are resolved against the repository root, so launching
+Streamlit from another directory does not silently open a different database.
+Completed user memory is always read from SQL. `LANGGRAPH_CHECKPOINT_DB` is a
+separate SQLite file used only to resume interrupted LangGraph workflows.
+
+Profile facts are written to immutable `profile_versions` JSON snapshots.
+`profiles.current_version_id` selects the active snapshot, and
+`profile_document_sources` records all supporting documents. Career analysis
+uses the equivalent `career_analysis.current_version_id` pointer and immutable
+`career_analysis_versions` linked to the profile version that produced them.
+Rollback changes a pointer only; the next edit receives the next unused version
+number.
 
 To migrate to CockroachDB later:
 
 1. Provision CockroachDB and set a Cockroach-compatible `DATABASE_URL`.
-2. Add Alembic migrations for the existing SQLAlchemy models.
-3. Replace SQLite table creation with migrations.
-4. Keep graph nodes, repository method contracts, and Streamlit views unchanged.
+2. Run the existing Alembic migrations against the CockroachDB URL.
+3. Review transaction retry behavior for CockroachDB serialization failures.
+4. Keep graph nodes, storage service contracts, and Streamlit views unchanged.
 
 Application-generated UUID keys and transaction-scoped profile writes are used
 to keep the schema portable to a distributed SQL deployment.
@@ -510,11 +706,11 @@ to keep the schema portable to a distributed SQL deployment.
 
 ## Current priority
 
-1. Add authentication and multi-user authorization
-2. Add migration management with Alembic
-3. Build job search workflow
-4. Move the SQL repository to CockroachDB
-5. Add autonomous reasoning components
+1. Move the SQL repository to CockroachDB
+2. Add conversation-to-memory candidate extraction and vector retrieval
+3. Add scheduled proactive searches and notifications
+4. Add PDF/DOCX resume-draft export
+5. Add separately approved sending and application actions
 
 ---
 
@@ -525,4 +721,4 @@ to keep the schema portable to a distributed SQL deployment.
 - **LangSmith** — tracing and debugging
 - **CockroachDB** — persistent memory (planned)
 - **Vector Search** — semantic retrieval (planned)
-- **Streamlit** — web interface (planned)
+- **Streamlit** — authenticated web interface

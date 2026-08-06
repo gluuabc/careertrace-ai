@@ -21,7 +21,16 @@ def generate_profile(state: ProfileState) -> dict[str, dict]:
     prompt_profile = {
         key: value
         for key, value in state["saved_profile"].items()
-        if key not in {"profile_version", "updated_at"}
+        if key
+        not in {
+            "user_id",
+            "email",
+            "profile_version",
+            "profile_version_id",
+            "profile_changed",
+            "updated_at",
+            "source_documents",
+        }
     }
     structured_llm = get_llm("reasoning").with_structured_output(CareerProfile)
     result = structured_llm.invoke(

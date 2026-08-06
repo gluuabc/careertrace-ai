@@ -1,7 +1,8 @@
-from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 
+from app.graph.checkpoint import get_default_checkpointer
 from app.nodes.confirmation import confirm_profile
+from app.nodes.documents import store_document
 from app.nodes.extraction import extract_profile
 from app.nodes.memory import save_career_analysis, save_profile
 from app.nodes.profile import generate_profile
@@ -15,7 +16,19 @@ def _route_after_validation(state: ProfileState) -> str:
 
 
 def _route_after_confirmation(state: ProfileState) -> str:
-    return "confirmed" if state.get("confirmed") else "rejected"
+    if state.get("confirmed"):
+        return "confirmed"
+    if state.get("missing_fields") or state.get("validation_errors"):
+        return "invalid"
+    return "rejected"
+
+
+def _route_after_save(state: ProfileState) -> str:
+    return (
+        "changed"
+        if state.get("saved_profile", {}).get("profile_changed", True)
+        else "unchanged"
+    )
 
 
 def build_profile_graph(checkpointer=None):
@@ -23,7 +36,8 @@ def build_profile_graph(checkpointer=None):
 
     workflow = StateGraph(ProfileState)
 
-    # Deterministic document-processing node.
+    # Deterministic private storage and document-processing nodes.
+    workflow.add_node("store_document", store_document)
     workflow.add_node("extract_resume", extract_resume)
     # LLM reasoning node using the low-cost model.
     workflow.add_node("extract_profile", extract_profile)
@@ -37,7 +51,8 @@ def build_profile_graph(checkpointer=None):
     workflow.add_node("generate_profile", generate_profile)
     workflow.add_node("save_career_analysis", save_career_analysis)
 
-    workflow.add_edge(START, "extract_resume")
+    workflow.add_edge(START, "store_document")
+    workflow.add_edge("store_document", "extract_resume")
     workflow.add_edge("extract_resume", "extract_profile")
     workflow.add_edge("extract_profile", "validate_profile")
     workflow.add_conditional_edges(
@@ -54,14 +69,26 @@ def build_profile_graph(checkpointer=None):
         _route_after_confirmation,
         {
             "confirmed": "save_profile",
+            "invalid": "confirm_profile",
             "rejected": END,
         },
     )
-    workflow.add_edge("save_profile", "generate_profile")
+    workflow.add_conditional_edges(
+        "save_profile",
+        _route_after_save,
+        {
+            "changed": "generate_profile",
+            "unchanged": END,
+        },
+    )
     workflow.add_edge("generate_profile", "save_career_analysis")
     workflow.add_edge("save_career_analysis", END)
 
-    return workflow.compile(checkpointer=checkpointer or MemorySaver())
+    return workflow.compile(
+        checkpointer=(
+            checkpointer if checkpointer is not None else get_default_checkpointer()
+        )
+    )
 
 
 profile_graph = build_profile_graph()

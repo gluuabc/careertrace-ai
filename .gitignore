@@ -7,6 +7,17 @@ __pycache__/
 
 # Environment variables
 .env
+.streamlit/secrets.toml
+
+# Local runtime data and uploads
+data/*.db
+data/*.db-*
+data/*.sqlite
+data/*.sqlite3
+data/langgraph_checkpoints.sqlite*
+data/*.pdf
+data/*.docx
+data/profile_memory.json
 
 # OS files
 .DS_Store
