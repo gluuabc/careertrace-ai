@@ -4,6 +4,9 @@ from docx import Document
 from pypdf import PdfReader
 
 from app.state.schema import ProfileState
+from app.database.repository import profile_repository
+from app.database.retrieval_repository import RetrievalRepository
+from app.services.retrieval_corpus import RetrievalCorpusIndexer
 
 
 def _extract_pdf(path: Path) -> str:
@@ -73,5 +76,13 @@ def extract_resume(state: ProfileState) -> dict[str, str | list[dict[str, str]]]
         sections.append(
             f"DOCUMENT: {filename}\nTYPE: {document_type}\nCONTENT:\n{text}"
         )
+
+    user_id = state.get("user_id")
+    document_ids = state.get("document_ids") or ([state["document_id"]] if state.get("document_id") else [])
+    if user_id:
+        indexer = RetrievalCorpusIndexer(RetrievalRepository(profile_repository.session_factory))
+        for index, item in enumerate(extracted):
+            if index < len(document_ids):
+                indexer.index_uploaded_document(user_id=user_id, document_id=document_ids[index], document_type=item["document_type"], filename=item["filename"], text=item["text"])
 
     return {"resume_text": "\n\n---\n\n".join(sections), "document_texts": extracted}

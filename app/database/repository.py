@@ -22,6 +22,7 @@ from app.database.models import (
     ProfileVersion,
     Project,
     Skill,
+    StarredQAPair,
     User,
 )
 
@@ -445,6 +446,7 @@ class ProfileRepository(AgentRepositoryMixin):
     def review_memory_candidate(
         self, user_id: str, candidate_id: str, *, accept: bool
     ) -> dict[str, Any] | None:
+        accepted_memory: dict[str, Any] | None = None
         with session_scope(self.session_factory) as session:
             candidate = session.scalar(
                 select(MemoryCandidate).where(
@@ -469,7 +471,25 @@ class ProfileRepository(AgentRepositoryMixin):
             )
             session.add(memory)
             session.flush()
-            return self._memory_dict(memory)
+            accepted_memory = self._memory_dict(memory)
+        if accepted_memory is not None:
+            # Approval is authoritative; retrieval indexing is additive and must not
+            # make the approval transaction depend on an external embedding service.
+            try:
+                from app.database.retrieval_repository import RetrievalRepository
+
+                RetrievalRepository(self.session_factory).upsert_document(
+                    corpus_type="approved_memory",
+                    user_id=user_id,
+                    source_entity_id=accepted_memory["memory_id"],
+                    source_version="1",
+                    title=accepted_memory["category"],
+                    text_content=accepted_memory["content"],
+                    metadata={"source": accepted_memory["source"]},
+                )
+            except Exception:
+                pass
+        return accepted_memory
 
     def list_memories(self, user_id: str) -> list[dict[str, Any]]:
         with session_scope(self.session_factory) as session:
@@ -520,7 +540,13 @@ class ProfileRepository(AgentRepositoryMixin):
             return result
 
     def add_message(
-        self, user_id: str, conversation_id: str, role: str, content: str
+        self,
+        user_id: str,
+        conversation_id: str,
+        role: str,
+        content: str,
+        *,
+        reply_to_message_id: str | None = None,
     ) -> dict[str, Any]:
         clean_role = role.strip().lower()
         if clean_role not in {"user", "assistant"}:
@@ -529,15 +555,108 @@ class ProfileRepository(AgentRepositoryMixin):
             conversation = self._owned_conversation(
                 session, user_id, conversation_id
             )
+            reply_to = None
+            if reply_to_message_id is not None:
+                reply_to = session.scalar(
+                    select(Message).where(
+                        Message.message_id == reply_to_message_id,
+                        Message.conversation_id == conversation_id,
+                    )
+                )
+                if reply_to is None or reply_to.role != "user":
+                    raise ValueError(
+                        "Reply target must be a user message in this conversation."
+                    )
+                if clean_role != "assistant":
+                    raise ValueError(
+                        "Only an assistant message may reference a user question."
+                    )
             message = Message(
                 conversation=conversation,
                 role=clean_role,
                 content=self._required_text(content, "content"),
+                reply_to=reply_to,
             )
             conversation.updated_at = datetime.now(timezone.utc)
             session.add(message)
             session.flush()
             return self._message_dict(message)
+
+    # ------------------------------------------------------------- starred Q&A
+    def star_qa_pair(
+        self,
+        user_id: str,
+        conversation_id: str,
+        user_message_id: str,
+        assistant_message_id: str,
+        *,
+        preference_update_summary: str | None = None,
+    ) -> dict[str, Any]:
+        with session_scope(self.session_factory) as session:
+            user = self._require_user(session, user_id)
+            conversation = self._owned_conversation(session, user_id, conversation_id)
+            messages = session.scalars(
+                select(Message).where(
+                    Message.conversation_id == conversation_id,
+                    Message.message_id.in_([user_message_id, assistant_message_id]),
+                )
+            ).all()
+            by_id = {item.message_id: item for item in messages}
+            question = by_id.get(user_message_id)
+            answer = by_id.get(assistant_message_id)
+            if question is None or question.role != "user":
+                raise ValueError("The starred question was not found for this user.")
+            if answer is None or answer.role != "assistant":
+                raise ValueError("The starred answer was not found for this user.")
+            if answer.reply_to_message_id != question.message_id:
+                raise ValueError("The assistant message is not linked to this question.")
+            existing = session.scalar(
+                select(StarredQAPair).where(
+                    StarredQAPair.user_id == user_id,
+                    StarredQAPair.user_message_id == user_message_id,
+                    StarredQAPair.assistant_message_id == assistant_message_id,
+                )
+            )
+            if existing is not None:
+                return self._starred_qa_dict(existing)
+            item = StarredQAPair(
+                user=user,
+                conversation=conversation,
+                user_message=question,
+                assistant_message=answer,
+                preference_update_summary=self._clean_optional(
+                    preference_update_summary
+                ),
+            )
+            session.add(item)
+            session.flush()
+            return self._starred_qa_dict(item)
+
+    def unstar_qa_pair(self, user_id: str, starred_qa_id: str) -> None:
+        with session_scope(self.session_factory) as session:
+            item = session.scalar(
+                select(StarredQAPair).where(
+                    StarredQAPair.starred_qa_id == starred_qa_id,
+                    StarredQAPair.user_id == user_id,
+                )
+            )
+            if item is None:
+                raise ValueError("Starred Q&A was not found for this user.")
+            session.delete(item)
+
+    def list_starred_qa_pairs(
+        self, user_id: str, conversation_id: str | None = None
+    ) -> list[dict[str, Any]]:
+        with session_scope(self.session_factory) as session:
+            self._require_user(session, user_id)
+            query = select(StarredQAPair).where(StarredQAPair.user_id == user_id)
+            if conversation_id is not None:
+                self._owned_conversation(session, user_id, conversation_id)
+                query = query.where(StarredQAPair.conversation_id == conversation_id)
+            items = session.scalars(
+                query.order_by(StarredQAPair.created_at.desc())
+            ).all()
+            return [self._starred_qa_dict(item) for item in items]
 
     # ---------------------------------------------------------------- helpers
     @staticmethod
@@ -953,6 +1072,21 @@ class ProfileRepository(AgentRepositoryMixin):
             "conversation_id": item.conversation_id,
             "role": item.role,
             "content": item.content,
+            "reply_to_message_id": item.reply_to_message_id,
+            "created_at": item.created_at.isoformat(),
+        }
+
+    @staticmethod
+    def _starred_qa_dict(item: StarredQAPair) -> dict[str, Any]:
+        return {
+            "starred_qa_id": item.starred_qa_id,
+            "conversation_id": item.conversation_id,
+            "conversation_title": item.conversation.title,
+            "user_message_id": item.user_message_id,
+            "assistant_message_id": item.assistant_message_id,
+            "question": item.user_message.content,
+            "answer": item.assistant_message.content,
+            "preference_update_summary": item.preference_update_summary,
             "created_at": item.created_at.isoformat(),
         }
 

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from enum import StrEnum
-from typing import Annotated, Any, Literal, TypedDict
+from typing import Annotated, Any, Generic, Literal, TypeVar, TypedDict
 from uuid import uuid4
 import os
 
@@ -36,7 +36,7 @@ class IntentDecision(BaseModel):
 class AgentTodoItem(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid4()))
     content: str
-    status: Literal["pending", "in_progress", "completed", "cancelled"] = "pending"
+    status: Literal["pending", "in_progress", "blocked", "completed", "cancelled"] = "pending"
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
 
@@ -84,8 +84,8 @@ class JobSearchRequest(BaseModel):
     graduation_year: int | None = None
     work_authorization_requirement: str | None = None
     required_eligibility: list[str] = Field(default_factory=list)
-    required_skills: list[str] = Field(default_factory=list)
-    preferred_skills: list[str] = Field(default_factory=list)
+    profile_skills: list[str] = Field(default_factory=list)
+    desired_job_skills: list[str] = Field(default_factory=list)
     preferred_companies: list[str] = Field(default_factory=list)
     excluded_companies: list[str] = Field(default_factory=list)
     industries: list[str] = Field(default_factory=list)
@@ -101,6 +101,22 @@ class JobSearchRequest(BaseModel):
         ge=1,
         le=20,
     )
+    cursor: str | None = None
+    page_size: int = Field(default=10, ge=1, le=20)
+
+    @model_validator(mode="before")
+    @classmethod
+    def migrate_legacy_skill_fields(cls, value: Any) -> Any:
+        if not isinstance(value, dict):
+            return value
+        migrated = dict(value)
+        legacy = list(migrated.pop("required_skills", []) or []) + list(
+            migrated.pop("preferred_skills", []) or []
+        )
+        migrated["desired_job_skills"] = list(
+            dict.fromkeys([*(migrated.get("desired_job_skills") or []), *legacy])
+        )
+        return migrated
 
 
 class JobCandidate(BaseModel):
@@ -129,6 +145,9 @@ class JobCandidate(BaseModel):
     fit_explanation: str | None = None
     transferable_skills: list[str] = Field(default_factory=list)
     skill_gaps: list[str] = Field(default_factory=list)
+    first_seen_iteration: int = 1
+    last_seen_iteration: int = 1
+    source_keys: list[str] = Field(default_factory=list)
 
 
 class SearchSufficiency(BaseModel):
@@ -150,6 +169,16 @@ class PeopleSearchRequest(BaseModel):
     research_topics: list[str] = Field(default_factory=list)
     role_keywords: list[str] = Field(default_factory=list)
     requested_count: int = Field(default=5, ge=1, le=20)
+    cursor: str | None = None
+    page_size: int = Field(default=10, ge=1, le=20)
+
+
+class ContactChannel(BaseModel):
+    type: Literal["email", "website", "profile", "other"]
+    value: str
+    provenance: Literal["public_verified", "user_provided_private"]
+    visibility: Literal["public", "private_to_user"]
+    evidence_id: str | None = None
 
 
 class PeopleCandidate(BaseModel):
@@ -167,11 +196,87 @@ class PeopleCandidate(BaseModel):
     fit_explanation: str | None = None
     career_path_summary: str | None = None
     public_source_url: str
-    public_contact: str | None = None
-    contact_status: Literal["available", "unavailable"] = "unavailable"
     retrieved_at: datetime = Field(default_factory=utc_now)
     evidence_ids: list[str] = Field(default_factory=list)
     unknown_fields: list[str] = Field(default_factory=list)
+    contact_channels: list[ContactChannel] = Field(default_factory=list)
+    private_contact_reference: str | None = None
+    first_seen_iteration: int = 1
+    last_seen_iteration: int = 1
+    source_keys: list[str] = Field(default_factory=list)
+
+
+class PeopleSearchSufficiency(BaseModel):
+    requested_count: int
+    verified_count: int
+    unverified_count: int
+    new_candidates_this_iteration: int
+    remaining_source_budget: int
+    has_more_sources: bool
+    has_more_pages: bool
+    can_refine: bool
+    sufficient: bool
+    stop_reason: str | None = None
+
+
+SearchItem = TypeVar("SearchItem")
+
+
+class SearchPage(BaseModel, Generic[SearchItem]):
+    """Bounded page exposed to the model; full records stay in evidence storage."""
+
+    items: list[SearchItem] = Field(default_factory=list)
+    returned_count: int = 0
+    total_count: int | None = None
+    total_count_is_estimate: bool = True
+    page_size: int = Field(default=10, ge=1, le=20)
+    cursor: str | None = None
+    next_cursor: str | None = None
+    has_more: bool = False
+    truncated: bool = False
+    source_coverage: dict[str, Any] = Field(default_factory=dict)
+    evidence_ids: list[str] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+
+
+class SourceProgress(BaseModel):
+    source_key: str
+    provider: str
+    company_or_domain: str | None = None
+    query_hash: str
+    visited: bool = False
+    cursor: str | None = None
+    next_cursor: str | None = None
+    has_more: bool = False
+    exhausted: bool = False
+    call_count: int = 0
+    first_iteration: int | None = None
+    last_iteration: int | None = None
+    last_success_at: datetime | None = None
+    last_error_type: str | None = None
+
+
+class SearchSessionState(BaseModel):
+    search_session_id: str = Field(default_factory=lambda: str(uuid4()))
+    run_id: str
+    user_id: str
+    intent: Literal["job_search", "people_search"]
+    normalized_request: dict[str, Any]
+    requested_count: int
+    iteration: int = 0
+    max_iterations: int = Field(default=4, ge=1)
+    source_call_budget: int = Field(default=12, ge=0)
+    source_calls_used: int = Field(default=0, ge=0)
+    remaining_source_budget: int = Field(default=12, ge=0)
+    consecutive_no_progress: int = Field(default=0, ge=0)
+    visited_sources: list[str] = Field(default_factory=list)
+    provider_cursors: dict[str, str | None] = Field(default_factory=dict)
+    seen_candidate_ids: list[str] = Field(default_factory=list)
+    candidate_records: list[dict[str, Any]] = Field(default_factory=list)
+    query_variants: list[str] = Field(default_factory=list)
+    source_failures: dict[str, str] = Field(default_factory=dict)
+    source_coverage: dict[str, Any] = Field(default_factory=dict)
+    status: Literal["active", "completed", "partial", "failed"] = "active"
 
 
 class ResumeRevisionChangeInput(BaseModel):
@@ -242,6 +347,10 @@ class CareerAgentState(TypedDict, total=False):
     final_response: str
     status: dict[str, Any]
     runtime_context: str
+    routing_source: str
+    user_message_id: str
+    stop_after_tools: bool
+    partial_result: bool
 
 
 def validate_todos(items: list[AgentTodoItem]) -> list[AgentTodoItem]:

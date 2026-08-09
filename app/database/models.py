@@ -16,6 +16,7 @@ from sqlalchemy import (
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database.database import Base
+from app.database.types import PortableVector
 
 
 def _uuid() -> str:
@@ -101,6 +102,18 @@ class User(TimestampMixin, Base):
         back_populates="user", cascade="all, delete-orphan"
     )
     outreach_drafts: Mapped[list["OutreachDraft"]] = relationship(
+        back_populates="user", cascade="all, delete-orphan"
+    )
+    starred_qa_pairs: Mapped[list["StarredQAPair"]] = relationship(
+        back_populates="user", cascade="all, delete-orphan"
+    )
+    search_sessions: Mapped[list["SearchSession"]] = relationship(
+        back_populates="user", cascade="all, delete-orphan"
+    )
+    retrieval_documents: Mapped[list["RetrievalDocument"]] = relationship(
+        back_populates="user", cascade="all, delete-orphan"
+    )
+    retrieval_queries: Mapped[list["RetrievalQueryLog"]] = relationship(
         back_populates="user", cascade="all, delete-orphan"
     )
 
@@ -431,11 +444,58 @@ class Message(Base):
     )
     role: Mapped[str] = mapped_column(String(20), nullable=False)
     content: Mapped[str] = mapped_column(Text, nullable=False)
+    reply_to_message_id: Mapped[str | None] = mapped_column(
+        ForeignKey("messages.message_id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utc_now, nullable=False, index=True
     )
 
     conversation: Mapped[Conversation] = relationship(back_populates="messages")
+    reply_to: Mapped["Message | None"] = relationship(
+        remote_side=[message_id], foreign_keys=[reply_to_message_id]
+    )
+
+
+class StarredQAPair(Base):
+    __tablename__ = "starred_qa_pairs"
+    __table_args__ = (
+        UniqueConstraint(
+            "user_id",
+            "user_message_id",
+            "assistant_message_id",
+            name="uq_starred_qa_user_pair",
+        ),
+    )
+
+    starred_qa_id: Mapped[str] = mapped_column(
+        String(36), primary_key=True, default=_uuid
+    )
+    user_id: Mapped[str] = mapped_column(
+        ForeignKey("users.user_id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    conversation_id: Mapped[str] = mapped_column(
+        ForeignKey("conversations.conversation_id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    user_message_id: Mapped[str] = mapped_column(
+        ForeignKey("messages.message_id", ondelete="CASCADE"), nullable=False
+    )
+    assistant_message_id: Mapped[str] = mapped_column(
+        ForeignKey("messages.message_id", ondelete="CASCADE"), nullable=False
+    )
+    preference_update_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utc_now, nullable=False, index=True
+    )
+
+    user: Mapped[User] = relationship(back_populates="starred_qa_pairs")
+    conversation: Mapped[Conversation] = relationship()
+    user_message: Mapped[Message] = relationship(foreign_keys=[user_message_id])
+    assistant_message: Mapped[Message] = relationship(foreign_keys=[assistant_message_id])
 
 
 class AgentRun(Base):
@@ -463,6 +523,13 @@ class AgentRun(Base):
     )
     final_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
     error_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    user_message_id: Mapped[str | None] = mapped_column(
+        ForeignKey("messages.message_id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    assistant_message_id: Mapped[str | None] = mapped_column(
+        ForeignKey("messages.message_id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    state_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
 
     user: Mapped[User] = relationship(back_populates="agent_runs")
     conversation: Mapped[Conversation] = relationship(back_populates="agent_runs")
@@ -475,6 +542,78 @@ class AgentRun(Base):
     evidence: Mapped[list["AgentEvidence"]] = relationship(
         back_populates="run", cascade="all, delete-orphan"
     )
+    search_sessions: Mapped[list["SearchSession"]] = relationship(
+        back_populates="run", cascade="all, delete-orphan"
+    )
+
+
+class SearchSession(TimestampMixin, Base):
+    """Durable search state shared across graph iterations and process restarts."""
+
+    __tablename__ = "search_sessions"
+
+    search_session_id: Mapped[str] = mapped_column(
+        String(36), primary_key=True, default=_uuid
+    )
+    run_id: Mapped[str] = mapped_column(
+        ForeignKey("agent_runs.run_id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    user_id: Mapped[str] = mapped_column(
+        ForeignKey("users.user_id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    intent: Mapped[str] = mapped_column(String(50), nullable=False, index=True)
+    normalized_request: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    requested_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    iteration: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    max_iterations: Mapped[int] = mapped_column(Integer, default=4, nullable=False)
+    source_call_budget: Mapped[int] = mapped_column(Integer, nullable=False)
+    source_calls_used: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    remaining_source_budget: Mapped[int] = mapped_column(Integer, nullable=False)
+    consecutive_no_progress: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    visited_sources: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
+    provider_cursors: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    seen_candidate_ids: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
+    candidate_records: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list, nullable=False)
+    query_variants: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
+    source_failures: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    source_coverage: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    status: Mapped[str] = mapped_column(String(30), default="active", nullable=False, index=True)
+
+    run: Mapped[AgentRun] = relationship(back_populates="search_sessions")
+    user: Mapped[User] = relationship(back_populates="search_sessions")
+    sources: Mapped[list["SearchSourceProgress"]] = relationship(
+        back_populates="search_session", cascade="all, delete-orphan"
+    )
+
+
+class SearchSourceProgress(Base):
+    __tablename__ = "search_source_progress"
+    __table_args__ = (
+        UniqueConstraint("search_session_id", "source_key", name="uq_search_source_session_key"),
+    )
+
+    source_progress_id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    search_session_id: Mapped[str] = mapped_column(
+        ForeignKey("search_sessions.search_session_id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    source_key: Mapped[str] = mapped_column(String(500), nullable=False)
+    provider: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
+    company_or_domain: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    query_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    visited: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    cursor: Mapped[str | None] = mapped_column(Text, nullable=True)
+    next_cursor: Mapped[str | None] = mapped_column(Text, nullable=True)
+    has_more: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    exhausted: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    call_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    first_iteration: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    last_iteration: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    last_success_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_error_type: Mapped[str | None] = mapped_column(String(100), nullable=True)
+
+    search_session: Mapped[SearchSession] = relationship(back_populates="sources")
 
 
 class AgentStep(Base):
@@ -560,6 +699,53 @@ class AgentEvidence(Base):
 
     user: Mapped[User] = relationship(back_populates="agent_evidence")
     run: Mapped[AgentRun] = relationship(back_populates="evidence")
+
+
+class RetrievalDocument(TimestampMixin, Base):
+    __tablename__ = "retrieval_documents"
+    __table_args__ = (
+        UniqueConstraint(
+            "corpus_type", "user_id", "source_entity_id", "source_version", "content_hash",
+            name="uq_retrieval_document_source_version_hash",
+        ),
+    )
+
+    retrieval_document_id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    corpus_type: Mapped[str] = mapped_column(String(50), nullable=False, index=True)
+    user_id: Mapped[str | None] = mapped_column(
+        ForeignKey("users.user_id", ondelete="CASCADE"), nullable=True, index=True
+    )
+    source_entity_id: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
+    source_version: Mapped[str] = mapped_column(String(100), nullable=False)
+    title: Mapped[str] = mapped_column(Text, nullable=False)
+    text: Mapped[str] = mapped_column(Text, nullable=False)
+    search_vector: Mapped[str | None] = mapped_column(Text, nullable=True)
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    evidence_ids: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
+    content_hash: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    retrieved_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    embedding_model_id: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    embedding_dimension: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    embedding: Mapped[list[float] | None] = mapped_column(PortableVector(1024), nullable=True)
+
+    user: Mapped[User | None] = relationship(back_populates="retrieval_documents")
+
+
+class RetrievalQueryLog(Base):
+    __tablename__ = "retrieval_query_logs"
+
+    retrieval_query_id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    user_id: Mapped[str] = mapped_column(
+        ForeignKey("users.user_id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    query: Mapped[str] = mapped_column(Text, nullable=False)
+    corpus_types: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
+    rankings_json: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list, nullable=False)
+    warnings: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utc_now, nullable=False, index=True)
+
+    user: Mapped[User] = relationship(back_populates="retrieval_queries")
 
 
 class ConversationContextSummary(Base):

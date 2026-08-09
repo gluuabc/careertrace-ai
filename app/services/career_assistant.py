@@ -24,7 +24,9 @@ def respond_to_user(
     clean_prompt = prompt.strip()
     if not clean_prompt:
         raise ValueError("A career request is required.")
-    repository.add_message(user_id, conversation_id, "user", clean_prompt)
+    user_message = repository.add_message(
+        user_id, conversation_id, "user", clean_prompt
+    )
     if event_handler:
         event_handler({"type": "status", "workflow_stage": "initializing"})
 
@@ -42,12 +44,25 @@ def respond_to_user(
             "conversation_id": conversation_id,
             "current_request": clean_prompt,
             "messages": [],
+            "user_message_id": user_message["message_id"],
         }
     )
     response = str(result.get("final_response") or "").strip()
     if not response:
         raise ValueError("The Career Agent returned an empty response.")
-    repository.add_message(user_id, conversation_id, "assistant", response)
+    assistant_message = repository.add_message(
+        user_id,
+        conversation_id,
+        "assistant",
+        response,
+        reply_to_message_id=user_message["message_id"],
+    )
+    if result.get("run_id"):
+        repository.update_agent_run(
+            user_id,
+            result["run_id"],
+            assistant_message_id=assistant_message["message_id"],
+        )
     if event_handler:
         event_handler(
             {

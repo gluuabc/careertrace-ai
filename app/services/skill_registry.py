@@ -82,8 +82,14 @@ class SkillRegistry:
             raise ValueError("Skill file path must remain inside the registered Skill.")
         if requested.suffix.lower() not in ALLOWED_SKILL_SUFFIXES:
             raise ValueError("Unsupported Skill file type.")
-        resolved = (skill.directory / requested).resolve()
-        if not resolved.is_relative_to(skill.directory) or resolved.is_symlink():
+        candidate = skill.directory / requested
+        current = skill.directory
+        for part in requested.parts:
+            current = current / part
+            if current.is_symlink():
+                raise ValueError("Skill file path contains a symbolic link.")
+        resolved = candidate.resolve()
+        if not resolved.is_relative_to(skill.directory):
             raise ValueError("Skill file path escapes the registered Skill.")
         if not resolved.is_file():
             raise ValueError("Skill file was not found.")

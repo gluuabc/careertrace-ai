@@ -17,6 +17,8 @@ from app.database.models import (
     ProfileVersion,
     ResumeRevisionChange,
     ResumeRevisionDraft,
+    SearchSession,
+    SearchSourceProgress,
     UserConnection,
 )
 
@@ -26,13 +28,163 @@ class AgentRepositoryMixin:
 
     session_factory: Any
 
+    def get_or_create_search_session(
+        self,
+        user_id: str,
+        run_id: str,
+        *,
+        intent: str,
+        normalized_request: dict[str, Any],
+        requested_count: int,
+        source_call_budget: int,
+        max_iterations: int = 4,
+    ) -> dict[str, Any]:
+        """Resume an equivalent active search instead of restarting providers."""
+        with session_scope(self.session_factory) as session:
+            run = self._owned_run(session, user_id, run_id)
+            item = session.scalar(
+                select(SearchSession)
+                .where(
+                    SearchSession.run_id == run_id,
+                    SearchSession.user_id == user_id,
+                    SearchSession.intent == intent,
+                    SearchSession.status == "active",
+                )
+                .order_by(SearchSession.created_at.desc())
+            )
+            if item is not None and dict(item.normalized_request) != dict(normalized_request):
+                item = None
+            if item is None:
+                item = SearchSession(
+                    run=run,
+                    user=run.user,
+                    intent=intent,
+                    normalized_request=dict(normalized_request),
+                    requested_count=requested_count,
+                    max_iterations=max_iterations,
+                    source_call_budget=source_call_budget,
+                    remaining_source_budget=source_call_budget,
+                )
+                session.add(item)
+                session.flush()
+            return self._search_session_dict(item)
+
+    def reserve_search_source_calls(
+        self, user_id: str, search_session_id: str, requested_calls: int = 1
+    ) -> dict[str, Any]:
+        """Reserve budget before network I/O so concurrent tools cannot overspend."""
+        requested_calls = max(0, int(requested_calls))
+        with session_scope(self.session_factory) as session:
+            item = session.scalar(
+                select(SearchSession)
+                .where(
+                    SearchSession.search_session_id == search_session_id,
+                    SearchSession.user_id == user_id,
+                )
+                .with_for_update()
+            )
+            if item is None:
+                raise ValueError("Search session was not found for this user.")
+            reserved = min(requested_calls, item.remaining_source_budget)
+            item.remaining_source_budget -= reserved
+            item.source_calls_used += reserved
+            session.flush()
+            result = self._search_session_dict(item)
+            result["reserved_calls"] = reserved
+            return result
+
+    def update_search_session(
+        self, user_id: str, search_session_id: str, **updates: Any
+    ) -> dict[str, Any]:
+        allowed = {
+            "iteration", "consecutive_no_progress", "visited_sources",
+            "provider_cursors", "seen_candidate_ids", "query_variants",
+            "source_failures", "source_coverage", "candidate_records", "status",
+        }
+        unknown = set(updates) - allowed
+        if unknown:
+            raise ValueError(f"Unsupported search-session fields: {sorted(unknown)}")
+        with session_scope(self.session_factory) as session:
+            item = session.scalar(
+                select(SearchSession).where(
+                    SearchSession.search_session_id == search_session_id,
+                    SearchSession.user_id == user_id,
+                )
+            )
+            if item is None:
+                raise ValueError("Search session was not found for this user.")
+            for key, value in updates.items():
+                setattr(item, key, value)
+            session.flush()
+            return self._search_session_dict(item)
+
+    def upsert_search_source_progress(
+        self,
+        user_id: str,
+        search_session_id: str,
+        *,
+        source_key: str,
+        provider: str,
+        query_hash: str,
+        **updates: Any,
+    ) -> dict[str, Any]:
+        allowed = {
+            "company_or_domain", "visited", "cursor", "next_cursor", "has_more",
+            "exhausted", "call_count", "first_iteration", "last_iteration",
+            "last_success_at", "last_error_type",
+        }
+        with session_scope(self.session_factory) as session:
+            search = session.scalar(
+                select(SearchSession).where(
+                    SearchSession.search_session_id == search_session_id,
+                    SearchSession.user_id == user_id,
+                )
+            )
+            if search is None:
+                raise ValueError("Search session was not found for this user.")
+            item = session.scalar(
+                select(SearchSourceProgress).where(
+                    SearchSourceProgress.search_session_id == search_session_id,
+                    SearchSourceProgress.source_key == source_key,
+                )
+            )
+            if item is None:
+                item = SearchSourceProgress(
+                    search_session=search,
+                    source_key=source_key,
+                    provider=provider,
+                    query_hash=query_hash,
+                )
+                session.add(item)
+            for key, value in updates.items():
+                if key not in allowed:
+                    raise ValueError(f"Unsupported source-progress field: {key}")
+                setattr(item, key, value)
+            session.flush()
+            return self._source_progress_dict(item)
+
     def create_agent_run(
-        self, user_id: str, conversation_id: str, *, goal: str
+        self,
+        user_id: str,
+        conversation_id: str,
+        *,
+        goal: str,
+        user_message_id: str | None = None,
     ) -> dict[str, Any]:
         with session_scope(self.session_factory) as session:
             user = self._require_user(session, user_id)
             conversation = self._owned_conversation(session, user_id, conversation_id)
-            run = AgentRun(user=user, conversation=conversation, goal=goal.strip())
+            if user_message_id is not None and not any(
+                item.message_id == user_message_id and item.role == "user"
+                for item in conversation.messages
+            ):
+                raise ValueError("Agent run user message was not found in this conversation.")
+            run = AgentRun(
+                user=user,
+                conversation=conversation,
+                goal=goal.strip(),
+                user_message_id=user_message_id,
+            )
             session.add(run)
             session.flush()
             return self._agent_run_dict(run)
@@ -47,6 +199,8 @@ class AgentRepositoryMixin:
         status: str | None = None,
         final_summary: str | None = None,
         error_summary: str | None = None,
+        assistant_message_id: str | None = None,
+        state_json: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         with session_scope(self.session_factory) as session:
             run = self._owned_run(session, user_id, run_id)
@@ -55,15 +209,34 @@ class AgentRepositoryMixin:
             if goal is not None:
                 run.goal = goal.strip()
             if status is not None:
-                if status not in {"running", "completed", "failed", "needs_input"}:
+                if status not in {
+                    "running", "completed", "failed", "needs_input", "partial"
+                }:
                     raise ValueError("Invalid agent run status.")
                 run.status = status
-                if status in {"completed", "failed"}:
+                if status in {"completed", "failed", "partial"}:
                     run.completed_at = datetime.now(timezone.utc)
             if final_summary is not None:
                 run.final_summary = final_summary
             if error_summary is not None:
                 run.error_summary = error_summary
+            if assistant_message_id is not None:
+                message = next(
+                    (
+                        item
+                        for item in run.conversation.messages
+                        if item.message_id == assistant_message_id
+                        and item.role == "assistant"
+                    ),
+                    None,
+                )
+                if message is None:
+                    raise ValueError(
+                        "Agent run assistant message was not found in this conversation."
+                    )
+                run.assistant_message_id = assistant_message_id
+            if state_json is not None:
+                run.state_json = dict(state_json)
             session.flush()
             return self._agent_run_dict(run)
 
@@ -281,6 +454,18 @@ class AgentRepositoryMixin:
             ).all()
             return [self._connection_dict(item) for item in items]
 
+    def get_connection(self, user_id: str, connection_id: str) -> dict[str, Any]:
+        with session_scope(self.session_factory) as session:
+            item = session.scalar(
+                select(UserConnection).where(
+                    UserConnection.connection_id == connection_id,
+                    UserConnection.user_id == user_id,
+                )
+            )
+            if item is None:
+                raise ValueError("Connection was not found for this user.")
+            return self._connection_dict(item)
+
     def save_resume_revision_draft(
         self, user_id: str, data: dict[str, Any]
     ) -> dict[str, Any]:
@@ -445,11 +630,59 @@ class AgentRepositoryMixin:
             "started_at": run.started_at.isoformat(),
             "completed_at": run.completed_at.isoformat() if run.completed_at else None,
             "final_summary": run.final_summary, "error_summary": run.error_summary,
+            "user_message_id": run.user_message_id,
+            "assistant_message_id": run.assistant_message_id,
+            "state": dict(run.state_json or {}),
         }
         if include_children:
             result["steps"] = [AgentRepositoryMixin._agent_step_dict(item) for item in sorted(run.steps, key=lambda x: x.sequence_number)]
             result["tool_calls"] = [AgentRepositoryMixin._agent_tool_call_dict(item) for item in sorted(run.tool_calls, key=lambda x: x.created_at)]
         return result
+
+    @staticmethod
+    def _search_session_dict(item: SearchSession) -> dict[str, Any]:
+        return {
+            "search_session_id": item.search_session_id,
+            "run_id": item.run_id,
+            "user_id": item.user_id,
+            "intent": item.intent,
+            "normalized_request": dict(item.normalized_request),
+            "requested_count": item.requested_count,
+            "iteration": item.iteration,
+            "max_iterations": item.max_iterations,
+            "source_call_budget": item.source_call_budget,
+            "source_calls_used": item.source_calls_used,
+            "remaining_source_budget": item.remaining_source_budget,
+            "consecutive_no_progress": item.consecutive_no_progress,
+            "visited_sources": list(item.visited_sources),
+            "provider_cursors": dict(item.provider_cursors),
+            "seen_candidate_ids": list(item.seen_candidate_ids),
+            "candidate_records": list(item.candidate_records),
+            "query_variants": list(item.query_variants),
+            "source_failures": dict(item.source_failures),
+            "source_coverage": dict(item.source_coverage),
+            "status": item.status,
+            "sources": [AgentRepositoryMixin._source_progress_dict(source) for source in item.sources],
+        }
+
+    @staticmethod
+    def _source_progress_dict(item: SearchSourceProgress) -> dict[str, Any]:
+        return {
+            "source_key": item.source_key,
+            "provider": item.provider,
+            "company_or_domain": item.company_or_domain,
+            "query_hash": item.query_hash,
+            "visited": item.visited,
+            "cursor": item.cursor,
+            "next_cursor": item.next_cursor,
+            "has_more": item.has_more,
+            "exhausted": item.exhausted,
+            "call_count": item.call_count,
+            "first_iteration": item.first_iteration,
+            "last_iteration": item.last_iteration,
+            "last_success_at": item.last_success_at.isoformat() if item.last_success_at else None,
+            "last_error_type": item.last_error_type,
+        }
 
     @staticmethod
     def _agent_step_dict(item: AgentStep) -> dict[str, Any]:
