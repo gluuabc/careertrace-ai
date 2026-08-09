@@ -106,6 +106,7 @@ def _profile_form(
     key_prefix: str,
     show_required: bool = False,
     identity_locked: bool = False,
+    collapse_preferences: bool = False,
 ) -> dict[str, Any]:
     required = " *" if show_required else ""
     left, right = st.columns(2)
@@ -150,19 +151,6 @@ def _profile_form(
             value=profile.get("career_goal") or "",
             key=f"{key_prefix}_career_goal",
         )
-        remote_preference = st.selectbox(
-            "Remote preference (optional)",
-            ["", "Remote", "Hybrid", "On-site", "Flexible"],
-            index=(
-                ["", "Remote", "Hybrid", "On-site", "Flexible"].index(
-                    profile.get("remote_preference") or ""
-                )
-                if (profile.get("remote_preference") or "")
-                in ["", "Remote", "Hybrid", "On-site", "Flexible"]
-                else 0
-            ),
-            key=f"{key_prefix}_remote",
-        )
 
     skills = st.text_input(
         f"Skills{required} (comma-separated)",
@@ -202,27 +190,59 @@ def _profile_form(
     if show_required and not _experience_from_text(experience):
         st.caption(":red[At least one experience entry is required.]")
 
-    st.caption("Career preferences")
-    target_roles = st.text_input(
-        "Target roles (optional, comma-separated)",
-        value=", ".join(profile.get("target_roles") or []),
-        key=f"{key_prefix}_target_roles",
-    )
-    preferred_locations = st.text_input(
-        "Preferred locations (optional, comma-separated)",
-        value=", ".join(profile.get("preferred_locations") or []),
-        key=f"{key_prefix}_locations",
-    )
-    employment_types = st.text_input(
-        "Employment types (optional, comma-separated)",
-        value=", ".join(profile.get("employment_types") or []),
-        key=f"{key_prefix}_employment",
-    )
-    work_authorization = st.text_input(
-        "Work authorization (optional)",
-        value=profile.get("work_authorization") or "",
-        key=f"{key_prefix}_authorization",
-    )
+    def render_preferences() -> tuple[str, str, str, str, str]:
+        target = st.text_input(
+            "Target roles (optional, comma-separated)",
+            value=", ".join(profile.get("target_roles") or []),
+            key=f"{key_prefix}_target_roles",
+        )
+        locations = st.text_input(
+            "Preferred locations (optional, comma-separated)",
+            value=", ".join(profile.get("preferred_locations") or []),
+            key=f"{key_prefix}_locations",
+        )
+        employment = st.text_input(
+            "Employment types (optional, comma-separated)",
+            value=", ".join(profile.get("employment_types") or []),
+            key=f"{key_prefix}_employment",
+        )
+        authorization = st.text_input(
+            "Work authorization (optional)",
+            value=profile.get("work_authorization") or "",
+            key=f"{key_prefix}_authorization",
+        )
+        remote_options = ["", "Remote", "Hybrid", "On-site", "Flexible"]
+        current_remote = profile.get("remote_preference") or ""
+        remote = st.selectbox(
+            "Remote preference (optional)",
+            remote_options,
+            index=(
+                remote_options.index(current_remote)
+                if current_remote in remote_options
+                else 0
+            ),
+            key=f"{key_prefix}_remote",
+        )
+        return target, locations, employment, authorization, remote
+
+    if collapse_preferences:
+        with st.expander("Career preferences", expanded=False):
+            (
+                target_roles,
+                preferred_locations,
+                employment_types,
+                work_authorization,
+                remote_preference,
+            ) = render_preferences()
+    else:
+        st.caption("Career preferences")
+        (
+            target_roles,
+            preferred_locations,
+            employment_types,
+            work_authorization,
+            remote_preference,
+        ) = render_preferences()
 
     return {
         "name": name.strip() or None,
@@ -491,6 +511,7 @@ def _render_profile(user_id: str) -> None:
             "edit",
             show_required=True,
             identity_locked=bool(account.get("google_id")),
+            collapse_preferences=True,
         )
         if st.form_submit_button("Save profile changes", type="primary"):
             missing_fields, errors = find_profile_issues(updated_profile)
@@ -503,6 +524,21 @@ def _render_profile(user_id: str) -> None:
                 )
                 if result["profile_changed"]:
                     st.success("Profile changes saved. Career analysis is now stale.")
+                    preference_labels = {
+                        "target_roles": "Target roles",
+                        "preferred_locations": "Preferred locations",
+                        "employment_types": "Employment types",
+                        "remote_preference": "Remote preference",
+                        "work_authorization": "Work authorization",
+                    }
+                    changes = []
+                    for field, label in preference_labels.items():
+                        before = profile.get(field)
+                        after = updated_profile.get(field)
+                        if before != after:
+                            changes.append(f"{label}: {before or 'none'} → {after or 'none'}")
+                    if changes:
+                        st.success("Preference updated:\n\n" + "\n\n".join(changes))
                 else:
                     st.info("No changes detected. Profile version was not updated.")
 
@@ -545,6 +581,36 @@ def _render_analysis(user_id: str) -> None:
             profile_repository.save_analysis(user_id, generated)
         st.success("Career analysis updated.")
         st.rerun()
+
+
+def _render_starred_qa(user_id: str) -> None:
+    st.subheader("Starred Q&A")
+    pairs = profile_repository.list_starred_qa_pairs(user_id)
+    if not pairs:
+        st.info(
+            "No starred Q&A yet. Star useful CareerTrace responses from a "
+            "conversation to save them here."
+        )
+        return
+    for pair in pairs:
+        with st.container(border=True):
+            st.markdown(f"### ★ {pair['question']}")
+            st.write(pair["answer"])
+            st.caption(
+                f"Conversation: {pair['conversation_title']} · Saved: "
+                f"{pair['created_at']}"
+            )
+            if pair.get("preference_update_summary"):
+                st.info(f"Preference updated: {pair['preference_update_summary']}")
+            if st.button(
+                "Unstar",
+                key=f"unstar_page_{pair['starred_qa_id']}",
+                icon=":material/star:",
+            ):
+                profile_repository.unstar_qa_pair(
+                    user_id, pair["starred_qa_id"]
+                )
+                st.rerun()
 
 
 def _render_documents(user_id: str) -> None:
@@ -801,27 +867,73 @@ def _render_connections(user_id: str) -> None:
             st.caption(f"{len(connections)} private connection records available.")
 
 
-def _render_agent_activity(user_id: str, conversation_id: str) -> None:
-    runs = profile_repository.list_agent_runs(user_id, conversation_id)
-    if not runs:
-        return
-    latest = runs[0]
-    with st.expander("Agent Activity", expanded=True):
-        st.write(f"**Goal:** {latest['goal'] or 'Not set'}")
+def _render_agent_activity(
+    user_id: str, conversation_id: str | None
+) -> None:
+    with st.sidebar:
+        st.subheader("CareerTrace Status")
+        if not conversation_id:
+            st.caption("No activity yet for this conversation.")
+            return
+        runs = profile_repository.list_agent_runs(user_id, conversation_id)
+        if not runs:
+            st.caption("No activity yet for this conversation.")
+            return
+        latest = runs[0]
+        state = latest.get("state") or {}
+        status = state.get("status") or {}
+        st.write("**Goal**")
+        st.write(latest["goal"] or "Not set")
         st.caption(
-            f"Intent: {latest['intent'] or 'classifying'} · Status: "
-            f"{latest['status']} · Sources/tools: {len(latest['tool_calls'])}"
+            f"{state.get('workflow_stage') or latest['status']} · "
+            f"{latest['intent'] or 'classifying'}"
         )
-        for step in latest["steps"]:
-            marker = "✅" if step["status"] == "completed" else "⚠️" if step["status"] == "failed" else "⏳"
-            st.markdown(f"{marker} **{step['stage']}** — {step['display_summary']}")
-        for call in latest["tool_calls"]:
-            duration = f"{call['duration_ms']} ms" if call["duration_ms"] is not None else "duration unknown"
-            st.caption(
-                f"Tool: {call['tool_name']} · {call['status']} · {duration}"
+        markers = {
+            "completed": "✓",
+            "in_progress": "●",
+            "pending": "○",
+            "blocked": "⚠",
+            "cancelled": "—",
+        }
+        for item in state.get("todo_items") or []:
+            st.write(
+                f"{markers.get(item.get('status'), '○')} {item.get('content', '')}"
             )
-            if call["error_message"]:
-                st.warning(call["error_message"])
+        candidate_count = int(state.get("candidate_count") or 0)
+        if candidate_count:
+            st.caption(
+                f"{state.get('verified_candidate_count', 0)} verified · "
+                f"{state.get('unverified_candidate_count', 0)} unverified"
+            )
+        source_count = int(state.get("source_call_count") or 0)
+        if source_count:
+            st.caption(f"{source_count} source calls")
+        for warning in (state.get("warnings") or [])[:3]:
+            lowered = str(warning).casefold()
+            if "budget" in lowered:
+                message = "The configured workflow budget was reached."
+            elif "routing" in lowered or "classifier" in lowered:
+                message = "Structured routing fallback was used."
+            else:
+                message = "A provider or source was unavailable; available results were preserved."
+            st.warning(message)
+        with st.expander("Activity details", expanded=False):
+            for step in latest["steps"]:
+                summary = (
+                    "Structured routing fallback was used."
+                    if step["stage"] == "routing_warning"
+                    else step["display_summary"]
+                )
+                st.caption(f"{step['stage']} · {step['status']} · {summary}")
+            for call in latest["tool_calls"]:
+                duration = (
+                    f"{call['duration_ms']} ms"
+                    if call["duration_ms"] is not None
+                    else "duration unknown"
+                )
+                st.caption(
+                    f"Tool: {call['tool_name']} · {call['status']} · {duration}"
+                )
 
 
 def _render_agent_results(user_id: str, conversation_id: str) -> None:
@@ -853,7 +965,8 @@ def _render_agent_results(user_id: str, conversation_id: str) -> None:
                     st.write(f"**{item.get('name')}** — {item.get('current_role') or 'role unknown'}")
                     st.write(f"Organization: {item.get('organization') or 'unknown'}")
                     st.write("Relevant connection: " + ("; ".join(item.get("relevant_connection") or []) or "unknown"))
-                    st.write(f"Public contact: {item.get('public_contact') or 'unavailable'}")
+                    public_channels = [channel for channel in item.get("contact_channels") or [] if channel.get("visibility") == "public"]
+                    st.write("Public contact: " + (", ".join(channel.get("value", "") for channel in public_channels) or "unavailable"))
                     st.link_button("Public source", item["public_source_url"])
 
     resume_drafts = profile_repository.list_resume_revision_drafts(user_id)
@@ -903,6 +1016,7 @@ def _render_career_assistant(user_id: str) -> None:
         st.rerun()
 
     if not conversations:
+        _render_agent_activity(user_id, None)
         st.info("Create a conversation to start chatting.")
         return
     conversation_ids = [item["conversation_id"] for item in conversations]
@@ -922,9 +1036,29 @@ def _render_career_assistant(user_id: str) -> None:
     _render_agent_activity(user_id, active_id)
     _render_agent_results(user_id, active_id)
     conversation = profile_repository.get_conversation(user_id, active_id)
+    starred = {
+        item["assistant_message_id"]: item
+        for item in profile_repository.list_starred_qa_pairs(user_id, active_id)
+    }
     for message in conversation["messages"]:
         with st.chat_message(message["role"]):
             st.write(message["content"])
+            if message["role"] == "assistant" and message.get("reply_to_message_id"):
+                existing = starred.get(message["message_id"])
+                label = "★ Starred" if existing else "☆ Star"
+                if st.button(label, key=f"star_{message['message_id']}"):
+                    if existing:
+                        profile_repository.unstar_qa_pair(
+                            user_id, existing["starred_qa_id"]
+                        )
+                    else:
+                        profile_repository.star_qa_pair(
+                            user_id,
+                            active_id,
+                            message["reply_to_message_id"],
+                            message["message_id"],
+                        )
+                    st.rerun()
 
     prompt = st.chat_input("Ask CareerTrace about your career")
     if prompt:
@@ -965,7 +1099,7 @@ def main() -> None:
     (
         upload_tab,
         profile_tab,
-        analysis_tab,
+        starred_tab,
         documents_tab,
         memory_tab,
         assistant_tab,
@@ -973,7 +1107,7 @@ def main() -> None:
         [
             "Document upload",
             "My profile",
-            "Career analysis",
+            "Starred Q&A",
             "Documents",
             "Memory",
             "Career Assistant",
@@ -983,8 +1117,8 @@ def main() -> None:
         _render_upload(user_id, is_demo=is_demo)
     with profile_tab:
         _render_profile(user_id)
-    with analysis_tab:
-        _render_analysis(user_id)
+    with starred_tab:
+        _render_starred_qa(user_id)
     with documents_tab:
         _render_documents(user_id)
     with memory_tab:

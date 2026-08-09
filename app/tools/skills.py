@@ -14,9 +14,29 @@ def read_skill(name: str) -> dict:
 
 
 @tool
-def read_skill_file(name: str, relative_path: str) -> dict:
+def read_skill_file(
+    name: str, relative_path: str, offset: int = 0, limit: int = 4000
+) -> dict:
     """Load one approved supporting text file from a registered Skill when its detailed rules are needed. Absolute paths, traversal, symlinks, and unsupported files are rejected."""
     try:
-        return ToolExecutionResult(ok=True, data={"name": name, "relative_path": relative_path, "content": skill_registry.read_skill_file(name, relative_path)}).model_dump()
+        if offset < 0 or limit < 1 or limit > 8000:
+            raise ValueError("Skill offset must be non-negative and limit must be 1–8000.")
+        content = skill_registry.read_skill_file(name, relative_path)
+        page = content[offset : offset + limit]
+        next_offset = offset + len(page)
+        return ToolExecutionResult(
+            ok=True,
+            data={
+                "name": name,
+                "relative_path": relative_path,
+                "content": page,
+                "offset": offset,
+                "returned_count": len(page),
+                "total_count": len(content),
+                "has_more": next_offset < len(content),
+                "next_offset": next_offset if next_offset < len(content) else None,
+                "truncated": next_offset < len(content),
+            },
+        ).model_dump()
     except ValueError as error:
         return ToolExecutionResult(ok=False, error_type="SkillFileError", error_message=str(error)).model_dump()

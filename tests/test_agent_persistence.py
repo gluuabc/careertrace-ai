@@ -1,8 +1,13 @@
 import unittest
+from unittest.mock import patch
 
 from app.database.database import create_database_engine, create_session_factory, init_db
 from app.database.repository import ProfileRepository
 from app.services.people_search import validate_connection_csv
+from app.services.people_search import PeopleSearchService
+from app.services.evidence import EvidenceService
+from app.state.agent_schema import PeopleSearchRequest
+from app.tools.sources.base import SourceResult
 from app.services.trajectory import sanitize_arguments
 
 
@@ -85,6 +90,61 @@ class AgentPersistenceTests(unittest.TestCase):
             },
         )
         self.assertEqual(follow_up["status"], "draft")
+
+    def test_search_session_resumes_and_reserves_budget_before_calls(self):
+        run = self.repository.create_agent_run(
+            self.user["user_id"], self.conversation["conversation_id"], goal="Search"
+        )
+        request = {"target_roles": ["Engineer"], "requested_count": 3}
+        search = self.repository.get_or_create_search_session(
+            self.user["user_id"],
+            run["run_id"],
+            intent="job_search",
+            normalized_request=request,
+            requested_count=3,
+            source_call_budget=2,
+        )
+        resumed = self.repository.get_or_create_search_session(
+            self.user["user_id"],
+            run["run_id"],
+            intent="job_search",
+            normalized_request=request,
+            requested_count=3,
+            source_call_budget=2,
+        )
+        self.assertEqual(search["search_session_id"], resumed["search_session_id"])
+        first = self.repository.reserve_search_source_calls(
+            self.user["user_id"], search["search_session_id"], 2
+        )
+        second = self.repository.reserve_search_source_calls(
+            self.user["user_id"], search["search_session_id"], 1
+        )
+        self.assertEqual(first["reserved_calls"], 2)
+        self.assertEqual(second["reserved_calls"], 0)
+        with self.assertRaisesRegex(ValueError, "not found"):
+            self.repository.reserve_search_source_calls(
+                self.other["user_id"], search["search_session_id"], 1
+            )
+
+    def test_private_connection_email_is_not_exposed_by_people_search(self):
+        self.repository.create_connection(
+            self.user["user_id"],
+            {"name": "Grace", "education": "Example University", "public_profile_url": "https://example.com/grace", "user_provided_email": "private@example.com", "source_type": "manual"},
+        )
+        run = self.repository.create_agent_run(self.user["user_id"], self.conversation["conversation_id"], goal="Find alumni")
+
+        class EmptySource:
+            def search(self, **_kwargs):
+                return SourceResult(True, "wikidata", [], "{}", "https://www.wikidata.org")
+
+        service = PeopleSearchService(repository=self.repository, evidence=EvidenceService(self.repository), openalex=EmptySource(), wikidata=EmptySource())
+        with patch.dict("os.environ", {"EVIDENCE_S3_ENABLED": "false"}):
+            result = service.search(user_id=self.user["user_id"], run_id=run["run_id"], request=PeopleSearchRequest(person_type="alumni", school="Example University"), source_call_budget=2)
+        serialized = str(result.model_dump(mode="json"))
+        self.assertNotIn("private@example.com", serialized)
+        candidate = result.data["page"]["items"][0]
+        self.assertTrue(candidate["private_contact_reference"])
+        self.assertEqual(candidate["contact_channels"], [])
 
 
 if __name__ == "__main__":

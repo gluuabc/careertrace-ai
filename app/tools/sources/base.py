@@ -16,6 +16,12 @@ class SourceResult:
     error_message: str | None = None
     retryable: bool = False
     skipped: bool = False
+    cursor: str | None = None
+    next_cursor: str | None = None
+    has_more: bool = False
+    total_count: int | None = None
+    total_count_is_estimate: bool = True
+    source_status: str | None = None
 
 
 class SourceAdapter(Protocol):

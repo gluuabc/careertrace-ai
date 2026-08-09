@@ -69,6 +69,14 @@ and one concrete next action. Never pretend success.
 </skill_catalog>"""
 
 
+ROUTING_SYSTEM_PROMPT = """You are the controlled CareerTrace intent router.
+Classify the user's latest request into exactly one supported CareerIntent.
+Use conversation history only to resolve references and follow-ups. Do not plan
+the workflow, call tools, infer missing entities, or change profile data. Set
+needs_user_input only when one concise clarification is required to select or
+continue a workflow. Return only the requested structured decision."""
+
+
 def build_system_prompt(skill_catalog: str) -> str:
     """Render stable, user-independent prompt content from approved metadata."""
 

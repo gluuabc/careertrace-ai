@@ -7,7 +7,7 @@ The project uses **LangGraph** to combine deterministic workflows with bounded A
 - **Deterministic workflows** handle reliable business processes (profile management, database updates, approvals).
 - **AI reasoning agents** handle tasks that require flexibility (career advice, job matching explanations, personalized recommendations).
 
-The long-term goal is to build a personalized career agent with persistent memory using **CockroachDB (SQL + Vector Search)**.
+The production architecture supports persistent memory and hybrid retrieval with **CockroachDB (SQL, full-text search, and vector search)**; SQLite remains the local development and unit-test backend.
 
 ---
 
@@ -208,7 +208,8 @@ Supported routes:
 
 ```text
 START -> initialize_run -> classify_intent -> prepare_workflow
-  ├── concise_guidance / action_plan / clarification -> agent_model
+  ├── needs_input -> finalize
+  ├── concise_guidance / action_plan -> agent_model
   └── job_search / people_search / resume_revision / outreach
         -> plan_action -> execute_tools -> agent_model
 agent_model -> execute_tools (bounded) | finalize -> END
@@ -217,6 +218,7 @@ agent_model -> execute_tools (bounded) | finalize -> END
 The model-visible tools are:
 
 - `read_skill` and `read_skill_file`
+- `read_evidence`
 - `search_jobs` and `get_job_details`
 - `search_people` and `get_person_details`
 - `save_resume_revision_draft`
@@ -227,6 +229,33 @@ The LLM never selects `user_id`; identity is injected from trusted graph state.
 Tool results remain proper `ToolMessage` objects. Source, iteration, and no-new-
 result stopping conditions are enforced by code.
 
+Search requests create a user/run-scoped SQL `search_sessions` record. Provider
+cursors, source coverage, failures, calls, candidate IDs, and bounded candidate
+records survive graph iterations and process restarts. Calls reserve the shared
+budget before network I/O. The model receives a `SearchPage` of 10 summaries by
+default (maximum 20) and can request the internal next cursor without refetching
+an unchanged provider feed.
+
+Hybrid retrieval follows this bounded path:
+
+```mermaid
+flowchart LR
+  Q["User-scoped query"] --> S["Cockroach full-text / SQLite sparse fallback"]
+  Q --> E["Titan Text Embeddings V2"]
+  E --> D["Cockroach VECTOR cosine / SQLite dense fallback"]
+  S --> R["Reciprocal Rank Fusion, k=60"]
+  D --> R
+  R --> A["Top 30"]
+  A --> B["Amazon Rerank 1.0, us-west-2"]
+  B --> T["Top 10"]
+  A -. "Reranker unavailable" .-> T
+```
+
+Ownership and corpus filters are deterministic SQL predicates, never vector
+similarity decisions. Debug ranks/scores are persisted per user. Approved
+memories use the same retrieval path; the runtime context no longer loads every
+memory.
+
 #### Job sources and limitations
 
 `config/job_sources.yaml` is the single version-controlled company catalog.
@@ -234,8 +263,9 @@ Sources start disabled and unverified. On 2026-08-06, public Greenhouse GET
 endpoints were validated for the enabled catalog entries; unverified companies
 remain disabled rather than receiving guessed ATS identifiers. Lever and official
 public-page adapters are available when a validated catalog record selects them.
-Firecrawl and Playwright are optional, disabled by default, and return structured
-skips when unavailable.
+Tavily is optional discovery-only input: each discovered URL is validated and
+independently fetched before it can become evidence. Playwright is a disabled-by-
+default fallback for a known validated JS-only URL. Firecrawl is not integrated.
 
 Job fields are normalized without inference. Eligibility is a hard constraint by
 default: unknown eligibility does not count toward the verified target and is
@@ -267,7 +297,8 @@ time, hash, excerpt, and provenance. Small evidence stays in SQL. Evidence above
 are retained.
 
 The immutable system prompt contains no user data. A fresh `<runtime_context>`
-block supplies the current profile, approved memories, task, selected entities,
+block supplies the current profile, a small query-relevant set of approved
+memories, task, selected entities,
 loaded Skills, and one current status per model call. Adaptive compression starts
 only above the configured threshold, preserves evidence IDs and hard constraints,
 and stores a query-aware summary boundary while leaving original SQL messages
@@ -298,18 +329,22 @@ SQLite
  ├── messages
  ├── agent_runs / agent_steps / agent_tool_calls
  ├── agent_evidence
+ ├── search_sessions / search_source_progress
+ ├── retrieval_documents / retrieval_query_logs
+ ├── starred_qa_pairs
  ├── conversation_context_summaries
  ├── user_connections
  ├── resume_revision_drafts / resume_revision_changes
  └── outreach_drafts
 ```
 
-Planned production storage:
+Supported production storage:
 
 ```
 CockroachDB
- ├── SQL tables
- └── Vector embeddings
+ ├── SQL application and durable search state
+ ├── TSVECTOR / TSQUERY sparse retrieval
+ └── VECTOR(1024) dense retrieval
 ```
 
 ---
@@ -533,6 +568,11 @@ AWS_REGION=us-east-1
 
 BEDROCK_MODEL_CHEAP=amazon.nova-lite-v1:0
 BEDROCK_MODEL_REASONING=<claude-model-id>
+BEDROCK_EMBEDDING_MODEL=amazon.titan-embed-text-v2:0
+BEDROCK_EMBEDDING_DIMENSIONS=1024
+BEDROCK_RERANK_ENABLED=false
+BEDROCK_RERANK_REGION=us-west-2
+BEDROCK_RERANK_MODEL_ID=amazon.rerank-v1:0
 
 
 # LangSmith tracing
@@ -554,6 +594,14 @@ GOOGLE_CLIENT_ID=<google-client-id>
 GOOGLE_CLIENT_SECRET=<google-client-secret>
 AUTH_COOKIE_SECRET=<strong-random-cookie-signing-secret>
 OAUTH_REDIRECT_URI=http://localhost:8501/oauth2callback
+
+# Optional discovery / rendering
+TAVILY_ENABLED=false
+TAVILY_API_KEY=
+PLAYWRIGHT_ENABLED=false
+
+# Developer-only read-only diagnostics
+COCKROACH_MCP_ENABLED=false
 ```
 
 Register the exact `OAUTH_REDIRECT_URI` as an authorized redirect URI in the
@@ -566,6 +614,16 @@ python -c "import secrets; print(secrets.token_urlsafe(48))"
 Credentials stay server-side. Streamlit's native OIDC implementation validates
 authorization state and nonce; CareerTrace additionally validates the Google
 issuer, audience, authorized party, verified email, issue time, and expiration.
+
+If controlled JavaScript rendering is required, explicitly install the browser
+binary and then enable it. Application startup never performs this installation:
+
+```bash
+python -m playwright install chromium
+```
+
+See [Third-Party Integrations](docs/THIRD_PARTY_INTEGRATIONS.md) for provider,
+data, retention, terms, and regional-processing boundaries.
 
 ## 5. Provision private S3 storage
 
@@ -604,10 +662,11 @@ The web interface provides:
 - Database-backed profile viewing and editing
 - Career preferences
 - Stored career analysis and controlled regeneration
+- Starred question/answer pairs, independent from career preferences
 - Private per-user document management
 - Profile and analysis history with rollback
 - Approved-memory review and persistent Career Assistant conversations
-- Agent Activity, evidence-backed candidate results, saved drafts, and optional connections
+- Sidebar agent status, evidence-backed candidate results, saved drafts, and optional connections
 
 ## Judge Testing Instructions
 
@@ -616,15 +675,16 @@ local review, the demo URL is `http://localhost:8501` after starting Streamlit.
 
 1. Open the demo URL and click **Try Judge Demo**.
 2. No Google account or OAuth test-user allowlisting is required.
-3. Confirm the **Demo workspace — uses synthetic data** label is visible.
+3. Confirm the **Demo workspace — uses synthetic data** label is visible. This
+   refers to the supplied test documents; no profile or analysis is pre-seeded.
 4. Download `Demo_Resume.pdf` and `Demo_Portfolio.pdf` from the Document Upload
    page.
 5. Upload both files together, select their document types, and click
    **Analyze documents**.
 6. Complete required-field collection and review the merged profile before
    selecting **Confirm and save**.
-7. Explore **My Profile**, **Career Analysis**, **Documents**, **Memory**, and
-   **Career Assistant**.
+7. Explore **My Profile**, **Starred Q&A**, **Documents**, **Memory** (including
+   career-analysis history), and **Career Assistant**.
 8. Use **Logout** to clear the active browser identity.
 
 Each judge browser session creates a new ordinary UUID-backed `users` row marked
@@ -690,11 +750,12 @@ uses the equivalent `career_analysis.current_version_id` pointer and immutable
 Rollback changes a pointer only; the next edit receives the next unused version
 number.
 
-To migrate to CockroachDB later:
+To run against an isolated CockroachDB database:
 
 1. Provision CockroachDB and set a Cockroach-compatible `DATABASE_URL`.
 2. Run the existing Alembic migrations against the CockroachDB URL.
-3. Review transaction retry behavior for CockroachDB serialization failures.
+3. Run the optional `COCKROACH_TEST_DATABASE_URL` integration suite against a
+   separate disposable database before production rollout.
 4. Keep graph nodes, storage service contracts, and Streamlit views unchanged.
 
 Application-generated UUID keys and transaction-scoped profile writes are used
@@ -706,8 +767,8 @@ to keep the schema portable to a distributed SQL deployment.
 
 ## Current priority
 
-1. Move the SQL repository to CockroachDB
-2. Add conversation-to-memory candidate extraction and vector retrieval
+1. Validate transaction-retry behavior against the selected CockroachDB tier
+2. Backfill embeddings for existing approved private corpus records
 3. Add scheduled proactive searches and notifications
 4. Add PDF/DOCX resume-draft export
 5. Add separately approved sending and application actions
@@ -719,6 +780,6 @@ to keep the schema portable to a distributed SQL deployment.
 - **LangGraph** — agent workflow orchestration
 - **Amazon Bedrock** — LLM inference
 - **LangSmith** — tracing and debugging
-- **CockroachDB** — persistent memory (planned)
-- **Vector Search** — semantic retrieval (planned)
+- **CockroachDB** — supported production persistence and retrieval schema
+- **Hybrid Search** — Cockroach full-text + Titan embeddings + RRF + Amazon Rerank
 - **Streamlit** — authenticated web interface

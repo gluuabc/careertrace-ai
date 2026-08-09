@@ -18,6 +18,7 @@ pydantic
 
 # Database
 sqlalchemy
+sqlalchemy-cockroachdb>=2.0.2,<3
 alembic
 psycopg2-binary
 pgvector
@@ -32,3 +33,4 @@ python-multipart
 requests>=2.31,<3
 beautifulsoup4>=4.12,<5
 PyYAML>=6,<7
+playwright>=1.54,<2

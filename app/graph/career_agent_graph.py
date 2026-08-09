@@ -13,6 +13,7 @@ from app.database.repository import ProfileRepository, profile_repository
 from app.graph.checkpoint import get_default_checkpointer
 from app.llm.model import get_llm
 from app.services.context_manager import ContextManager, context_manager
+from app.services.errors import safe_provider_message, sanitize_diagnostic
 from app.services.skill_registry import SkillRegistry, skill_registry
 from app.services.trajectory import TrajectoryRecorder
 from app.state.agent_schema import (
@@ -50,6 +51,23 @@ TOOL_BY_INTENT = {
     ),
     CareerIntent.OUTREACH: ("save_outreach_draft", OutreachDraftInput, "draft"),
 }
+ALLOWED_TOOLS_BY_INTENT = {
+    CareerIntent.JOB_SEARCH: {
+        "search_jobs", "get_job_details", "read_skill_file", "read_evidence"
+    },
+    CareerIntent.PEOPLE_SEARCH: {
+        "search_people", "get_person_details", "read_skill_file", "read_evidence"
+    },
+    CareerIntent.RESUME_REVISION: {
+        "get_job_details", "read_evidence", "read_skill_file",
+        "save_resume_revision_draft",
+    },
+    CareerIntent.OUTREACH: {
+        "get_person_details", "read_evidence", "read_skill_file",
+        "save_outreach_draft", "update_outreach_status",
+    },
+}
+SOURCE_TOOLS = {"search_jobs", "search_people"}
 
 
 def _fallback_intent(request: str) -> IntentDecision:
@@ -74,10 +92,29 @@ def _fallback_intent(request: str) -> IntentDecision:
         )
     ):
         intent = CareerIntent.PEOPLE_SEARCH
-    elif any(term in value for term in ("plan", "timeline", "steps")):
+    elif any(term in value for term in ("career plan", "career timeline", "action plan")):
         intent = CareerIntent.ACTION_PLAN
-    else:
+    elif any(
+        term in value
+        for term in (
+            "what role",
+            "which role",
+            "career advice",
+            "career guidance",
+            "what should i prioritize",
+        )
+    ):
         intent = CareerIntent.CONCISE_GUIDANCE
+    else:
+        return IntentDecision(
+            intent=CareerIntent.CLARIFICATION,
+            goal=request.strip(),
+            needs_user_input=True,
+            clarification_question=(
+                "Would you like career guidance, a job search, a people search, "
+                "a resume revision, or an outreach draft?"
+            ),
+        )
     return IntentDecision(intent=intent, goal=request.strip())
 
 
@@ -108,7 +145,11 @@ class CareerAgentGraph:
         graph.add_node("finalize", self.finalize)
         graph.add_edge(START, "initialize_run")
         graph.add_edge("initialize_run", "classify_intent")
-        graph.add_edge("classify_intent", "prepare_workflow")
+        graph.add_conditional_edges(
+            "classify_intent",
+            self._route_after_classify,
+            {"clarify": "finalize", "prepare": "prepare_workflow"},
+        )
         graph.add_conditional_edges(
             "prepare_workflow",
             lambda state: "action" if state.get("intent") in ACTION_INTENTS else "respond",
@@ -119,7 +160,11 @@ class CareerAgentGraph:
             lambda state: "tools" if state.get("messages") and isinstance(state["messages"][-1], AIMessage) and state["messages"][-1].tool_calls else "final",
             {"tools": "execute_tools", "final": "finalize"},
         )
-        graph.add_edge("execute_tools", "agent_model")
+        graph.add_conditional_edges(
+            "execute_tools",
+            self._route_after_tools,
+            {"continue": "agent_model", "final": "finalize"},
+        )
         graph.add_conditional_edges(
             "agent_model",
             self._route_after_model,
@@ -131,7 +176,10 @@ class CareerAgentGraph:
     def initialize_run(self, state: CareerAgentState) -> dict[str, Any]:
         request = str(state.get("current_request") or "").strip()
         run = self.repository.create_agent_run(
-            state["user_id"], state["conversation_id"], goal=request
+            state["user_id"],
+            state["conversation_id"],
+            goal=request,
+            user_message_id=state.get("user_message_id"),
         )
         status = AgentStatus(goal=request, workflow_stage="classifying_intent", current_step="Classify request")
         return {
@@ -147,20 +195,60 @@ class CareerAgentGraph:
             "evidence_ids": [],
             "loaded_skills": {},
             "status": status.model_dump(mode="json"),
+            "stop_after_tools": False,
+            "partial_result": False,
         }
 
     def classify_intent(self, state: CareerAgentState) -> dict[str, Any]:
         request = state["current_request"]
-        try:
-            decision = self.model_factory("cheap").with_structured_output(IntentDecision).invoke(
-                "Classify this CareerTrace request into exactly one supported intent. "
-                "Action requests must use their workflow intent. Ask for clarification only "
-                f"when execution is impossible without one fact. Request: {request}"
-            )
-            if not isinstance(decision, IntentDecision):
-                decision = IntentDecision.model_validate(decision)
-        except Exception:
+        routing_messages = self.context.build_routing_messages(
+            user_id=state["user_id"],
+            conversation_id=state["conversation_id"],
+            current_request=request,
+            active_workflow=str(state.get("intent") or "") or None,
+            selected_entities={
+                "job_ids": state.get("selected_job_ids", []),
+                "person_ids": state.get("selected_people_ids", []),
+            }
+            if state.get("selected_job_ids") or state.get("selected_people_ids")
+            else None,
+        )
+        classifier = self.model_factory("cheap").with_structured_output(IntentDecision)
+        decision: IntentDecision | None = None
+        diagnostic = ""
+        routing_source = "llm"
+        for attempt in range(2):
+            try:
+                candidate = classifier.invoke(routing_messages)
+                decision = (
+                    candidate
+                    if isinstance(candidate, IntentDecision)
+                    else IntentDecision.model_validate(candidate)
+                )
+                routing_source = "llm_retry" if attempt else "llm"
+                break
+            except Exception as error:
+                diagnostic = sanitize_diagnostic(error)
+        warnings = list(state.get("warnings", []))
+        if decision is None:
             decision = _fallback_intent(request)
+            routing_source = (
+                "clarification_after_failure"
+                if decision.intent == CareerIntent.CLARIFICATION
+                else "deterministic_fallback"
+            )
+            warnings.append(
+                "Intent classification was unavailable; CareerTrace used a safe "
+                "deterministic route or requested clarification."
+            )
+            TrajectoryRecorder(
+                state["user_id"], state["run_id"], self.repository
+            ).step(
+                "routing_warning",
+                f"Structured classifier failed twice; routing_source={routing_source}; "
+                f"diagnostic={diagnostic}",
+                "completed",
+            )
         self.repository.update_agent_run(
             state["user_id"],
             state["run_id"],
@@ -169,7 +257,8 @@ class CareerAgentGraph:
             status="needs_input" if decision.needs_user_input else "running",
         )
         TrajectoryRecorder(state["user_id"], state["run_id"], self.repository).step(
-            "classify_intent", f"Routed request to {decision.intent.value}."
+            "classify_intent",
+            f"Routed request to {decision.intent.value}; routing_source={routing_source}.",
         )
         return {
             "intent": decision.intent,
@@ -177,6 +266,8 @@ class CareerAgentGraph:
             "needs_user_input": decision.needs_user_input,
             "final_response": decision.clarification_question or "",
             "workflow_stage": "preparing_workflow",
+            "routing_source": routing_source,
+            "warnings": warnings,
         }
 
     def prepare_workflow(self, state: CareerAgentState) -> dict[str, Any]:
@@ -211,21 +302,60 @@ class CareerAgentGraph:
         }
 
     def plan_action(self, state: CareerAgentState) -> dict[str, Any]:
-        if state.get("needs_user_input"):
-            return {}
         intent = CareerIntent(state["intent"])
         tool_name, schema, argument_name = TOOL_BY_INTENT[intent]
         profile = self.repository.get_profile(state["user_id"])
-        prompt = (
-            "Create only the structured arguments needed for the controlled tool. "
-            "Do not invent missing external facts. Use confirmed profile facts when relevant.\n"
-            f"REQUEST: {state['current_request']}\nPROFILE: {json.dumps(profile, default=str)}\n"
-            f"SKILL: {state.get('loaded_skills', {}).get(state.get('active_skill') or '', '')}"
+        routing_messages = self.context.build_routing_messages(
+            user_id=state["user_id"],
+            conversation_id=state["conversation_id"],
+            current_request=state["current_request"],
+            active_workflow=intent.value,
+            selected_entities={
+                "job_ids": state.get("selected_job_ids", []),
+                "person_ids": state.get("selected_people_ids", []),
+            },
+        )
+        selected: dict[str, Any] = {
+            "selected_job_summaries": [
+                item
+                for item in state.get("job_candidates", [])
+                if item.get("candidate_id") in state.get("selected_job_ids", [])
+            ],
+            "selected_people": [
+                item
+                for item in state.get("people_candidates", [])
+                if item.get("candidate_id") in state.get("selected_people_ids", [])
+            ],
+        }
+        if intent == CareerIntent.RESUME_REVISION:
+            selected["documents"] = self.repository.list_documents(state["user_id"])
+        if intent == CareerIntent.OUTREACH:
+            selected["previous_drafts"] = self.repository.list_outreach_drafts(
+                state["user_id"]
+            )
+        builder = {
+            CareerIntent.JOB_SEARCH: self.context.build_job_plan_context,
+            CareerIntent.PEOPLE_SEARCH: self.context.build_people_plan_context,
+            CareerIntent.RESUME_REVISION: self.context.build_resume_plan_context,
+            CareerIntent.OUTREACH: self.context.build_outreach_plan_context,
+        }[intent]
+        prompt = builder(
+            current_request=state["current_request"],
+            routing_messages=routing_messages,
+            profile=profile,
+            skill=state.get("loaded_skills", {}).get(
+                state.get("active_skill") or "", ""
+            ),
+            selected=selected,
         )
         try:
             planned = self.model_factory("reasoning").with_structured_output(schema).invoke(prompt)
             if not isinstance(planned, schema):
                 planned = schema.model_validate(planned)
+            if isinstance(planned, JobSearchRequest):
+                planned = planned.model_copy(
+                    update={"profile_skills": list((profile or {}).get("skills") or [])}
+                )
             call_id = f"call_{state['run_id']}_{state.get('iteration', 0) + 1}"
             message = AIMessage(
                 content="",
@@ -240,13 +370,14 @@ class CareerAgentGraph:
             )
             return {"messages": [message], "workflow_stage": "executing_tools"}
         except Exception as error:
+            diagnostic = sanitize_diagnostic(error)
             response = (
-                "I could not safely prepare that workflow because required structured "
-                f"information is missing or invalid: {str(error)[:300]}. Please provide the missing target details."
+                "I need one more specific target detail before I can safely prepare "
+                "that workflow. Please clarify the role, person, document, or recipient."
             )
             return {
                 "needs_user_input": True,
-                "current_error": str(error)[:500],
+                "current_error": diagnostic,
                 "final_response": response,
                 "workflow_stage": "needs_input",
             }
@@ -269,7 +400,11 @@ class CareerAgentGraph:
             if not isinstance(response, AIMessage):
                 response = base_model.invoke(messages)
         except Exception as error:
-            return {"current_error": str(error)[:500], "final_response": "CareerTrace could not complete the model step. The completed tool results remain saved; please retry once.", "workflow_stage": "failed"}
+            return {
+                "current_error": sanitize_diagnostic(error),
+                "final_response": safe_provider_message("the model step"),
+                "workflow_stage": "failed",
+            }
         return {"messages": [response], "iteration": state.get("iteration", 0) + 1, "workflow_stage": "reasoning"}
 
     def execute_tools(self, state: CareerAgentState) -> dict[str, Any]:
@@ -277,12 +412,8 @@ class CareerAgentGraph:
         if not isinstance(ai_message, AIMessage):
             return {"current_error": "Tool execution requires an assistant tool call."}
         max_calls = int(os.getenv("AGENT_MAX_SOURCE_CALLS", "12"))
-        if state.get("total_source_calls", 0) >= max_calls:
-            return {"warnings": [*state.get("warnings", []), "Source-call budget exhausted."], "workflow_stage": "budget_exhausted"}
         import time
-        started = time.monotonic()
-        result = self.tool_node.invoke(state)
-        tool_messages = result.get("messages", [])
+
         recorder = TrajectoryRecorder(state["user_id"], state["run_id"], self.repository)
         counts = dict(state.get("tool_call_counts", {}))
         source_calls = state.get("total_source_calls", 0)
@@ -291,8 +422,78 @@ class CareerAgentGraph:
         evidence_ids = list(state.get("evidence_ids", []))
         warnings = list(state.get("warnings", []))
         searched_jobs = False
+        searched_people = False
         is_sufficient = bool(state.get("is_sufficient", False))
-        for call, message in zip(ai_message.tool_calls, tool_messages, strict=False):
+        intent = CareerIntent(state["intent"])
+        allowed = ALLOWED_TOOLS_BY_INTENT.get(intent, set())
+        tool_messages: list[ToolMessage] = []
+        max_iterations = int(os.getenv("AGENT_MAX_ITERATIONS", "6"))
+        stop_after_tools = False
+
+        for call in ai_message.tool_calls:
+            started = time.monotonic()
+            rejection: dict[str, Any] | None = None
+            if call["name"] not in allowed:
+                rejection = {
+                    "ok": False,
+                    "error_type": "ToolNotAuthorized",
+                    "error_message": "This tool is not authorized for the active workflow.",
+                    "source_calls": 0,
+                }
+                warnings.append(
+                    f"Rejected unauthorized tool {call['name']} for {intent.value}."
+                )
+            elif state.get("iteration", 0) >= max_iterations:
+                rejection = {
+                    "ok": False,
+                    "error_type": "IterationBudgetExhausted",
+                    "error_message": "The workflow iteration budget is exhausted.",
+                    "source_calls": 0,
+                }
+                warnings.append("Workflow iteration budget exhausted.")
+                stop_after_tools = True
+            elif call["name"] in SOURCE_TOOLS and source_calls >= max_calls:
+                rejection = {
+                    "ok": False,
+                    "error_type": "SourceBudgetExhausted",
+                    "error_message": "The source-call budget is exhausted.",
+                    "source_calls": 0,
+                }
+                warnings.append("Source-call budget exhausted.")
+                stop_after_tools = True
+
+            if rejection is not None:
+                message = ToolMessage(
+                    content=json.dumps(rejection),
+                    tool_call_id=call["id"],
+                    name=call["name"],
+                )
+            else:
+                single_message = AIMessage(content="", tool_calls=[call])
+                local_state = dict(state)
+                local_state["messages"] = [single_message]
+                local_state["total_source_calls"] = source_calls
+                result = self.tool_node.invoke(local_state)
+                returned = {
+                    item.tool_call_id: item
+                    for item in result.get("messages", [])
+                    if isinstance(item, ToolMessage)
+                }
+                message = returned.get(call["id"])
+                if message is None:
+                    message = ToolMessage(
+                        content=json.dumps(
+                            {
+                                "ok": False,
+                                "error_type": "MissingToolResult",
+                                "error_message": "The tool returned no matching result.",
+                                "source_calls": 0,
+                            }
+                        ),
+                        tool_call_id=call["id"],
+                        name=call["name"],
+                    )
+            tool_messages.append(message)
             counts[call["name"]] = counts.get(call["name"], 0) + 1
             try:
                 payload = json.loads(message.content) if isinstance(message.content, str) else message.content
@@ -304,14 +505,29 @@ class CareerAgentGraph:
             data = payload.get("data") or {}
             if call["name"] == "search_jobs":
                 searched_jobs = True
-                jobs = list(data.get("verified") or []) + list(data.get("eligibility_not_verified") or [])
+                page = data.get("page") or data
+                new_jobs = list(page.get("items") or [])
+                if not new_jobs:
+                    new_jobs = list(data.get("verified") or []) + list(
+                        data.get("eligibility_not_verified") or []
+                    )
+                jobs = self._merge_candidates(
+                    jobs, new_jobs, state.get("iteration", 0) + 1
+                )
                 sufficiency = data.get("sufficiency") or {}
                 is_sufficient = (
                     int(sufficiency.get("verified_count") or 0)
                     >= int(sufficiency.get("requested_count") or 1)
                 )
             elif call["name"] == "search_people":
-                people = list(data.get("candidates") or [])
+                searched_people = True
+                page = data.get("page") or data
+                new_people = list(page.get("items") or data.get("candidates") or [])
+                people = self._merge_candidates(
+                    people, new_people, state.get("iteration", 0) + 1
+                )
+                sufficiency = data.get("sufficiency") or {}
+                is_sufficient = bool(sufficiency.get("sufficient", False))
             recorder.tool_call(
                 tool_call_id=call["id"],
                 tool_name=call["name"],
@@ -332,9 +548,19 @@ class CareerAgentGraph:
             item.get("candidate_id") for item in jobs if item.get("hard_constraints_met")
         }
         consecutive_no_new = state.get("consecutive_no_new_results", 0)
-        if searched_jobs:
+        if searched_jobs or searched_people:
+            previous_all = {
+                item.get("candidate_id")
+                for item in [
+                    *state.get("job_candidates", []),
+                    *state.get("people_candidates", []),
+                ]
+            }
+            current_all = {
+                item.get("candidate_id") for item in [*jobs, *people]
+            }
             consecutive_no_new = (
-                consecutive_no_new + 1 if not (current_ids - previous_ids) else 0
+                consecutive_no_new + 1 if not (current_all - previous_all) else 0
             )
         status = AgentStatus(
             goal=state.get("current_goal") or "",
@@ -347,21 +573,88 @@ class CareerAgentGraph:
             source_call_count=source_calls,
             warnings=warnings,
         )
-        return {"messages": tool_messages, "tool_call_counts": counts, "total_source_calls": min(source_calls, max_calls), "consecutive_no_new_results": consecutive_no_new, "job_candidates": jobs, "people_candidates": people, "evidence_ids": sorted(set(evidence_ids)), "warnings": warnings, "status": status.model_dump(mode="json"), "is_sufficient": is_sufficient, "workflow_stage": "reviewing_results"}
+        if source_calls >= max_calls:
+            stop_after_tools = True
+        if consecutive_no_new >= int(os.getenv("AGENT_NO_NEW_RESULTS_STOP", "2")):
+            stop_after_tools = True
+        if is_sufficient:
+            stop_after_tools = True
+        todos = self._todos_after_execution(state.get("todo_items", []))
+        return {
+            "messages": tool_messages,
+            "tool_call_counts": counts,
+            "total_source_calls": source_calls,
+            "consecutive_no_new_results": consecutive_no_new,
+            "job_candidates": jobs,
+            "people_candidates": people,
+            "evidence_ids": sorted(set(evidence_ids)),
+            "warnings": warnings,
+            "status": status.model_dump(mode="json"),
+            "todo_items": todos,
+            "is_sufficient": is_sufficient,
+            "stop_after_tools": stop_after_tools,
+            "partial_result": stop_after_tools and not is_sufficient,
+            "workflow_stage": "partial" if stop_after_tools and not is_sufficient else "reviewing_results",
+        }
+
+    @staticmethod
+    def _merge_candidates(
+        existing: list[dict[str, Any]],
+        incoming: list[dict[str, Any]],
+        iteration: int,
+    ) -> list[dict[str, Any]]:
+        merged = {item.get("candidate_id"): dict(item) for item in existing}
+        order = [item.get("candidate_id") for item in existing]
+        for candidate in incoming:
+            candidate_id = candidate.get("candidate_id")
+            if not candidate_id:
+                continue
+            previous = merged.get(candidate_id, {})
+            combined = {**previous, **candidate}
+            combined["first_seen_iteration"] = previous.get(
+                "first_seen_iteration", iteration
+            )
+            combined["last_seen_iteration"] = iteration
+            combined["evidence_ids"] = sorted(
+                set(previous.get("evidence_ids", []))
+                | set(candidate.get("evidence_ids", []))
+            )
+            combined["source_keys"] = sorted(
+                set(previous.get("source_keys", []))
+                | set(candidate.get("source_keys", []))
+                | ({str(candidate.get("source_name"))} if candidate.get("source_name") else set())
+            )
+            merged[candidate_id] = combined
+            if candidate_id not in order:
+                order.append(candidate_id)
+        return [merged[item_id] for item_id in order if item_id in merged]
+
+    @staticmethod
+    def _todos_after_execution(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        result = [dict(item) for item in items]
+        active_seen = False
+        for item in result:
+            if item.get("status") == "in_progress" and not active_seen:
+                item["status"] = "completed"
+                active_seen = True
+                continue
+            if active_seen and item.get("status") == "pending":
+                item["status"] = "in_progress"
+                break
+        return result
+
+    def _route_after_tools(self, state: CareerAgentState) -> str:
+        return "final" if state.get("stop_after_tools") else "continue"
+
+    @staticmethod
+    def _route_after_classify(state: CareerAgentState) -> str:
+        return "clarify" if state.get("needs_user_input") else "prepare"
 
     def _route_after_model(self, state: CareerAgentState) -> str:
         if state.get("current_error"):
             return "final"
-        if state.get("is_sufficient"):
-            return "final"
-        if state.get("total_source_calls", 0) >= int(os.getenv("AGENT_MAX_SOURCE_CALLS", "12")):
-            return "final"
-        if state.get("consecutive_no_new_results", 0) >= int(
-            os.getenv("AGENT_NO_NEW_RESULTS_STOP", "2")
-        ):
-            return "final"
         last = state.get("messages", [])[-1] if state.get("messages") else None
-        if isinstance(last, AIMessage) and last.tool_calls and state.get("iteration", 0) < int(os.getenv("AGENT_MAX_ITERATIONS", "6")):
+        if isinstance(last, AIMessage) and last.tool_calls:
             return "tools"
         return "final"
 
@@ -378,16 +671,78 @@ class CareerAgentGraph:
                 final = f"I found {len(state['people_candidates'])} evidence-backed people candidates. Review the sources below."
             else:
                 final = "I could not complete the workflow. Please provide one more specific target and try again."
-        failed = bool(state.get("current_error"))
-        self.repository.update_agent_run(state["user_id"], state["run_id"], status="failed" if failed else ("needs_input" if state.get("needs_user_input") else "completed"), final_summary=final, error_summary=state.get("current_error"))
+        failed = bool(state.get("current_error")) and not state.get("needs_user_input")
+        partial = bool(state.get("partial_result"))
+        run_status = (
+            "failed"
+            if failed
+            else "needs_input"
+            if state.get("needs_user_input")
+            else "partial"
+            if partial
+            else "completed"
+        )
         todos = []
         for item in state.get("todo_items", []):
             updated = dict(item)
-            if updated.get("status") in {"pending", "in_progress"}:
-                updated["status"] = "cancelled" if failed else "completed"
+            if updated.get("status") == "in_progress":
+                if state.get("needs_user_input") or failed:
+                    updated["status"] = "blocked"
+                else:
+                    updated["status"] = "completed"
+            elif updated.get("status") == "pending":
+                if failed or partial:
+                    updated["status"] = "cancelled"
+                elif not state.get("needs_user_input"):
+                    updated["status"] = "completed"
             todos.append(updated)
+        self.repository.update_agent_run(
+            state["user_id"],
+            state["run_id"],
+            status=run_status,
+            final_summary=final,
+            error_summary=state.get("current_error"),
+            state_json={
+                "workflow_stage": (
+                    "failed"
+                    if failed
+                    else "needs_input"
+                    if state.get("needs_user_input")
+                    else "partial"
+                    if partial
+                    else "completed"
+                ),
+                "todo_items": todos,
+                "status": state.get("status", {}),
+                "warnings": state.get("warnings", []),
+                "candidate_count": len(state.get("job_candidates", []))
+                + len(state.get("people_candidates", [])),
+                "verified_candidate_count": sum(
+                    bool(item.get("hard_constraints_met"))
+                    for item in state.get("job_candidates", [])
+                ),
+                "unverified_candidate_count": sum(
+                    not bool(item.get("hard_constraints_met"))
+                    for item in state.get("job_candidates", [])
+                ),
+                "source_call_count": state.get("total_source_calls", 0),
+            },
+        )
         TrajectoryRecorder(state["user_id"], state["run_id"], self.repository).step("finalize", "Prepared observable final response.", "failed" if failed else "completed")
-        return {"final_response": final, "todo_items": todos, "workflow_stage": "failed" if failed else "completed"}
+        workflow_stage = (
+            "failed"
+            if failed
+            else "needs_input"
+            if state.get("needs_user_input")
+            else "partial"
+            if partial
+            else "completed"
+        )
+        return {
+            "final_response": final,
+            "todo_items": todos,
+            "workflow_stage": workflow_stage,
+        }
 
     def invoke(self, state: CareerAgentState, config: dict[str, Any] | None = None) -> dict[str, Any]:
         return self.graph.invoke(state, config=config)
