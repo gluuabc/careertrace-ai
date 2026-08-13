@@ -43,8 +43,14 @@ class CockroachIntegrationTests(unittest.TestCase):
         self.assertIn("CockroachDB", version)
 
     def test_vector_fts_and_visibility_indexes_are_live(self):
-        columns = {item["name"]: str(item["type"]) for item in inspect(self.engine).get_columns("retrieval_documents")}
+        with self.engine.connect() as connection:
+            rows = connection.execute(
+                text("SHOW COLUMNS FROM retrieval_documents")
+            ).fetchall()
+
+        columns = {row[0]: row[1] for row in rows}
         indexes = {item["name"] for item in inspect(self.engine).get_indexes("retrieval_documents")}
+
         self.assertEqual(columns["embedding"], "VECTOR(1024)")
         self.assertIn("search_vector_fts", columns)
         self.assertTrue({"ix_retrieval_documents_fts", "ix_retrieval_documents_embedding", "ix_retrieval_documents_visibility"} <= indexes)
