@@ -51,10 +51,6 @@ class CockroachIntegrationTests(unittest.TestCase):
         columns = {row[0]: row[1] for row in rows}
         indexes = {item["name"] for item in inspect(self.engine).get_indexes("retrieval_documents")}
 
-        print("DATABASE:", self.engine.url)
-        print("COLUMNS:", columns)
-        print("INDEXES:", indexes)
-
         self.assertEqual(columns["embedding"], "VECTOR(1024)")
         self.assertIn("search_vector_fts", columns)
         self.assertTrue({"ix_retrieval_documents_fts", "ix_retrieval_documents_embedding", "ix_retrieval_documents_visibility"} <= indexes)
