@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 from collections.abc import Callable
 from urllib.parse import urljoin, urlparse
+import json
 
 from bs4 import BeautifulSoup
 
@@ -76,3 +77,29 @@ class PlaywrightAdapter:
 
     def search(self, **kwargs) -> SourceResult:
         return self.fetch(**kwargs)
+
+    def fetch_person_detail(self, *, url: str, allowed_hosts: set[str] | None = None) -> SourceResult:
+        rendered = self.fetch(url=url, allowed_hosts=allowed_hosts)
+        if not rendered.ok or not rendered.raw_content:
+            return rendered
+        soup = BeautifulSoup(rendered.raw_content, "html.parser")
+        name_node = soup.find("h1")
+        role_node = soup.select_one("[class*='title'], [class*='role'], [class*='position']")
+        organization_node = soup.select_one("[class*='affiliation'], [class*='institution'], [class*='department'], [class*='organization']")
+        name = name_node.get_text(" ", strip=True)[:300] if name_node else None
+        role = role_node.get_text(" ", strip=True)[:300] if role_node else None
+        organization = organization_node.get_text(" ", strip=True)[:300] if organization_node else None
+        records = []
+        if name and (role or organization):
+            records.append({
+                "name": name,
+                "current_role": role,
+                "organization": organization,
+                "public_source_url": rendered.source_url or url,
+                "public_profiles": [rendered.source_url or url],
+                "research_topics": [],
+                "claim_provenance": {"method": "playwright_visible_html", "source_url": rendered.source_url or url},
+            })
+        rendered.records = records
+        rendered.total_count = len(records)
+        return rendered

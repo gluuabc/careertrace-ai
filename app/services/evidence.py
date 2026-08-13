@@ -98,20 +98,20 @@ class EvidenceService:
         )
         try:
             from app.database.retrieval_repository import RetrievalRepository
-            from app.services.embeddings import logical_chunks
+            from app.services.retrieval_corpus import RetrievalCorpusIndexer
 
-            retrieval = RetrievalRepository(self.repository.session_factory)
-            for index, chunk in enumerate(logical_chunks(sanitized)):
-                retrieval.upsert_document(
-                    corpus_type="evidence",
-                    user_id=user_id,
-                    source_entity_id=f"{evidence_id}:{index}",
-                    source_version=digest,
-                    title=source_name,
-                    text_content=chunk,
-                    metadata={"source_type": source_type, "source_url": source_url, "chunk_index": index},
-                    evidence_ids=[evidence_id],
-                )
+            RetrievalCorpusIndexer(
+                RetrievalRepository(self.repository.session_factory)
+            ).index_evidence(
+                user_id=user_id,
+                run_id=run_id,
+                evidence_id=evidence_id,
+                source_name=source_name,
+                source_type=source_type,
+                source_url=source_url,
+                content_hash=digest,
+                text=sanitized,
+            )
         except Exception:
             warnings.append("Evidence retrieval indexing is temporarily unavailable.")
         return record, warnings

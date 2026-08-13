@@ -16,6 +16,7 @@ from app.services.context_manager import ContextManager, context_manager
 from app.services.errors import safe_provider_message, sanitize_diagnostic
 from app.services.skill_registry import SkillRegistry, skill_registry
 from app.services.trajectory import TrajectoryRecorder
+from app.services.token_accounting import ModelCallObserver
 from app.state.agent_schema import (
     AgentStatus,
     AgentTodoItem,
@@ -134,6 +135,20 @@ class CareerAgentGraph:
         self.tool_node = ToolNode(CAREER_AGENT_TOOLS, handle_tool_errors=True)
         self.graph = self._build(checkpointer)
 
+    @staticmethod
+    def _model_id(model_type: str) -> str:
+        key = "BEDROCK_MODEL_CHEAP" if model_type == "cheap" else "BEDROCK_MODEL_REASONING"
+        return os.getenv(key, "")
+
+    def _invoke_observed(self, runnable: Any, messages: list[Any], state: CareerAgentState, *, stage: str, model_type: str, tools: list[Any] | None = None, compression_triggered: bool = False) -> Any:
+        return ModelCallObserver(self.repository).invoke(
+            runnable, messages,
+            user_id=state["user_id"], conversation_id=state.get("conversation_id"),
+            run_id=state.get("run_id"), stage=stage, model_type=model_type,
+            model_id=self._model_id(model_type), tools=tools,
+            compression_triggered=compression_triggered,
+        )
+
     def _build(self, checkpointer=None):
         graph = StateGraph(CareerAgentState)
         graph.add_node("initialize_run", self.initialize_run)
@@ -219,7 +234,11 @@ class CareerAgentGraph:
         routing_source = "llm"
         for attempt in range(2):
             try:
-                candidate = classifier.invoke(routing_messages)
+                candidate = self._invoke_observed(
+                    classifier, routing_messages, state,
+                    stage="classify_intent_retry" if attempt else "classify_intent",
+                    model_type="cheap",
+                )
                 decision = (
                     candidate
                     if isinstance(candidate, IntentDecision)
@@ -349,7 +368,10 @@ class CareerAgentGraph:
             selected=selected,
         )
         try:
-            planned = self.model_factory("reasoning").with_structured_output(schema).invoke(prompt)
+            planned = self._invoke_observed(
+                self.model_factory("reasoning").with_structured_output(schema),
+                prompt, state, stage="plan_action", model_type="reasoning",
+            )
             if not isinstance(planned, schema):
                 planned = schema.model_validate(planned)
             if isinstance(planned, JobSearchRequest):
@@ -391,14 +413,22 @@ class CareerAgentGraph:
             selected_entities={"job_ids": state.get("selected_job_ids", []), "people_ids": state.get("selected_people_ids", [])},
             loaded_skills=state.get("loaded_skills", {}),
             agent_status=state.get("status", {}),
+            run_id=state.get("run_id"),
         )
         messages.extend(state.get("messages", []))
+        messages, _final_tokens, compression_triggered = self.context.final_preflight_messages(messages)
         base_model = self.model_factory("reasoning")
         model = base_model.bind_tools(CAREER_AGENT_TOOLS)
         try:
-            response = model.invoke(messages)
+            response = self._invoke_observed(
+                model, messages, state, stage="agent_model", model_type="reasoning",
+                tools=list(CAREER_AGENT_TOOLS), compression_triggered=compression_triggered,
+            )
             if not isinstance(response, AIMessage):
-                response = base_model.invoke(messages)
+                response = self._invoke_observed(
+                    base_model, messages, state, stage="agent_model_fallback",
+                    model_type="reasoning", compression_triggered=compression_triggered,
+                )
         except Exception as error:
             return {
                 "current_error": sanitize_diagnostic(error),

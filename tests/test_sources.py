@@ -4,8 +4,10 @@ from unittest.mock import patch
 
 from app.tools.sources.greenhouse import GreenhouseAdapter
 from app.tools.sources.lever import LeverAdapter
+from app.tools.sources.openalex import OpenAlexAdapter
 from app.tools.sources.public_pages import PublicPageAdapter
 from app.tools.sources.tavily import TavilyAdapter
+from app.tools.sources.wikidata import WikidataAdapter
 from app.tools.sources.playwright import PlaywrightAdapter
 
 
@@ -92,6 +94,23 @@ class SourceAdapterTests(unittest.TestCase):
         self.assertFalse(result.ok)
         self.assertIn("size", result.error_message)
 
+    def test_network_adapters_enforce_response_caps(self):
+        adapters = [
+            (GreenhouseAdapter, FakeSession, lambda item: item.search(board_token="x",company="X")),
+            (LeverAdapter, FakeSession, lambda item: item.search(site_name="x",company="X")),
+            (OpenAlexAdapter, FakeSession, lambda item: item.search(query="x")),
+            (WikidataAdapter, FakeSession, lambda item: item.search(query="x")),
+            (TavilyAdapter, FakePostSession, lambda item: item.search(query="x")),
+        ]
+        for adapter_type, session_type, invoke in adapters:
+            response=FakeResponse(content=b"x"*(adapter_type.max_bytes+1))
+            adapter=adapter_type(session_type(response))
+            environment={"TAVILY_ENABLED":"true","TAVILY_API_KEY":"test-only"} if adapter_type is TavilyAdapter else {}
+            with self.subTest(adapter=adapter_type.__name__), patch.dict("os.environ",environment):
+                result=invoke(adapter)
+                self.assertFalse(result.ok)
+                self.assertNotIn("test-only",repr(result))
+
     def test_public_job_detail_uses_only_explicit_structured_fields(self):
         html = b'''<script type="application/ld+json">{"@type":"JobPosting","title":"AI Intern","hiringOrganization":{"name":"Example"},"employmentType":"INTERN","datePosted":"2026-08-01","validThrough":"2026-09-01","description":"Undergraduate candidates must be currently enrolled. Sponsorship is not available."}</script><h1>Ignored fallback</h1>'''
         result = PublicPageAdapter(FakeSession(FakeResponse(content=html, url="https://example.com/jobs/1")), resolver=public_resolver).fetch_job_detail(url="https://example.com/jobs/1")
@@ -108,6 +127,16 @@ class SourceAdapterTests(unittest.TestCase):
         self.assertEqual(result.records[0]["name"], "Ada Example")
         self.assertEqual(result.records[0]["organization"], "Example Co")
         self.assertEqual(result.records[0]["public_contact"], "ada@example.com")
+
+    def test_people_html_fallback_without_schema_org_requires_trust(self):
+        html=b'''<h1>Ada Faculty</h1><div class="title">Professor of Computer Science</div><div class="institution">Example University</div><p>Research interests: machine learning, databases.</p><a href="mailto:ada@example.edu">Email</a>'''
+        adapter=PublicPageAdapter(FakeSession(FakeResponse(content=html,url="https://example.edu/faculty/ada")),resolver=public_resolver)
+        untrusted=adapter.fetch_person_detail(url="https://example.edu/faculty/ada")
+        self.assertEqual(untrusted.records,[])
+        trusted=adapter.fetch_person_detail(url="https://example.edu/faculty/ada",trusted_for_claims=True)
+        self.assertEqual(trusted.records[0]["name"],"Ada Faculty")
+        self.assertEqual(trusted.records[0]["organization"],"Example University")
+        self.assertIn("machine learning",trusted.records[0]["research_topics"])
 
     def test_tavily_is_cleanly_skipped_when_disabled(self):
         with patch.dict("os.environ", {"TAVILY_ENABLED": "false", "TAVILY_API_KEY": ""}):

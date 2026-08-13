@@ -14,20 +14,18 @@ from app.prompts import ROUTING_SYSTEM_PROMPT, build_system_prompt
 from app.services.skill_registry import SkillRegistry, skill_registry
 from app.database.retrieval_repository import RetrievalRepository
 from app.services.retrieval import HybridRetrievalService
+from app.services.token_accounting import heuristic_input_tokens, heuristic_text_tokens
+from app.services.token_accounting import ModelCallObserver
 
 
 def estimate_tokens(text: str) -> int:
-    return max(1, (len(text) + 3) // 4)
+    return heuristic_text_tokens(text)
 
 
 def estimate_bound_tool_schema_tokens() -> int:
-    try:
-        from app.tools import get_all_tools
-
-        schemas = [tool.tool_call_schema.model_json_schema() for tool in get_all_tools()]
-        return estimate_tokens(json.dumps(schemas, sort_keys=True, default=str))
-    except Exception:
-        return 0
+    from app.tools import CAREER_AGENT_TOOLS
+    schemas = [tool.tool_call_schema.model_json_schema() for tool in CAREER_AGENT_TOOLS]
+    return estimate_tokens(json.dumps(schemas, sort_keys=True, default=str))
 
 
 class ContextManager:
@@ -61,9 +59,9 @@ class ContextManager:
         usable = (
             cls.model_context_limit()
             - int(os.getenv("CONTEXT_RESERVED_OUTPUT_TOKENS", "4096"))
-            - int(os.getenv("CONTEXT_SAFETY_MARGIN_TOKENS", "2048"))
+            - int(os.getenv("CONTEXT_SAFETY_MARGIN_TOKENS", "8192"))
         )
-        ratio = float(os.getenv("CONTEXT_COMPRESSION_TRIGGER_RATIO", "0.8"))
+        ratio = float(os.getenv("CONTEXT_COMPRESSION_TRIGGER_RATIO", "0.75"))
         return max(1000, int(usable * ratio))
 
     def runtime_block(
@@ -226,6 +224,7 @@ class ContextManager:
         selected_entities: dict[str, Any] | None = None,
         loaded_skills: dict[str, str] | None = None,
         agent_status: dict[str, Any] | None = None,
+        run_id: str | None = None,
     ) -> list[BaseMessage]:
         conversation = self.repository.get_conversation(user_id, conversation_id)
         summary = self.repository.get_latest_context_summary(user_id, conversation_id)
@@ -279,6 +278,7 @@ class ContextManager:
             selected_entities=selected_entities or {},
             loaded_skills=loaded_skills or {},
             agent_status=agent_status or {},
+            run_id=run_id,
         )
 
     def _compress_if_needed(
@@ -293,6 +293,7 @@ class ContextManager:
         selected_entities: dict[str, Any],
         loaded_skills: dict[str, str],
         agent_status: dict[str, Any],
+        run_id: str | None,
     ) -> list[BaseMessage]:
         total = sum(estimate_tokens(str(message.content)) for message in messages)
         total += estimate_bound_tool_schema_tokens()
@@ -307,7 +308,12 @@ class ContextManager:
             f"STATUS: {json.dumps(agent_status)}\nSEGMENT:\n{json.dumps(batch)}"
         )
         try:
-            response = get_llm("cheap").invoke([HumanMessage(content=prompt)])
+            response = ModelCallObserver(self.repository).invoke(
+                get_llm("cheap"), [HumanMessage(content=prompt)],
+                user_id=user_id, conversation_id=conversation_id, run_id=run_id,
+                stage="context_compression", model_type="cheap",
+                model_id=os.getenv("BEDROCK_MODEL_CHEAP", ""), compression_triggered=True,
+            )
             summary_text = str(response.content).strip()
             if not summary_text:
                 raise ValueError("Empty compression response")
@@ -342,7 +348,25 @@ class ContextManager:
             selected_entities=selected_entities,
             loaded_skills=loaded_skills,
             agent_status=agent_status,
+            run_id=run_id,
         )
+
+    def final_preflight_messages(self, messages: list[BaseMessage]) -> tuple[list[BaseMessage], int, bool]:
+        """Apply a final bounded compaction after current-run ToolMessages are appended."""
+        from app.tools import CAREER_AGENT_TOOLS
+
+        total = heuristic_input_tokens(messages, tools=list(CAREER_AGENT_TOOLS))
+        if total <= self.compression_threshold():
+            return messages, total, False
+        # Preserve both system messages and the latest tool exchange. Older current-run
+        # tool data is replaced with metadata-only summaries; source text remains in evidence.
+        compacted: list[BaseMessage] = []
+        for index, message in enumerate(messages):
+            if message.type == "tool" and index < len(messages) - 2:
+                compacted.append(type(message)(content="[Earlier tool result compacted; use authorized evidence read if needed.]", tool_call_id=getattr(message, "tool_call_id", "compacted"), name=getattr(message, "name", None)))
+            else:
+                compacted.append(message)
+        return compacted, heuristic_input_tokens(compacted, tools=list(CAREER_AGENT_TOOLS)), True
 
 
 context_manager = ContextManager()

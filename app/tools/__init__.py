@@ -18,10 +18,9 @@ def _build_tools() -> list[Any]:
     from app.tools.evidence import read_evidence
     from app.tools.jobs import get_job_details, search_jobs
     from app.tools.people import get_person_details, search_people
-    from app.tools.skills import read_skill, read_skill_file
+    from app.tools.skills import read_skill_file
 
     return [
-        read_skill,
         read_skill_file,
         read_evidence,
         search_jobs,

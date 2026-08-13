@@ -171,8 +171,9 @@ class PublicPageAdapter:
         *,
         url: str,
         allowed_hosts: set[str] | None = None,
+        trusted_for_claims: bool = False,
     ) -> SourceResult:
-        """Extract only explicit schema.org Person records from a public page."""
+        """Extract explicit Person data, with a bounded trusted-page HTML fallback."""
         try:
             response, raw = self._fetch(url, allowed_hosts=allowed_hosts)
             html = raw.decode(getattr(response, "encoding", None) or "utf-8", errors="replace")
@@ -208,6 +209,36 @@ class PublicPageAdapter:
                         "public_source_url": response.url,
                         "public_profiles": [item.get("url")] if item.get("url") else [response.url],
                         "public_contact": item.get("email"),
+                        "claim_provenance": {"method": "schema_org_person", "source_url": response.url},
+                    })
+            if not people and trusted_for_claims:
+                visible, _ = self._clean_soup(raw, getattr(response, "encoding", None))
+                name_node = visible.find("h1")
+                name = name_node.get_text(" ", strip=True)[:300] if name_node else None
+                role_node = visible.select_one("[class*='title'], [class*='role'], [class*='position']")
+                organization_node = visible.select_one("[class*='affiliation'], [class*='institution'], [class*='department'], [class*='organization']")
+                role = role_node.get_text(" ", strip=True)[:300] if role_node else None
+                organization = organization_node.get_text(" ", strip=True)[:300] if organization_node else None
+                text = " ".join(visible.get_text(" ", strip=True).split())
+                if name and (role or organization):
+                    topics: list[str] = []
+                    topic_match = re.search(r"(?:research interests?|research areas?|topics?)\s*:?\s*([^.!?]{3,500})", text, re.I)
+                    if topic_match:
+                        topics = [item.strip() for item in re.split(r"[,;]", topic_match.group(1)) if item.strip()][:10]
+                    public_email = None
+                    mail = visible.find("a", href=re.compile(r"^mailto:", re.I))
+                    if mail:
+                        public_email = str(mail.get("href") or "").removeprefix("mailto:").split("?", 1)[0]
+                    people.append({
+                        "name": name,
+                        "current_role": role,
+                        "organization": organization,
+                        "education": None,
+                        "research_topics": topics,
+                        "public_source_url": response.url,
+                        "public_profiles": [response.url],
+                        "public_contact": public_email,
+                        "claim_provenance": {"method": "visible_html", "source_url": response.url, "explicit_text_excerpt": text[:1000]},
                     })
             return SourceResult(True, self.name, people, html, response.url, "text/html", total_count=len(people), total_count_is_estimate=False, source_status="available")
         except (requests.RequestException, ValueError) as error:

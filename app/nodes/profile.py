@@ -1,9 +1,12 @@
 import json
+import os
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import BaseModel
 
+from app.database.repository import profile_repository
 from app.llm.model import get_llm
+from app.services.token_accounting import ModelCallObserver
 from app.state.schema import CareerProfile, ProfileState
 
 
@@ -33,8 +36,7 @@ def generate_profile(state: ProfileState) -> dict[str, dict]:
         }
     }
     structured_llm = get_llm("reasoning").with_structured_output(CareerProfile)
-    result = structured_llm.invoke(
-        [
+    messages = [
             SystemMessage(
                 content=(
                     "You are a practical career assistant. Base every recommendation "
@@ -50,6 +52,15 @@ def generate_profile(state: ProfileState) -> dict[str, dict]:
                 )
             ),
         ]
+    result = ModelCallObserver(profile_repository).invoke(
+        structured_llm,
+        messages,
+        user_id=state["user_id"],
+        conversation_id=None,
+        run_id=None,
+        stage="career_profile_generation",
+        model_type="reasoning",
+        model_id=os.getenv("BEDROCK_MODEL_REASONING", ""),
     )
 
     return {"career_profile": _as_dict(result)}

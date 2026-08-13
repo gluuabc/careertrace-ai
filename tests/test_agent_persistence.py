@@ -126,6 +126,29 @@ class AgentPersistenceTests(unittest.TestCase):
                 self.other["user_id"], search["search_session_id"], 1
             )
 
+    def test_provider_network_call_not_inside_search_budget_transaction(self):
+        run = self.repository.create_agent_run(
+            self.user["user_id"], self.conversation["conversation_id"], goal="Search"
+        )
+        search = self.repository.get_or_create_search_session(
+            self.user["user_id"], run["run_id"], intent="people_search",
+            normalized_request={"person_type": "professor"}, requested_count=1,
+            source_call_budget=1,
+        )
+        provider_called = False
+
+        def provider_call():
+            nonlocal provider_called
+            provider_called = True
+
+        reserved = self.repository.reserve_search_source_calls(
+            self.user["user_id"], search["search_session_id"], 1
+        )
+        self.assertFalse(provider_called)
+        self.assertEqual(reserved["reserved_calls"], 1)
+        provider_call()
+        self.assertTrue(provider_called)
+
     def test_private_connection_email_is_not_exposed_by_people_search(self):
         self.repository.create_connection(
             self.user["user_id"],

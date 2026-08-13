@@ -1,8 +1,9 @@
 from collections.abc import Callable, Iterable
 from datetime import datetime, timezone
 from typing import Any
+import threading
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session
 
 from app.database.database import SessionLocal, session_scope
@@ -21,6 +22,7 @@ from app.database.models import (
     ProfileDocumentSource,
     ProfileVersion,
     Project,
+    RetrievalDocument,
     Skill,
     StarredQAPair,
     User,
@@ -32,6 +34,7 @@ class ProfileRepository(AgentRepositoryMixin):
 
     def __init__(self, session_factory: Callable[[], Session] = SessionLocal):
         self.session_factory = session_factory
+        self._source_budget_lock = threading.Lock()
 
     # ------------------------------------------------------------------ users
     def list_users(self) -> list[dict[str, Any]]:
@@ -406,6 +409,15 @@ class ProfileRepository(AgentRepositoryMixin):
                 raise ValueError(
                     "A document used by profile history cannot be deleted."
                 )
+            session.execute(
+                update(RetrievalDocument)
+                .where(
+                    RetrievalDocument.user_id == user_id,
+                    RetrievalDocument.corpus_type == "uploaded_document_chunk",
+                    RetrievalDocument.source_entity_id.like(f"{document_id}%"),
+                )
+                .values(active=False)
+            )
             session.delete(document)
 
     # ------------------------------------------------------ flexible memories
@@ -477,16 +489,11 @@ class ProfileRepository(AgentRepositoryMixin):
             # make the approval transaction depend on an external embedding service.
             try:
                 from app.database.retrieval_repository import RetrievalRepository
+                from app.services.retrieval_corpus import RetrievalCorpusIndexer
 
-                RetrievalRepository(self.session_factory).upsert_document(
-                    corpus_type="approved_memory",
-                    user_id=user_id,
-                    source_entity_id=accepted_memory["memory_id"],
-                    source_version="1",
-                    title=accepted_memory["category"],
-                    text_content=accepted_memory["content"],
-                    metadata={"source": accepted_memory["source"]},
-                )
+                RetrievalCorpusIndexer(
+                    RetrievalRepository(self.session_factory)
+                ).index_memory(user_id=user_id, memory=accepted_memory)
             except Exception:
                 pass
         return accepted_memory

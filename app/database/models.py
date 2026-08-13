@@ -116,6 +116,9 @@ class User(TimestampMixin, Base):
     retrieval_queries: Mapped[list["RetrievalQueryLog"]] = relationship(
         back_populates="user", cascade="all, delete-orphan"
     )
+    model_call_metrics: Mapped[list["ModelCallMetric"]] = relationship(
+        back_populates="user", cascade="all, delete-orphan"
+    )
 
 
 class Profile(TimestampMixin, Base):
@@ -728,6 +731,7 @@ class RetrievalDocument(TimestampMixin, Base):
     embedding_model_id: Mapped[str | None] = mapped_column(String(200), nullable=True)
     embedding_dimension: Mapped[int | None] = mapped_column(Integer, nullable=True)
     embedding: Mapped[list[float] | None] = mapped_column(PortableVector(1024), nullable=True)
+    active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False, index=True)
 
     user: Mapped[User | None] = relationship(back_populates="retrieval_documents")
 
@@ -746,6 +750,38 @@ class RetrievalQueryLog(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utc_now, nullable=False, index=True)
 
     user: Mapped[User] = relationship(back_populates="retrieval_queries")
+
+
+class ModelCallMetric(Base):
+    __tablename__ = "model_call_metrics"
+
+    model_call_metric_id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.user_id", ondelete="CASCADE"), nullable=False, index=True)
+    conversation_id: Mapped[str | None] = mapped_column(ForeignKey("conversations.conversation_id", ondelete="SET NULL"), nullable=True, index=True)
+    run_id: Mapped[str | None] = mapped_column(ForeignKey("agent_runs.run_id", ondelete="SET NULL"), nullable=True, index=True)
+    stage: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
+    model_type: Mapped[str] = mapped_column(String(50), nullable=False)
+    model_id: Mapped[str | None] = mapped_column(String(300), nullable=True)
+    region: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    rough_estimated_input_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    preflight_input_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    preflight_count_source: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    actual_input_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    actual_output_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    actual_total_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    cache_read_input_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    cache_write_input_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    model_context_limit: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    reserved_output_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    safety_margin_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    compression_threshold: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    compression_triggered: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    latency_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    stop_reason: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    error_type: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utc_now, nullable=False, index=True)
+
+    user: Mapped[User] = relationship(back_populates="model_call_metrics")
 
 
 class ConversationContextSummary(Base):

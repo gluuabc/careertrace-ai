@@ -34,3 +34,4 @@ requests>=2.31,<3
 beautifulsoup4>=4.12,<5
 PyYAML>=6,<7
 playwright>=1.54,<2
+mcp>=1.20,<2

@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import os
+import json
 from typing import Any
 
 import requests
 
-from app.tools.sources.base import SourceResult
+from app.tools.sources.base import SourceResult, bounded_response_bytes
 
 
 class TavilyAdapter:
@@ -14,6 +15,7 @@ class TavilyAdapter:
     name = "tavily_discovery"
     endpoint = "https://api.tavily.com/search"
     timeout = (5.0, 15.0)
+    max_bytes = 2_000_000
 
     def __init__(self, session: requests.Session | None = None):
         self.session = session or requests.Session()
@@ -47,9 +49,10 @@ class TavilyAdapter:
         if include_domains:
             payload["include_domains"] = include_domains[:10]
         try:
-            response = self.session.post(self.endpoint, json=payload, timeout=self.timeout)
+            response = self.session.post(self.endpoint, json=payload, timeout=self.timeout, stream=True, allow_redirects=False)
             response.raise_for_status()
-            body = response.json()
+            raw = bounded_response_bytes(response, self.max_bytes)
+            body = json.loads(raw) if raw else response.json()
             records = [
                 {
                     "title": item.get("title"),

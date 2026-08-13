@@ -74,6 +74,18 @@ class ToolExecutionResult(BaseModel):
     source_calls: int = 0
 
 
+class RequirementState(StrEnum):
+    MATCH = "match"
+    CONFLICT = "conflict"
+    UNKNOWN = "unknown"
+
+
+class PeopleVerificationStatus(StrEnum):
+    VERIFIED_PUBLIC = "verified_public"
+    USER_PROVIDED_UNVERIFIED = "user_provided_unverified"
+    INSUFFICIENT_PUBLIC_EVIDENCE = "insufficient_public_evidence"
+
+
 class JobSearchRequest(BaseModel):
     target_roles: list[str] = Field(default_factory=list)
     role_keywords: list[str] = Field(default_factory=list)
@@ -118,6 +130,16 @@ class JobSearchRequest(BaseModel):
         )
         return migrated
 
+    @field_validator("hard_preference_fields")
+    @classmethod
+    def validate_hard_preference_fields(cls, values: list[str]) -> list[str]:
+        allowed = {"industries", "salary_preference"}
+        normalized = list(dict.fromkeys(str(value).strip() for value in values if str(value).strip()))
+        unknown = set(normalized) - allowed
+        if unknown:
+            raise ValueError(f"Unsupported hard preference fields: {sorted(unknown)}")
+        return normalized
+
 
 class JobCandidate(BaseModel):
     candidate_id: str
@@ -148,6 +170,11 @@ class JobCandidate(BaseModel):
     first_seen_iteration: int = 1
     last_seen_iteration: int = 1
     source_keys: list[str] = Field(default_factory=list)
+    hard_requirement_states: dict[str, RequirementState] = Field(default_factory=dict)
+    job_required_skills: list[str] = Field(default_factory=list)
+    job_preferred_skills: list[str] = Field(default_factory=list)
+    ranking_components: dict[str, Any] = Field(default_factory=dict)
+    verification_status: Literal["verified", "requirements_not_fully_verified", "conflict"] = "requirements_not_fully_verified"
 
 
 class SearchSufficiency(BaseModel):
@@ -204,6 +231,10 @@ class PeopleCandidate(BaseModel):
     first_seen_iteration: int = 1
     last_seen_iteration: int = 1
     source_keys: list[str] = Field(default_factory=list)
+    verification_status: PeopleVerificationStatus = PeopleVerificationStatus.INSUFFICIENT_PUBLIC_EVIDENCE
+    identity_confidence: Literal["verified", "unverified", "unknown"] = "unknown"
+    source_trust: dict[str, Any] = Field(default_factory=dict)
+    ranking_components: dict[str, Any] = Field(default_factory=dict)
 
 
 class PeopleSearchSufficiency(BaseModel):

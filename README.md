@@ -251,8 +251,10 @@ flowchart LR
   A -. "Reranker unavailable" .-> T
 ```
 
-Ownership and corpus filters are deterministic SQL predicates, never vector
-similarity decisions. Debug ranks/scores are persisted per user. Approved
+Ownership, active-version, and current-search document filters are deterministic
+SQL predicates, never vector-similarity decisions. Raw retrieval queries/ranks
+are not persisted unless `RETRIEVAL_DEBUG_LOGGING=true`; debug logging is
+user-scoped, bounded, and optional. Approved
 memories use the same retrieval path; the runtime context no longer loads every
 memory.
 
@@ -267,10 +269,13 @@ Tavily is optional discovery-only input: each discovered URL is validated and
 independently fetched before it can become evidence. Playwright is a disabled-by-
 default fallback for a known validated JS-only URL. Firecrawl is not integrated.
 
-Job fields are normalized without inference. Eligibility is a hard constraint by
-default: unknown eligibility does not count toward the verified target and is
-shown separately as **Eligibility not verified**. No source adapter applies to a
-job.
+Job fields are normalized without inference. Supplied hard requirements use
+`MATCH` / `CONFLICT` / `UNKNOWN`: conflicts are excluded, while any unknown hard
+field stays in **Requirements not fully verified** and does not count toward the
+verified target. Desired skills remain soft preferences; skill gaps are only
+explicit posting requirements absent from confirmed profile skills. Eligible
+current-session candidates are indexed and ordered by sparse + Titan dense
+retrieval, RRF, and optional Amazon Rerank. No source adapter applies to a job.
 
 #### People sources and limitations
 
@@ -600,8 +605,11 @@ TAVILY_ENABLED=false
 TAVILY_API_KEY=
 PLAYWRIGHT_ENABLED=false
 
-# Developer-only read-only diagnostics
-COCKROACH_MCP_ENABLED=false
+# Developer-only read-only managed MCP diagnostics
+COCKROACH_CLOUD_MCP_ENABLED=false
+COCKROACH_CLOUD_MCP_URL=https://cockroachlabs.cloud/mcp
+COCKROACH_CLOUD_CLUSTER_ID=
+COCKROACH_CLOUD_MCP_API_KEY=
 ```
 
 Register the exact `OAUTH_REDIRECT_URI` as an authorized redirect URI in the
@@ -624,6 +632,16 @@ python -m playwright install chromium
 
 See [Third-Party Integrations](docs/THIRD_PARTY_INTEGRATIONS.md) for provider,
 data, retention, terms, and regional-processing boundaries.
+
+CareerTrace uses three separate CockroachDB concepts:
+
+- **Distributed vector/full-text indexing** is a runtime retrieval capability.
+- **CockroachDB Cloud Managed MCP** is a bounded, read-only developer operations
+  integration and never enters the Career Agent tool surface.
+- **CockroachDB Agent Skills** are developer engineering guidance used to audit
+  transactions, SQL, diagnostics, and privileges. They are not runtime data,
+  model training data, or end-user Skills. The exact upstream revision and
+  findings are recorded in [the Skills audit](docs/COCKROACH_AGENT_SKILLS.md).
 
 ## 5. Provision private S3 storage
 
@@ -764,6 +782,17 @@ to keep the schema portable to a distributed SQL deployment.
 ---
 
 # Development Notes
+
+## Developer CockroachDB operations
+
+The end-user Career Agent never receives database administration tools. Optional
+developer diagnostics use the official CockroachDB Cloud Managed MCP endpoint
+through the public MCP Python SDK, pin one configured cluster, and enforce a
+CareerTrace-side allowlist for bounded read-only `SELECT`/`EXPLAIN` operations.
+CockroachDB's official operational Skills are published at
+[`cockroachlabs/cockroachdb-skills`](https://github.com/cockroachlabs/cockroachdb-skills)
+and belong in a developer tool's `.agents/skills`/personal skill catalog—not
+`app/skills`, which contains only CareerTrace product workflows.
 
 ## Current priority
 

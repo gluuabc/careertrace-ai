@@ -1,7 +1,11 @@
 from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import BaseModel
 
+import os
+
+from app.database.repository import profile_repository
 from app.llm.model import get_llm
+from app.services.token_accounting import ModelCallObserver
 from app.state.schema import ProfileFacts, ProfileState
 
 
@@ -54,8 +58,7 @@ def extract_profile(state: ProfileState) -> dict[str, dict]:
     """Use the low-cost Bedrock model for structured resume extraction."""
 
     structured_llm = get_llm("cheap").with_structured_output(ProfileFacts)
-    result = structured_llm.invoke(
-        [
+    messages = [
             SystemMessage(
                 content=(
                     "Extract only facts explicitly supported by the supplied career "
@@ -77,6 +80,15 @@ def extract_profile(state: ProfileState) -> dict[str, dict]:
                 )
             ),
         ]
+    result = ModelCallObserver(profile_repository).invoke(
+        structured_llm,
+        messages,
+        user_id=state["user_id"],
+        conversation_id=None,
+        run_id=None,
+        stage="profile_extraction",
+        model_type="cheap",
+        model_id=os.getenv("BEDROCK_MODEL_CHEAP", ""),
     )
 
     return {

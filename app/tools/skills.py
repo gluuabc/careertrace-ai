@@ -1,4 +1,7 @@
+from typing import Annotated
+
 from langchain_core.tools import tool
+from langgraph.prebuilt import InjectedState
 
 from app.services.skill_registry import skill_registry
 from app.state.agent_schema import ToolExecutionResult
@@ -15,10 +18,16 @@ def read_skill(name: str) -> dict:
 
 @tool
 def read_skill_file(
-    name: str, relative_path: str, offset: int = 0, limit: int = 4000
+    name: str,
+    relative_path: str,
+    offset: int = 0,
+    limit: int = 4000,
+    active_skill: Annotated[str, InjectedState("active_skill")] = "",
 ) -> dict:
     """Load one approved supporting text file from a registered Skill when its detailed rules are needed. Absolute paths, traversal, symlinks, and unsupported files are rejected."""
     try:
+        if not active_skill or name != active_skill:
+            raise ValueError("Skill files may be read only for the active workflow Skill.")
         if offset < 0 or limit < 1 or limit > 8000:
             raise ValueError("Skill offset must be non-negative and limit must be 1–8000.")
         content = skill_registry.read_skill_file(name, relative_path)

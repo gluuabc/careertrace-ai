@@ -4,6 +4,17 @@ from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 
+def bounded_response_bytes(response: Any, max_bytes: int) -> bytes:
+    raw = getattr(response, "raw", None)
+    if raw is not None and hasattr(raw, "read"):
+        content = raw.read(max_bytes + 1, decode_content=True)
+    else:
+        content = bytes(getattr(response, "content", b""))
+    if len(content) > max_bytes:
+        raise ValueError("Provider response exceeded the configured size limit.")
+    return content
+
+
 @dataclass
 class SourceResult:
     ok: bool
