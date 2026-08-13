@@ -6,7 +6,7 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 from app.database.retrieval_repository import RetrievalRepository, retrieval_repository
-from app.services.embeddings import EmbeddingProvider, TitanEmbeddingProvider, logical_chunks
+from app.services.embeddings import EmbeddingProvider, TitanEmbeddingProvider, recursive_structure_chunks
 from app.services.reranking import AmazonRerankProvider, Reranker
 from app.state.retrieval_schema import HybridRetrievalResult, RetrievalHit, RetrievalLoopState
 
@@ -56,13 +56,57 @@ class HybridRetrievalService:
         metadata: dict[str, Any] | None = None,
         evidence_ids: list[str] | None = None,
     ) -> list[dict[str, Any]]:
-        provider = self._embedding_provider()
+        provider: EmbeddingProvider | None = None
+        provider_warning: str | None = None
+        try:
+            provider = self._embedding_provider()
+        except Exception:
+            provider_warning = "Embedding provider is unavailable; sparse indexing was preserved."
         indexed = []
-        for index, chunk in enumerate(logical_chunks(text)):
+        self.repository.deactivate_source(
+            user_id,
+            corpus_types=[corpus_type],
+            source_entity_prefix=f"{source_entity_id}:chunk:",
+        )
+        source_content_hash = hashlib.sha256(text.encode()).hexdigest()
+        maximum = int(os.getenv("RETRIEVAL_CHUNK_MAX_TOKENS", "768"))
+        overlap = int(os.getenv("RETRIEVAL_CHUNK_OVERLAP_TOKENS", "64"))
+        pending = list(recursive_structure_chunks(text))
+        while pending:
+            chunk_info = pending.pop(0)
+            chunk = chunk_info.text
             digest = hashlib.sha256(chunk.encode()).hexdigest()
-            embedding = self.repository.get_cached_embedding(user_id, digest, provider.model_id, provider.dimensions)
-            if embedding is None:
-                embedding = provider.embed(chunk)
+            embedding = None
+            embedding_input_tokens = None
+            if provider is not None:
+                try:
+                    embedding = self.repository.get_cached_embedding(user_id, digest, provider.model_id, provider.dimensions)
+                    if embedding is None:
+                        embedding = provider.embed(chunk)
+                        embedding_input_tokens = getattr(provider, "last_input_tokens", None)
+                except Exception:
+                    provider_warning = "Embedding generation is unavailable; sparse indexing was preserved."
+            if embedding_input_tokens is not None and embedding_input_tokens > maximum and len(chunk) > 1:
+                # The Titan response is authoritative. Re-plan this one chunk with
+                # a proportionally smaller conservative limit and never persist
+                # the known-oversized representation as canonical.
+                adjusted_max = max(
+                    1,
+                    int(chunk_info.token_count * maximum / embedding_input_tokens * 0.9),
+                )
+                children = recursive_structure_chunks(
+                    chunk,
+                    target_tokens=adjusted_max,
+                    max_tokens=adjusted_max,
+                    overlap_tokens=min(overlap, max(0, adjusted_max - 1)),
+                )
+                if len(children) > 1:
+                    pending = children + pending
+                    continue
+                provider_warning = "Titan reported an oversized irreducible chunk; sparse indexing was preserved."
+                embedding = None
+                embedding_input_tokens = None
+            index = len(indexed)
             indexed.append(
                 self.repository.upsert_document(
                     corpus_type=corpus_type,
@@ -71,14 +115,52 @@ class HybridRetrievalService:
                     source_version=source_version,
                     title=title,
                     text_content=chunk,
-                    metadata={**(metadata or {}), "chunk_index": index},
+                    metadata={
+                        **(metadata or {}),
+                        "chunk_index": index,
+                        "section_title": chunk_info.section_title,
+                        "section_path": chunk_info.section_path,
+                        "start_offset": chunk_info.start_offset,
+                        "end_offset": chunk_info.end_offset,
+                        "token_count": embedding_input_tokens or chunk_info.token_count,
+                        "token_count_source": "titan_response" if embedding_input_tokens is not None else chunk_info.token_count_source,
+                        "chunking_strategy": chunk_info.chunking_strategy,
+                        "source_content_hash": source_content_hash,
+                        "embedding_input_tokens": embedding_input_tokens,
+                        "embedding_model_id": provider.model_id if provider else None,
+                        **({"indexing_warning": provider_warning} if provider_warning else {}),
+                    },
                     evidence_ids=evidence_ids,
-                    embedding_model_id=provider.model_id,
-                    embedding_dimension=provider.dimensions,
+                    embedding_model_id=provider.model_id if provider else None,
+                    embedding_dimension=provider.dimensions if provider else None,
                     embedding=embedding,
                 )
             )
         return indexed
+
+    def backfill_missing_embeddings(self, *, user_id: str, limit: int = 100) -> dict[str, int]:
+        provider = self._embedding_provider()
+        populated = 0
+        reused = 0
+        examined = 0
+        for document in self.repository.list_missing_embeddings(user_id, limit=limit):
+            examined += 1
+            embedding = self.repository.get_cached_embedding(
+                user_id, document["content_hash"], provider.model_id, provider.dimensions
+            )
+            if embedding is None:
+                embedding = provider.embed(document["text"])
+            else:
+                reused += 1
+            if self.repository.set_embedding(
+                user_id,
+                document["retrieval_document_id"],
+                model_id=provider.model_id,
+                dimensions=provider.dimensions,
+                embedding=embedding,
+            ):
+                populated += 1
+        return {"examined": examined, "populated": populated, "reused": reused}
 
     def retrieve(
         self,
@@ -87,6 +169,7 @@ class HybridRetrievalService:
         query: str,
         corpus_types: list[str],
         top_k: int = 10,
+        document_ids: list[str] | None = None,
     ) -> HybridRetrievalResult:
         warnings: list[str] = []
         query_embedding: list[float] | None = None
@@ -95,8 +178,8 @@ class HybridRetrievalService:
         except Exception:
             warnings.append("Dense retrieval is unavailable; sparse retrieval remains active.")
         with ThreadPoolExecutor(max_workers=2) as pool:
-            sparse_future = pool.submit(self.repository.sparse_search, user_id, query, corpus_types, 30)
-            dense_future = pool.submit(self.repository.dense_search, user_id, query_embedding, corpus_types, 30) if query_embedding else None
+            sparse_future = pool.submit(self.repository.sparse_search, user_id, query, corpus_types, 30, document_ids)
+            dense_future = pool.submit(self.repository.dense_search, user_id, query_embedding, corpus_types, 30, document_ids) if query_embedding else None
             sparse = sparse_future.result()
             dense = dense_future.result() if dense_future else []
         fused = reciprocal_rank_fusion(sparse, dense)[:30]
@@ -106,9 +189,10 @@ class HybridRetrievalService:
         if rerank_enabled:
             try:
                 reranker = self.reranker or AmazonRerankProvider()
-                ranked = reranker.rerank(query, rerank_input, top_n=min(top_k, 10))
-                if not ranked:
+                reranked = reranker.rerank(query, rerank_input, top_n=min(top_k, 10))
+                if not reranked or any(item.get("rerank_rank") is None for item in reranked):
                     raise ValueError("Reranker returned no results.")
+                ranked = reranked
             except Exception:
                 warnings.append("Amazon Rerank is unavailable; RRF ordering was used.")
                 ranked = rerank_input
@@ -134,7 +218,10 @@ class HybridRetrievalService:
             for item in selected
         ]
         debug = [{key: item.get(key) for key in ("sparse_rank", "dense_rank", "sparse_score", "dense_score", "rrf_score", "rerank_score", "rerank_rank")} | {"retrieval_document_id": item["document"]["retrieval_document_id"]} for item in ranked]
-        self.repository.save_query_debug(user_id, query, corpus_types, debug, warnings)
+        try:
+            self.repository.save_query_debug(user_id, query, corpus_types, debug, warnings)
+        except Exception:
+            warnings.append("Retrieval debug logging failed without affecting results.")
         state = RetrievalLoopState(original_query=query, query_variants=[query], active_query=query, retrieved_ids=[item["document"]["retrieval_document_id"] for item in fused], selected_ids=[item.retrieval_document_id for item in hits], sufficiency={"requested_count": top_k, "selected_count": len(hits), "sufficient": len(hits) >= min(top_k, len(fused))}, has_more_pages=len(fused) > len(hits), iteration=1)
         return HybridRetrievalResult(items=hits, state=state, warnings=warnings)
 

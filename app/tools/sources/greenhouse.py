@@ -6,13 +6,14 @@ from typing import Any
 import requests
 from bs4 import BeautifulSoup
 
-from app.tools.sources.base import SourceResult
+from app.tools.sources.base import SourceResult, bounded_response_bytes
 
 
 class GreenhouseAdapter:
     name = "greenhouse"
     timeout = (5.0, 15.0)
     user_agent = "CareerTrace/1.0 public-job-research"
+    max_bytes = 5_000_000
 
     def __init__(self, session: requests.Session | None = None):
         self.session = session or requests.Session()
@@ -24,10 +25,14 @@ class GreenhouseAdapter:
                 url,
                 timeout=self.timeout,
                 headers={"User-Agent": self.user_agent},
-                allow_redirects=True,
+                allow_redirects=False,
+                stream=True,
             )
             response.raise_for_status()
-            payload = response.json()
+            raw = bounded_response_bytes(response, self.max_bytes)
+            if not raw and hasattr(response, "json"):
+                raw = json.dumps(response.json()).encode("utf-8")
+            payload = json.loads(raw)
             records = []
             for item in payload.get("jobs") or []:
                 description = BeautifulSoup(item.get("content") or "", "html.parser").get_text(" ", strip=True)
@@ -42,6 +47,6 @@ class GreenhouseAdapter:
                         "description": description,
                     }
                 )
-            return SourceResult(True, self.name, records, json.dumps(payload), url)
+            return SourceResult(True, self.name, records, raw.decode("utf-8", errors="replace"), url)
         except (requests.RequestException, ValueError) as error:
-            return SourceResult(False, self.name, source_url=url, error_type=type(error).__name__, error_message=str(error)[:500], retryable=isinstance(error, requests.Timeout))
+            return SourceResult(False, self.name, source_url=url, error_type=type(error).__name__, error_message="Greenhouse source request failed.", retryable=isinstance(error, requests.Timeout))

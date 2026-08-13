@@ -2,7 +2,8 @@ import os
 import threading
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Iterator
+from collections.abc import Callable
+from typing import Any, Iterator, TypeVar
 
 from dotenv import load_dotenv
 from sqlalchemy import Engine, create_engine, event
@@ -15,6 +16,7 @@ load_dotenv()
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_DATABASE_URL = f"sqlite:///{PROJECT_ROOT / 'data' / 'careertrace.db'}"
 _migration_lock = threading.Lock()
+T = TypeVar("T")
 
 
 class Base(DeclarativeBase):
@@ -112,3 +114,37 @@ def session_scope(
         raise
     finally:
         session.close()
+
+
+def run_retryable_transaction(
+    callback: Callable[[Session], T],
+    *,
+    session_factory: sessionmaker[Session] = SessionLocal,
+    max_retries: int = 3,
+    max_backoff: int = 1,
+    _runner: Callable[..., Any] | None = None,
+) -> T:
+    """Run one short, database-only unit with bounded Cockroach retries.
+
+    ``callback`` may be invoked more than once on CockroachDB. It must contain
+    only idempotent database work on the supplied session: never provider,
+    embedding, HTTP, browser, or other external side effects.
+    """
+
+    retries = max(0, min(int(max_retries), 10))
+    backoff = max(0, min(int(max_backoff), 10))
+    bind = session_factory.kw.get("bind")
+    if bind is not None and bind.dialect.name == "cockroachdb":
+        if _runner is None:
+            from sqlalchemy_cockroachdb import run_transaction
+
+            _runner = run_transaction
+        return _runner(
+            session_factory,
+            callback,
+            max_retries=retries,
+            max_backoff=backoff,
+        )
+
+    with session_scope(session_factory) as session:
+        return callback(session)

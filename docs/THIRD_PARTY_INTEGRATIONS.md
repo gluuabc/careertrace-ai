@@ -83,7 +83,8 @@ This inventory describes the integration boundaries implemented by CareerTrace. 
 - Data received/persisted: user profiles, versions, metadata, memories, conversations, runs, search state, evidence metadata, drafts, retrieval documents, and embeddings.
 - Raw provider output: CockroachDB is the persistence provider, not a content provider.
 - Retention: controlled by the application/operator's SQL retention policy.
-- Diagnostics: `COCKROACH_MCP_ENABLED=false` by default. The diagnostic module exposes only fixed read-only inspection methods and is never included in the Career Agent's tools. Operational guidance remains separate from user-facing CareerTrace Skills.
+- Diagnostics: `COCKROACH_CLOUD_MCP_ENABLED=false` by default. The developer-only wrapper uses the official MCP Python SDK's Streamable HTTP client with the managed endpoint, a pinned cluster ID, and a bounded system-metadata-only read allowlist. It is never included in Career Agent tools.
+- Agent Skills: CockroachDB's official [`cockroachlabs/cockroachdb-skills`](https://github.com/cockroachlabs/cockroachdb-skills) repository is reserved for developer/database operations. The audit used upstream commit `e14e86d23ce8ee2e7e40a34ce2944c2502b6eadd` (Apache-2.0). It is not copied into `app/skills` and is not exposed to end users. See [CockroachDB Agent Skills Audit](COCKROACH_AGENT_SKILLS.md).
 
 ## Playwright
 

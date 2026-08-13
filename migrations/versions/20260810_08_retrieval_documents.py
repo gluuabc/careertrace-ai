@@ -47,8 +47,17 @@ def upgrade() -> None:
 
     if bind.dialect.name == "cockroachdb":
         index_names = {item["name"] for item in sa.inspect(bind).get_indexes("retrieval_documents")}
+        column_names = {item["name"] for item in sa.inspect(bind).get_columns("retrieval_documents")}
+        if "search_vector_fts" not in column_names:
+            op.execute(
+                "ALTER TABLE retrieval_documents ADD COLUMN search_vector_fts TSVECTOR "
+                "AS (to_tsvector('english', coalesce(title, '') || ' ' || text)) STORED"
+            )
         if "ix_retrieval_documents_fts" not in index_names:
-            op.execute("CREATE INDEX ix_retrieval_documents_fts ON retrieval_documents USING GIN (to_tsvector('english', coalesce(title, '') || ' ' || text))")
+            op.execute(
+                "CREATE INVERTED INDEX ix_retrieval_documents_fts "
+                "ON retrieval_documents (search_vector_fts)"
+            )
         if "ix_retrieval_documents_embedding" not in index_names:
             op.execute("CREATE VECTOR INDEX ix_retrieval_documents_embedding ON retrieval_documents (embedding vector_cosine_ops)")
 

@@ -9,13 +9,17 @@ from urllib.parse import urlsplit, urlunsplit
 
 from app.database.repository import ProfileRepository, profile_repository
 from app.services.evidence import EvidenceService, evidence_service
-from app.state.agent_schema import JobCandidate, JobSearchRequest, SearchPage, SearchSufficiency, ToolExecutionResult
+from app.database.retrieval_repository import RetrievalRepository
+from app.services.retrieval import HybridRetrievalService
+from app.services.retrieval_corpus import RetrievalCorpusIndexer
+from app.state.agent_schema import JobCandidate, JobSearchRequest, RequirementState, SearchPage, SearchSufficiency, ToolExecutionResult
 from app.tools.sources.catalog import CompanyCatalog
 from app.tools.sources.greenhouse import GreenhouseAdapter
 from app.tools.sources.lever import LeverAdapter
 from app.tools.sources.public_pages import PublicPageAdapter
 from app.tools.sources.playwright import PlaywrightAdapter
 from app.tools.sources.tavily import TavilyAdapter
+from app.tools.sources.trust import assess_job_source
 
 ELIGIBILITY_TERMS = re.compile(
     r"([^.!?]*(?:currently enrolled|student|graduat(?:e|ing|ion)|work authorization|"
@@ -63,35 +67,83 @@ def deduplicate_jobs(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return result
 
 
+SKILL_TERMS = (
+    "python", "java", "javascript", "typescript", "sql", "aws", "docker",
+    "kubernetes", "react", "pytorch", "tensorflow", "machine learning",
+)
+
+
+def extract_explicit_job_skills(description: str, request: JobSearchRequest) -> tuple[list[str], list[str]]:
+    """Return only skills literally present in explicit required/preferred sections."""
+    candidates: list[str] = []
+    seen_candidates: set[str] = set()
+    for skill in [*request.profile_skills, *request.desired_job_skills, *SKILL_TERMS]:
+        key = _normalized(skill)
+        if key and key not in seen_candidates:
+            seen_candidates.add(key)
+            candidates.append(skill)
+    sections = re.split(r"(?im)^\s*(requirements?|qualifications?|preferred qualifications?|bonus)\s*:?[\s]*$", description or "")
+    required_text = description or ""
+    preferred_text = ""
+    if len(sections) > 1:
+        required_parts: list[str] = []
+        preferred_parts: list[str] = []
+        for index in range(1, len(sections), 2):
+            heading = sections[index].casefold()
+            body = sections[index + 1] if index + 1 < len(sections) else ""
+            (preferred_parts if "preferred" in heading or "bonus" in heading else required_parts).append(body)
+        required_text = "\n".join(required_parts)
+        preferred_text = "\n".join(preferred_parts)
+    required = [skill for skill in candidates if _normalized(skill) and _normalized(skill) in _normalized(required_text)]
+    preferred = [skill for skill in candidates if _normalized(skill) and _normalized(skill) in _normalized(preferred_text)]
+    return list(dict.fromkeys(required)), list(dict.fromkeys(preferred))
+
+
 def apply_hard_filters(candidate: JobCandidate, request: JobSearchRequest) -> JobCandidate:
-    failed: list[str] = []
-    unknown: list[str] = []
+    states: dict[str, RequirementState] = {}
     haystack = _normalized(" ".join(filter(None, [candidate.title, candidate.description_excerpt])))
+    def set_state(field: str, state: RequirementState) -> None:
+        states[field] = state
+
+    excluded = {_normalized(item) for item in request.excluded_companies}
+    if excluded:
+        set_state("excluded_company", RequirementState.CONFLICT if _normalized(candidate.company) in excluded else RequirementState.MATCH)
     if request.employment_types:
-        value = _normalized(candidate.employment_type or candidate.title)
+        value = _normalized(candidate.employment_type)
         if not value:
-            unknown.append("employment_type")
-            failed.append("employment_type_unknown")
+            set_state("employment_type", RequirementState.UNKNOWN)
         elif not any(_normalized(item) in value for item in request.employment_types):
-            failed.append("employment_type")
+            set_state("employment_type", RequirementState.CONFLICT)
+        else:
+            set_state("employment_type", RequirementState.MATCH)
     if request.locations:
         if not candidate.location:
-            unknown.append("location")
-            failed.append("location_unknown")
+            set_state("location", RequirementState.UNKNOWN)
         elif not any(_normalized(item) in _normalized(candidate.location) for item in request.locations):
-            failed.append("location")
+            set_state("location", RequirementState.CONFLICT)
+        else:
+            set_state("location", RequirementState.MATCH)
     if request.remote_preference and request.remote_preference.casefold() not in {"flexible", "any"}:
-        remote_required = request.remote_preference.casefold() == "remote"
+        preference = request.remote_preference.casefold()
         is_remote = "remote" in _normalized(candidate.location) or "remote" in haystack
-        if remote_required and not is_remote:
-            failed.append("remote_preference")
-        if not remote_required and is_remote and request.remote_preference.casefold() == "on-site":
-            failed.append("remote_preference")
+        is_onsite = any(term in haystack for term in ("on-site", "onsite", "in person"))
+        if preference == "remote":
+            set_state("remote_preference", RequirementState.MATCH if is_remote else (RequirementState.CONFLICT if is_onsite else RequirementState.UNKNOWN))
+        elif preference in {"on-site", "onsite"}:
+            set_state("remote_preference", RequirementState.MATCH if is_onsite else (RequirementState.CONFLICT if is_remote else RequirementState.UNKNOWN))
     if not candidate.eligibility:
-        unknown.append("eligibility")
-        failed.append("eligibility_unknown")
+        set_state("eligibility", RequirementState.UNKNOWN)
+        if request.student_level:
+            set_state("student_level", RequirementState.UNKNOWN)
+        if request.graduation_year:
+            set_state("graduation_year", RequirementState.UNKNOWN)
+        if request.work_authorization_requirement:
+            set_state("work_authorization", RequirementState.UNKNOWN)
     else:
         eligibility = _normalized(candidate.eligibility)
+        if request.required_eligibility:
+            matches = [_normalized(item) in eligibility for item in request.required_eligibility]
+            set_state("eligibility", RequirementState.MATCH if all(matches) else RequirementState.UNKNOWN)
         if request.student_level:
             requested_level = _normalized(request.student_level)
             level_aliases = {
@@ -103,22 +155,39 @@ def apply_hard_filters(candidate: JobCandidate, request: JobSearchRequest) -> Jo
             known_level_terms = {term for values in level_aliases.values() for term in values}
             if not any(term in eligibility for term in expected):
                 if not any(term in eligibility for term in known_level_terms):
-                    unknown.append("student_level")
-                    failed.append("student_level_unknown")
+                    set_state("student_level", RequirementState.UNKNOWN)
                 else:
-                    failed.append("student_level")
-        for requirement in request.required_eligibility:
-            if _normalized(requirement) not in eligibility:
-                failed.append(f"eligibility:{requirement}")
-        if request.graduation_year and str(request.graduation_year) not in eligibility and "graduat" in eligibility:
+                    set_state("student_level", RequirementState.CONFLICT)
+            else:
+                set_state("student_level", RequirementState.MATCH)
+        if request.graduation_year:
             years = {int(value) for value in re.findall(r"\b20\d{2}\b", eligibility)}
-            if years and request.graduation_year not in years:
-                failed.append("graduation_year")
-        if request.work_authorization_requirement and _normalized(request.work_authorization_requirement) not in eligibility:
-            failed.append("work_authorization")
-    candidate.failed_hard_constraints = sorted(set(failed))
+            if not years:
+                set_state("graduation_year", RequirementState.UNKNOWN)
+            else:
+                set_state("graduation_year", RequirementState.MATCH if request.graduation_year in years else RequirementState.CONFLICT)
+        if request.work_authorization_requirement:
+            required = _normalized(request.work_authorization_requirement)
+            if required in eligibility:
+                set_state("work_authorization", RequirementState.MATCH)
+            elif any(term in eligibility for term in ("sponsorship", "authorized to work", "citizen", "visa")):
+                set_state("work_authorization", RequirementState.CONFLICT)
+            else:
+                set_state("work_authorization", RequirementState.UNKNOWN)
+    if "industries" in request.hard_preference_fields:
+        if not request.industries:
+            set_state("industries", RequirementState.UNKNOWN)
+        else:
+            set_state("industries", RequirementState.MATCH if any(_normalized(item) in haystack for item in request.industries) else RequirementState.UNKNOWN)
+    if "salary_preference" in request.hard_preference_fields:
+        set_state("salary_preference", RequirementState.UNKNOWN if not candidate.salary else (RequirementState.MATCH if _normalized(request.salary_preference) in _normalized(candidate.salary) else RequirementState.CONFLICT))
+    conflicts = sorted(field for field, state in states.items() if state == RequirementState.CONFLICT)
+    unknown = sorted(field for field, state in states.items() if state == RequirementState.UNKNOWN)
+    candidate.hard_requirement_states = states
+    candidate.failed_hard_constraints = sorted([*conflicts, *(f"{field}_unknown" for field in unknown)])
     candidate.unknown_fields = sorted(set(candidate.unknown_fields + unknown))
-    candidate.hard_constraints_met = not failed
+    candidate.hard_constraints_met = not conflicts and not unknown
+    candidate.verification_status = "conflict" if conflicts else ("requirements_not_fully_verified" if unknown else "verified")
     return candidate
 
 
@@ -134,6 +203,8 @@ class JobSearchService:
         repository: ProfileRepository = profile_repository,
         tavily: TavilyAdapter | None = None,
         playwright: PlaywrightAdapter | None = None,
+        retrieval: HybridRetrievalService | None = None,
+        indexer: RetrievalCorpusIndexer | None = None,
     ):
         self.catalog = catalog or CompanyCatalog()
         self.greenhouse = greenhouse or GreenhouseAdapter()
@@ -143,6 +214,9 @@ class JobSearchService:
         self.repository = repository
         self.tavily = tavily or TavilyAdapter()
         self.playwright = playwright or PlaywrightAdapter()
+        retrieval_repository = RetrievalRepository(repository.session_factory)
+        self.retrieval = retrieval or HybridRetrievalService(retrieval_repository)
+        self.indexer = indexer or RetrievalCorpusIndexer(retrieval_repository, self.retrieval)
 
     def search(
         self,
@@ -169,8 +243,10 @@ class JobSearchService:
         )
         offset = int(request.cursor or 0) if str(request.cursor or "0").isdigit() else 0
         cached = list(session.get("candidate_records") or [])
-        if cached:
+        if cached and request.cursor is not None:
             return self._page_result(cached, request, session, offset=offset)
+        iteration = int(session.get("iteration") or 0) + 1
+        existing_candidates = [JobCandidate.model_validate(item) for item in cached]
 
         targets = []
         if request.preferred_companies:
@@ -178,6 +254,18 @@ class JobSearchService:
         else:
             targets = self.catalog.enabled()
         targets = [item for item in targets if item.company.casefold() not in {name.casefold() for name in request.excluded_companies}]
+        approved_job_hosts = {
+            host.casefold()
+            for item in targets
+            for candidate_url in (item.official_source_url, item.careers_url)
+            if candidate_url and (host := urlsplit(candidate_url).hostname)
+        }
+        progressed = {item["source_key"]: item for item in session.get("sources") or []}
+        targets = [
+            item for item in targets
+            if not progressed.get(f"{item.ats_type or 'public'}:{item.company.casefold()}", {}).get("exhausted")
+        ]
+        targets = targets[: max(1, int(os.getenv("SEARCH_SOURCES_PER_ITERATION", "2")))]
         source_calls = 0
         raw_records: list[dict[str, Any]] = []
         warnings: list[str] = []
@@ -213,8 +301,8 @@ class JobSearchService:
                     company_or_domain=source.company,
                     visited=True,
                     exhausted=True,
-                    first_iteration=1,
-                    last_iteration=1,
+                    first_iteration=iteration,
+                    last_iteration=iteration,
                     last_error_type="KnownButUnavailable",
                 )
                 continue
@@ -245,6 +333,31 @@ class JobSearchService:
                     source_calls += 1
                     if rendered.ok and rendered.records:
                         result = rendered
+            if result.ok and source.careers_url and source.ats_type not in {"greenhouse", "lever"}:
+                detail_records: list[dict[str, Any]] = []
+                detail_content: list[str] = []
+                official_host = urlsplit(source.careers_url).hostname
+                for discovered in result.records:
+                    detail_url = discovered.get("application_url")
+                    if not detail_url:
+                        continue
+                    detail_reservation = self.repository.reserve_search_source_calls(
+                        user_id, session["search_session_id"], 1
+                    )
+                    if not detail_reservation["reserved_calls"]:
+                        break
+                    detail = self.public_pages.fetch_job_detail(
+                        url=detail_url,
+                        company=source.company,
+                        allowed_hosts={official_host} if official_host else None,
+                    )
+                    source_calls += 1
+                    if detail.ok and detail.records:
+                        detail_records.extend(detail.records)
+                        detail_content.append(detail.raw_content)
+                # Listing anchors are discovery metadata and never become final jobs.
+                result.records = detail_records
+                result.raw_content = "\n\n".join(detail_content)
             coverage[source_key] = {
                 "source_status": result.source_status or ("available" if result.ok else "unavailable"),
                 "returned_count": len(result.records),
@@ -262,8 +375,8 @@ class JobSearchService:
                 cursor=result.cursor,
                 next_cursor=result.next_cursor,
                 call_count=1,
-                first_iteration=1,
-                last_iteration=1,
+                first_iteration=progressed.get(source_key, {}).get("first_iteration") or iteration,
+                last_iteration=iteration,
                 last_success_at=datetime.now(timezone.utc) if result.ok else None,
                 last_error_type=result.error_type,
             )
@@ -329,12 +442,10 @@ class JobSearchService:
                     for item in detail.records:
                         item.update(source_name=detail.source_name, source_url=detail.source_url, evidence_ids=[evidence["evidence_id"]])
                         raw_records.append(item)
-        normalized: list[JobCandidate] = []
+        normalized: list[JobCandidate] = list(existing_candidates)
         role_terms = [_normalized(item) for item in request.target_roles + request.role_keywords if item]
         for item in deduplicate_jobs(raw_records):
             text = _normalized(f"{item.get('title')} {item.get('description')}")
-            if role_terms and not any(term in text for term in role_terms):
-                continue
             eligibility = item.get("eligibility") or extract_explicit_eligibility(item.get("description"))
             identifier = item.get("source_job_id") or canonical_url(item.get("application_url")) or repr(item)
             candidate = JobCandidate(
@@ -350,21 +461,21 @@ class JobSearchService:
                 source_url=item["source_url"],
                 posted_at=item.get("posted_at"),
                 description_excerpt=(item.get("description") or "")[:1500] or None,
+                salary=item.get("salary"),
                 evidence_ids=item.get("evidence_ids") or [],
                 eligibility_evidence_id=(item.get("evidence_ids") or [None])[0] if eligibility else None,
                 source_keys=[f"{item['source_name']}:{_normalized(item.get('company'))}"],
             )
             profile_skills = {_normalized(item) for item in request.profile_skills}
             overlap = sorted(skill for skill in profile_skills if skill and skill in text)
-            missing_required = sorted(
-                skill
-                for skill in request.desired_job_skills
-                if _normalized(skill) not in text
-            )
-            candidate.deterministic_match_features = {"skill_overlap": overlap, "role_match": any(term in _normalized(candidate.title) for term in role_terms) if role_terms else True}
-            candidate.fit_score = min(100.0, 40.0 + 10.0 * len(overlap))
+            required_skills, preferred_skills = extract_explicit_job_skills(item.get("description") or "", request)
+            desired_overlap = sorted(skill for skill in request.desired_job_skills if _normalized(skill) in text)
+            candidate.job_required_skills = required_skills
+            candidate.job_preferred_skills = preferred_skills
+            candidate.deterministic_match_features = {"profile_skill_overlap": overlap, "desired_skill_overlap": desired_overlap, "role_term_overlap": [term for term in role_terms if term in text]}
+            candidate.fit_score = None
             candidate.transferable_skills = overlap
-            candidate.skill_gaps = missing_required
+            candidate.skill_gaps = sorted(skill for skill in required_skills if _normalized(skill) not in profile_skills)
             citation = (
                 f" [EVIDENCE: {candidate.evidence_ids[0]}]"
                 if candidate.evidence_ids
@@ -377,11 +488,50 @@ class JobSearchService:
                 + citation
             )
             apply_hard_filters(candidate, request)
-            normalized.append(candidate)
-            if len(normalized) >= request.max_results:
-                break
-        verified = [item for item in normalized if item.hard_constraints_met]
-        unverified = [item for item in normalized if not item.hard_constraints_met and "eligibility_unknown" in item.failed_hard_constraints]
+            if candidate.candidate_id not in {existing.candidate_id for existing in normalized}:
+                normalized.append(candidate)
+
+        rankable = [item for item in normalized if item.verification_status != "conflict"]
+        indexed_ids: list[str] = []
+        for candidate in rankable:
+            trust = assess_job_source(
+                candidate.source_url,
+                provider=candidate.source_name,
+                approved_hosts=approved_job_hosts,
+            )
+            candidate.deterministic_match_features["source_trust"] = trust.model_dump()
+            if not trust.trusted_for_claims and candidate.verification_status == "verified":
+                candidate.verification_status = "requirements_not_fully_verified"
+                candidate.unknown_fields = sorted(set([*candidate.unknown_fields, "source_authenticity"]))
+            documents = self.indexer.index_candidate(
+                corpus_type="job",
+                user_id=user_id,
+                search_session_id=session["search_session_id"],
+                run_id=run_id,
+                candidate_id=candidate.candidate_id,
+                title=f"{candidate.title or ''} — {candidate.company or ''}".strip(" —"),
+                text="\n".join(filter(None, [candidate.title, candidate.company, candidate.location, candidate.employment_type, candidate.description_excerpt, candidate.eligibility])),
+                metadata={"source_name": candidate.source_name, "source_url": candidate.source_url, "verification_status": candidate.verification_status, "hard_requirement_states": {key: str(value) for key, value in candidate.hard_requirement_states.items()}},
+                evidence_ids=candidate.evidence_ids,
+            )
+            indexed_ids.extend(item["retrieval_document_id"] for item in documents)
+        query = " ".join([*request.target_roles, *request.role_keywords, *request.desired_job_skills, *request.industries]).strip() or "career opportunity"
+        ranked_ids: list[str] = []
+        rank_components: dict[str, dict[str, Any]] = {}
+        if indexed_ids:
+            retrieval_result = self.retrieval.retrieve(user_id=user_id, query=query, corpus_types=["job"], top_k=min(request.max_results, 10), document_ids=indexed_ids)
+            warnings.extend(retrieval_result.warnings)
+            for hit in retrieval_result.items:
+                candidate_id = str(hit.metadata.get("candidate_id") or "")
+                if candidate_id and candidate_id not in ranked_ids:
+                    ranked_ids.append(candidate_id)
+                    rank_components[candidate_id] = {key: getattr(hit, key) for key in ("sparse_rank", "dense_rank", "sparse_score", "dense_score", "rrf_score", "rerank_score", "rerank_rank")}
+        order = {candidate_id: index for index, candidate_id in enumerate(ranked_ids)}
+        rankable.sort(key=lambda item: (order.get(item.candidate_id, len(order)), item.candidate_id))
+        for candidate in rankable:
+            candidate.ranking_components = rank_components.get(candidate.candidate_id, {})
+        verified = [item for item in rankable if item.verification_status == "verified"]
+        unverified = [item for item in rankable if item.verification_status == "requirements_not_fully_verified"]
         requested = request.requested_count
         stop_reason = "enough_verified_candidates" if len(verified) >= requested else ("source_budget_exhausted" if source_calls >= max_calls else "sources_exhausted")
         sufficiency = SearchSufficiency(
@@ -390,21 +540,21 @@ class JobSearchService:
             unverified_count=len(unverified),
             remaining_source_budget=max(0, max_calls - source_calls),
             new_verified_candidates_this_iteration=len(verified),
-            can_refine=len(verified) < requested and source_calls < max_calls,
+            can_refine=len(verified) < requested and int(session.get("remaining_source_budget") or max_calls) > source_calls,
             stop_reason=stop_reason,
-            limiting_constraints=["eligibility"] if unverified and len(verified) < requested else [],
+            limiting_constraints=sorted({field for item in unverified for field in item.unknown_fields}),
             suggested_relaxations=[],
         )
         records = [item.model_dump(mode="json") for item in [*verified, *unverified]]
         session = self.repository.update_search_session(
             user_id,
             session["search_session_id"],
-            iteration=1,
-            visited_sources=list(coverage),
+            iteration=iteration,
+            visited_sources=list(dict.fromkeys([*(session.get("visited_sources") or []), *coverage])),
             seen_candidate_ids=[item["candidate_id"] for item in records],
             candidate_records=records,
             source_coverage=coverage,
-            consecutive_no_progress=0 if records else 1,
+            consecutive_no_progress=0 if len(records) > len(cached) else int(session.get("consecutive_no_progress") or 0) + 1,
             status="active",
         )
         result = self._page_result(records, request, session, offset=offset)
@@ -435,7 +585,9 @@ class JobSearchService:
                     "description_excerpt", "hard_constraints_met", "failed_hard_constraints",
                     "unknown_fields", "evidence_ids", "fit_score", "fit_explanation",
                     "transferable_skills", "skill_gaps", "first_seen_iteration",
-                    "last_seen_iteration", "source_keys",
+                    "last_seen_iteration", "source_keys", "hard_requirement_states",
+                    "job_required_skills", "job_preferred_skills", "ranking_components",
+                    "verification_status",
                 )
             }
             excerpt = summary.get("description_excerpt")

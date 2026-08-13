@@ -5,7 +5,7 @@ from typing import Any
 
 from sqlalchemy import func, select
 
-from app.database.database import session_scope
+from app.database.database import run_retryable_transaction, session_scope
 from app.database.models import (
     AgentEvidence,
     AgentRun,
@@ -13,6 +13,7 @@ from app.database.models import (
     AgentToolCall,
     ConversationContextSummary,
     Document,
+    ModelCallMetric,
     OutreachDraft,
     ProfileVersion,
     ResumeRevisionChange,
@@ -27,6 +28,32 @@ class AgentRepositoryMixin:
     """Additive user-scoped persistence used by the Career Agent."""
 
     session_factory: Any
+
+    def create_model_call_metric(self, user_id: str, **values: Any) -> dict[str, Any]:
+        allowed = {column.name for column in ModelCallMetric.__table__.columns} - {
+            "model_call_metric_id", "user_id", "created_at"
+        }
+        unknown = set(values) - allowed
+        if unknown:
+            raise ValueError(f"Unsupported model metric fields: {sorted(unknown)}")
+        with session_scope(self.session_factory) as session:
+            user = self._require_user(session, user_id)
+            item = ModelCallMetric(user=user, **values)
+            session.add(item)
+            session.flush()
+            return self._model_metric_dict(item)
+
+    def list_model_call_metrics(self, user_id: str) -> list[dict[str, Any]]:
+        with session_scope(self.session_factory) as session:
+            self._require_user(session, user_id)
+            items = session.scalars(select(ModelCallMetric).where(
+                ModelCallMetric.user_id == user_id
+            ).order_by(ModelCallMetric.created_at)).all()
+            return [self._model_metric_dict(item) for item in items]
+
+    @staticmethod
+    def _model_metric_dict(item: ModelCallMetric) -> dict[str, Any]:
+        return {column.name: getattr(item, column.name) for column in ModelCallMetric.__table__.columns}
 
     def get_or_create_search_session(
         self,
@@ -74,7 +101,9 @@ class AgentRepositoryMixin:
     ) -> dict[str, Any]:
         """Reserve budget before network I/O so concurrent tools cannot overspend."""
         requested_calls = max(0, int(requested_calls))
-        with session_scope(self.session_factory) as session:
+        def reserve(session):
+            # This callback is deliberately database-only because CockroachDB
+            # may replay it after a serializable (SQLSTATE 40001) conflict.
             item = session.scalar(
                 select(SearchSession)
                 .where(
@@ -92,6 +121,14 @@ class AgentRepositoryMixin:
             result = self._search_session_dict(item)
             result["reserved_calls"] = reserved
             return result
+
+        # The lock keeps SQLite's local prototype deterministic. CockroachDB's
+        # row lock plus bounded serializable retries protects multiple workers.
+        with self._source_budget_lock:
+            return run_retryable_transaction(
+                reserve,
+                session_factory=self.session_factory,
+            )
 
     def update_search_session(
         self, user_id: str, search_session_id: str, **updates: Any
