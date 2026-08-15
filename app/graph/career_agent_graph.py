@@ -72,6 +72,55 @@ ALLOWED_TOOLS_BY_INTENT = {
     },
 }
 SOURCE_TOOLS = {"search_jobs", "search_people"}
+OPPORTUNITY_NOUNS = r"(?:jobs?|internships?|openings?|positions?|roles?|opportunities)"
+
+
+def _has_explicit_job_retrieval_intent(request: str) -> bool:
+    """Require an action to retrieve actual opportunities, not a role noun."""
+
+    value = " ".join(request.casefold().split())
+    patterns = (
+        rf"\b(?:find|search(?:\s+for)?|look\s+for|locate|retrieve)\b.{{0,100}}\b{OPPORTUNITY_NOUNS}\b",
+        rf"\b(?:show|list|give)\s+(?:me\s+)?(?:\d+\s+)?(?:\w+\s+){{0,6}}{OPPORTUNITY_NOUNS}\b",
+        r"\b(?:current|open|available|live|actual)\s+(?:\w+\s+){0,5}(?:jobs?|internships?|openings?|positions?|opportunities)\b",
+        rf"\b{OPPORTUNITY_NOUNS}\b.{{0,60}}\b(?:i\s+can\s+apply\s+to|apply\s+to|accepting\s+applications)\b",
+    )
+    return any(re.search(pattern, value) for pattern in patterns)
+
+
+def _is_role_guidance_request(request: str) -> bool:
+    """Recognize advisory role-fit questions without treating nouns as search."""
+
+    value = " ".join(request.casefold().split())
+    patterns = (
+        r"\b(?:which|what)\b.{0,80}\b(?:role|job|internship|career\s+path)s?\b.{0,80}\b(?:fit|fits|best|better|suit|sense)\b",
+        r"\b(?:fit|fits|fitting)\b.{0,50}\b(?:me|my\s+(?:profile|background|skills|experience))\b",
+        r"\b(?:should\s+i|compare|stronger\s+fit|best\s+fit|career\s+path)\b",
+        r"\bwhat\b.{0,40}\b(?:skills?|requirements?)\b.{0,60}\b(?:missing|need|for)\b",
+        r"\b(?:skills?\s+gaps?|requirements?)\s+for\b",
+        r"\bwhat\s+should\s+i\s+prioritize\b",
+        r"\bwhat\s+kinds?\s+of\s+(?:jobs?|internships?|roles?)\b",
+        r"\b(?:realistic\s+goal|make\s+the\s+most\s+sense)\b",
+    )
+    return any(re.search(pattern, value) for pattern in patterns)
+
+
+def enforce_intent_boundaries(
+    request: str, decision: IntentDecision
+) -> tuple[IntentDecision, bool]:
+    """Prevent non-retrieval role discussion from entering source workflows."""
+
+    if decision.intent != CareerIntent.JOB_SEARCH:
+        return decision, False
+    if _has_explicit_job_retrieval_intent(request):
+        return decision, False
+    if _is_role_guidance_request(request) or re.search(
+        rf"\b{OPPORTUNITY_NOUNS}\b", request.casefold()
+    ):
+        return decision.model_copy(
+            update={"intent": CareerIntent.CONCISE_GUIDANCE}
+        ), True
+    return decision, False
 
 
 def parse_structured_job_request(
@@ -107,7 +156,7 @@ def parse_structured_job_request(
 def _fallback_intent(request: str) -> IntentDecision:
     memory_signals = detect_memory_signals(request)
     value = request.casefold()
-    if any(term in value for term in ("find job", "search job", "opening", "internship")):
+    if _has_explicit_job_retrieval_intent(request):
         intent = CareerIntent.JOB_SEARCH
     elif "resume" in value and any(
         term in value for term in ("revise", "improve", "tailor", "rewrite", "edit")
@@ -129,15 +178,8 @@ def _fallback_intent(request: str) -> IntentDecision:
         intent = CareerIntent.PEOPLE_SEARCH
     elif any(term in value for term in ("career plan", "career timeline", "action plan")):
         intent = CareerIntent.ACTION_PLAN
-    elif any(
-        term in value
-        for term in (
-            "what role",
-            "which role",
-            "career advice",
-            "career guidance",
-            "what should i prioritize",
-        )
+    elif _is_role_guidance_request(request) or any(
+        term in value for term in ("career advice", "career guidance")
     ):
         intent = CareerIntent.CONCISE_GUIDANCE
     else:
@@ -305,6 +347,12 @@ class CareerAgentGraph:
                 f"diagnostic={diagnostic}",
                 "completed",
             )
+        if routing_source in {"llm", "llm_retry"}:
+            decision, boundary_overrode = enforce_intent_boundaries(
+                request, decision
+            )
+            if boundary_overrode:
+                routing_source = "llm_boundary_override"
         decision.memory_signals = merge_memory_signals(
             decision.memory_signals, detect_memory_signals(request)
         )
