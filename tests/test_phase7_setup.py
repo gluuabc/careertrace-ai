@@ -70,9 +70,12 @@ def test_no_secret_values_exist_in_public_configuration():
         "COCKROACH_CA_CERT",
     }
     assert all(example[name] == "" for name in secret_names)
-    assert not (PROJECT_ROOT / ".env").read_text(errors="ignore") in (
-        PROJECT_ROOT / ".env.example"
-    ).read_text(errors="ignore")
+    ignored = {
+        line.strip()
+        for line in (PROJECT_ROOT / ".gitignore").read_text().splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    }
+    assert ".env" in ignored
 
 
 def test_setup_checker_succeeds_with_valid_required_configuration():
@@ -125,6 +128,14 @@ def test_checkpoint_dependency_is_cockroach_specific_not_generic_postgres():
     assert "langgraph-checkpoint-postgres" not in requirements
     evidence = (PROJECT_ROOT / "docs" / "CHECKPOINT_COMPATIBILITY.md").read_text()
     assert "jsonb_each_text" in evidence
+
+
+def test_offline_test_dependencies_are_declared():
+    development_requirements = (
+        PROJECT_ROOT / "requirements-dev.txt"
+    ).read_text()
+    assert "-r requirements.txt" in development_requirements
+    assert "pytest>=8,<9" in development_requirements
 
 
 def test_dockerfile_has_reproducible_streamlit_start_and_no_secret_copy():
