@@ -31,6 +31,9 @@ def detect_memory_signals(text: str) -> list[MemorySignal]:
         (re.compile(r"\bI\s+no\s+longer\s+prefer\s+([^.;!?]+)", re.I), "memory.preference", "remove"),
         (re.compile(r"\bI\s+prefer\s+([^.;!?]+)", re.I), "memory.preference", "replace"),
         (re.compile(r"\bmy\s+(?:career\s+)?goal\s+is\s+([^.;!?]+)", re.I), "memory.goal", "replace"),
+        (re.compile(r"\bI\s+want\s+to\s+target\s+(.+?)(?=\s+going\s+forward\b|[.;!?]|$)", re.I), "memory.goal", "replace"),
+        (re.compile(r"\bI(?:'m|\s+am)\s+aiming\s+for\s+([^.;!?]+)", re.I), "memory.goal", "replace"),
+        (re.compile(r"\bremember\s+that\s+my\s+(?:current\s+)?goal\s+is\s+([^.;!?]+)", re.I), "memory.goal", "replace"),
         (re.compile(r"\bI\s+(?:cannot|can't|must|need to)\s+([^.;!?]+)", re.I), "memory.constraint", "replace"),
         (re.compile(r"\bI\s+(?:just|recently)\s+([^.;!?]+)", re.I), "memory.event", "add"),
     ]
@@ -63,9 +66,9 @@ def detect_memory_signals(text: str) -> list[MemorySignal]:
 def merge_memory_signals(
     classified: list[MemorySignal], explicit: list[MemorySignal]
 ) -> list[MemorySignal]:
-    """Keep classifier signals and append missing deterministic explicit signals."""
+    """Keep classifier signals except goals lacking deterministic user evidence."""
 
-    merged = list(classified)
+    merged = [item for item in classified if item.type != "memory.goal"]
     seen = {
         (item.type, item.operation_hint, *item.value_hint)
         for item in merged

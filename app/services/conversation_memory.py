@@ -167,6 +167,20 @@ def _deterministic_proposals(payload: dict[str, Any]) -> list[ExtractedMemoryPro
     return proposals
 
 
+def _validated_extraction_proposals(
+    payload: dict[str, Any], proposals: list[ExtractedMemoryProposal]
+) -> list[ExtractedMemoryProposal]:
+    """Replace classifier goals with only deterministically supported goals."""
+
+    non_goals = [proposal for proposal in proposals if proposal.category != "goal"]
+    explicit_goals = [
+        proposal
+        for proposal in _deterministic_proposals(payload)
+        if proposal.category == "goal"
+    ]
+    return [*non_goals, *explicit_goals]
+
+
 class ConversationMemoryExtractor:
     def __init__(self, repository: ProfileRepository = profile_repository, model_factory=get_llm):
         self.repository = repository
@@ -200,7 +214,13 @@ class ConversationMemoryExtractor:
                 proposals = parsed.proposals
             except Exception:
                 proposals = _deterministic_proposals(payload)
-            self._persist_proposals(user_id, conversation_id, run["extraction_run_id"], payload, proposals)
+            self._persist_proposals(
+                user_id,
+                conversation_id,
+                run["extraction_run_id"],
+                payload,
+                _validated_extraction_proposals(payload, proposals),
+            )
             return self.repository.finish_memory_extraction_run(
                 user_id, run["extraction_run_id"], success=True
             )

@@ -415,6 +415,68 @@ class AgentRepositoryMixin:
             ).all()
             return [self._agent_run_dict(run, include_children=True) for run in runs]
 
+    def get_latest_agent_display_result(
+        self, user_id: str, conversation_id: str
+    ) -> dict[str, Any] | None:
+        """Rehydrate one conversation's latest finalized display state from SQL."""
+
+        with session_scope(self.session_factory) as session:
+            self._owned_conversation(session, user_id, conversation_id)
+            run = session.scalar(
+                select(AgentRun)
+                .where(
+                    AgentRun.user_id == user_id,
+                    AgentRun.conversation_id == conversation_id,
+                    AgentRun.status.in_(("completed", "partial")),
+                )
+                .order_by(AgentRun.started_at.desc())
+            )
+            if run is None:
+                return None
+            state = dict(run.state_json or {})
+            result = {
+                "type": "final",
+                "user_id": user_id,
+                "conversation_id": conversation_id,
+                "run_id": run.run_id,
+                "workflow_stage": state.get("workflow_stage"),
+                "status": dict(state.get("status") or {}),
+                "todo_items": list(state.get("todo_items") or []),
+                "warnings": list(state.get("warnings") or []),
+                "candidate_count": int(state.get("candidate_count") or 0),
+                "verified_candidate_count": int(
+                    state.get("verified_candidate_count") or 0
+                ),
+                "unverified_candidate_count": int(
+                    state.get("unverified_candidate_count") or 0
+                ),
+                "source_call_count": int(state.get("source_call_count") or 0),
+                "personalization_references": dict(
+                    state.get("personalization_references") or {}
+                ),
+                "job_candidates": [],
+                "people_candidates": [],
+            }
+            search = session.scalar(
+                select(SearchSession)
+                .where(
+                    SearchSession.user_id == user_id,
+                    SearchSession.run_id == run.run_id,
+                )
+                .order_by(SearchSession.created_at.desc())
+            )
+            if search is not None:
+                key = (
+                    "job_candidates"
+                    if search.intent == "job_search"
+                    else "people_candidates"
+                    if search.intent == "people_search"
+                    else None
+                )
+                if key:
+                    result[key] = list(search.candidate_records or [])
+            return result
+
     def create_evidence(
         self,
         user_id: str,

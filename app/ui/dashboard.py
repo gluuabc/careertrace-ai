@@ -25,6 +25,7 @@ from app.services.outreach import outreach_service
 from app.services.people_search import validate_connection_csv
 from app.services.profile_mutation import profile_mutation_service
 from app.services.conversation_memory import trigger_conversation_boundary
+from app.services.agent_results import primary_job_link, resolve_agent_display_result
 
 
 TOP_LEVEL_PAGE_LABELS = (
@@ -972,7 +973,12 @@ def _render_agent_activity(
 
 
 def _render_agent_results(user_id: str, conversation_id: str) -> None:
-    result = st.session_state.get("agent_last_result") or {}
+    result = resolve_agent_display_result(
+        profile_repository,
+        user_id,
+        conversation_id,
+        st.session_state.get("agent_last_result"),
+    )
     if result.get("conversation_id") == conversation_id:
         references = result.get("personalization_references") or {}
         profile_references = references.get("profile") or []
@@ -999,8 +1005,9 @@ def _render_agent_results(user_id: str, conversation_id: str) -> None:
                     st.write(f"**{item.get('title') or 'unknown'} — {item.get('company') or 'unknown'}**")
                     st.write(f"Location: {item.get('location') or 'unknown'} · Employment: {item.get('employment_type') or 'unknown'}")
                     st.write(f"Eligibility: {item.get('eligibility') or 'unknown'}")
-                    if item.get("application_url"):
-                        st.link_button("Official application", item["application_url"])
+                    link = primary_job_link(item)
+                    if link:
+                        st.link_button(*link)
                     st.caption(
                         f"Source status: {str(item.get('source_status') or 'unknown').replace('_', ' ').title()} · "
                         f"Requirement status: {str(item.get('requirement_status') or 'unknown').replace('_', ' ').title()} · "
@@ -1013,10 +1020,14 @@ def _render_agent_results(user_id: str, conversation_id: str) -> None:
                 "requirements were not stated. They do not count toward the matching total."
             )
             for item in unverified:
+                link = primary_job_link(item)
+                link_markdown = (
+                    f"[{link[0]}]({link[1]})" if link else "Posting unavailable"
+                )
                 st.markdown(
                     f"- **{item.get('title') or 'unknown'} — {item.get('company') or 'unknown'}** · "
                     f"{str(item.get('source_status') or 'unknown').replace('_', ' ').title()} · "
-                    f"[source]({item.get('source_url')})"
+                    f"{link_markdown}"
                 )
         if demo_jobs:
             st.markdown("### Demo snapshot suggestions")
