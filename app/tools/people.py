@@ -15,6 +15,7 @@ def search_people(
     request: PeopleSearchRequest,
     user_id: Annotated[str, InjectedState("user_id")],
     run_id: Annotated[str, InjectedState("run_id")],
+    conversation_id: Annotated[str, InjectedState("conversation_id")],
     total_source_calls: Annotated[int, InjectedState("total_source_calls")],
 ) -> dict:
     """Search user-owned connections and permitted public sources for alumni, professors, or verified recruiters. Never scrape LinkedIn or infer private contact information. Public evidence is stored for returned external identities."""
@@ -22,7 +23,7 @@ def search_people(
         import os
 
         remaining = max(0, int(os.getenv("AGENT_MAX_SOURCE_CALLS", "12")) - total_source_calls)
-        return people_search_service.search(user_id=user_id, run_id=run_id, request=request, source_call_budget=remaining).model_dump(mode="json")
+        return people_search_service.search(user_id=user_id, run_id=run_id, conversation_id=conversation_id, request=request, source_call_budget=remaining).model_dump(mode="json")
     except Exception as error:
         return ToolExecutionResult(ok=False, error_type=type(error).__name__, error_message=safe_provider_message("People search")).model_dump()
 

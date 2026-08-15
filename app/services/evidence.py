@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import re
+from time import perf_counter
 from typing import Any
 from uuid import uuid4
 
@@ -49,6 +50,8 @@ class EvidenceService:
         content_type: str,
         raw_content: str,
         structured_content: dict[str, Any] | None = None,
+        index_for_retrieval: bool = True,
+        phase_observer=None,
     ) -> tuple[dict[str, Any], list[str]]:
         sanitized = sanitize_external_content(raw_content, content_type)
         raw_bytes = sanitized.encode("utf-8")
@@ -68,9 +71,16 @@ class EvidenceService:
                 f"agent-evidence/{user_id}/{run_id}/{evidence_id}.{extension}.gz"
             )
             try:
+                storage_started = perf_counter()
                 self.storage.put(
                     storage_key, gzip.compress(raw_bytes), "application/gzip"
                 )
+                if phase_observer:
+                    phase_observer(
+                        "evidence_object_storage",
+                        round((perf_counter() - storage_started) * 1000),
+                        candidate_count=1,
+                    )
                 backend = "s3"
                 sql_raw = None
             except StorageError as error:
@@ -80,6 +90,7 @@ class EvidenceService:
                     raise StorageError(
                         "Evidence exceeded the safe SQL fallback limit."
                     ) from error
+        sql_started = perf_counter()
         record = self.repository.create_evidence(
             user_id,
             run_id,
@@ -96,7 +107,16 @@ class EvidenceService:
             storage_backend=backend,
             storage_key=storage_key,
         )
+        if phase_observer:
+            phase_observer(
+                "evidence_sql_persistence",
+                round((perf_counter() - sql_started) * 1000),
+                candidate_count=1,
+            )
         try:
+            if not index_for_retrieval:
+                return record, warnings
+            indexing_started = perf_counter()
             from app.database.retrieval_repository import RetrievalRepository
             from app.services.retrieval_corpus import RetrievalCorpusIndexer
 
@@ -112,6 +132,12 @@ class EvidenceService:
                 content_hash=digest,
                 text=sanitized,
             )
+            if phase_observer:
+                phase_observer(
+                    "evidence_retrieval_indexing",
+                    round((perf_counter() - indexing_started) * 1000),
+                    candidate_count=1,
+                )
         except Exception:
             warnings.append("Evidence retrieval indexing is temporarily unavailable.")
         return record, warnings

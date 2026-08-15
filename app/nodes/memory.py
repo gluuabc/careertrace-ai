@@ -2,8 +2,7 @@ from typing import Any
 
 from app.database import init_db, profile_repository
 from app.state.schema import ProfileState
-from app.database.retrieval_repository import RetrievalRepository
-from app.services.retrieval_corpus import RetrievalCorpusIndexer
+from app.services.profile_mutation import profile_mutation_service
 
 def save_profile(state: ProfileState) -> dict[str, dict]:
     """Deterministically persist one confirmed profile transactionally."""
@@ -24,10 +23,12 @@ def save_profile(state: ProfileState) -> dict[str, dict]:
     document_ids = state.get("document_ids") or []
     if state.get("document_id"):
         document_ids = [*document_ids, state["document_id"]]
-    saved_profile = profile_repository.upsert_profile(
-        user_id, profile, document_ids=document_ids
+    saved_profile = profile_mutation_service.apply_profile_field_changes(
+        user_id,
+        profile,
+        source_type="document",
+        document_ids=document_ids,
     )
-    RetrievalCorpusIndexer(RetrievalRepository(profile_repository.session_factory)).index_profile(user_id=user_id, profile=saved_profile)
     return {
         "user_id": user_id,
         "saved_profile": saved_profile,

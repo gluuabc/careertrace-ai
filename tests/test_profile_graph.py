@@ -26,15 +26,7 @@ class ProfileGraphTests(unittest.TestCase):
             "invalid",
         )
 
-    def test_unchanged_profile_skips_new_analysis(self):
-        self.assertEqual(
-            graph_module._route_after_save(
-                {"saved_profile": {"profile_changed": False}}
-            ),
-            "unchanged",
-        )
-
-    def test_missing_information_and_confirmation_flow(self):
+    def test_profile_onboarding_does_not_generate_career_analysis(self):
         extracted = {
             "name": "Ada Student",
             "email": None,
@@ -68,14 +60,6 @@ class ProfileGraphTests(unittest.TestCase):
                     "profile_changed": True,
                 },
             },
-            "generate_profile": lambda _state: {
-                "career_profile": {
-                    "strengths": ["Python"],
-                    "possible_roles": ["Software Engineer"],
-                    "recommended_next_skills": ["Cloud deployment"],
-                }
-            },
-            "save_career_analysis": lambda _state: {"analysis_id": "analysis-1"},
         }
 
         with (
@@ -87,14 +71,6 @@ class ProfileGraphTests(unittest.TestCase):
                 graph_module, "extract_profile", fake_nodes["extract_profile"]
             ),
             patch.object(graph_module, "save_profile", fake_nodes["save_profile"]),
-            patch.object(
-                graph_module, "generate_profile", fake_nodes["generate_profile"]
-            ),
-            patch.object(
-                graph_module,
-                "save_career_analysis",
-                fake_nodes["save_career_analysis"],
-            ),
         ):
             graph = graph_module.build_profile_graph(MemorySaver())
 
@@ -134,7 +110,8 @@ class ProfileGraphTests(unittest.TestCase):
             config=config,
         )
         self.assertTrue(result["confirmed"])
-        self.assertEqual(result["analysis_id"], "analysis-1")
+        self.assertNotIn("analysis_id", result)
+        self.assertNotIn("career_profile", result)
         self.assertEqual(result["document_id"], "document-1")
 
 

@@ -4,8 +4,7 @@ from app.graph.checkpoint import get_default_checkpointer
 from app.nodes.confirmation import confirm_profile
 from app.nodes.documents import store_document
 from app.nodes.extraction import extract_profile
-from app.nodes.memory import save_career_analysis, save_profile
-from app.nodes.profile import generate_profile
+from app.nodes.memory import save_profile
 from app.nodes.resume import extract_resume
 from app.nodes.validation import collect_missing_information, validate_profile
 from app.state.schema import ProfileState
@@ -21,14 +20,6 @@ def _route_after_confirmation(state: ProfileState) -> str:
     if state.get("missing_fields") or state.get("validation_errors"):
         return "invalid"
     return "rejected"
-
-
-def _route_after_save(state: ProfileState) -> str:
-    return (
-        "changed"
-        if state.get("saved_profile", {}).get("profile_changed", True)
-        else "unchanged"
-    )
 
 
 def build_profile_graph(checkpointer=None):
@@ -47,9 +38,6 @@ def build_profile_graph(checkpointer=None):
     workflow.add_node("confirm_profile", confirm_profile)
     # Deterministic SQL persistence nodes.
     workflow.add_node("save_profile", save_profile)
-    # LLM reasoning node using the stronger model.
-    workflow.add_node("generate_profile", generate_profile)
-    workflow.add_node("save_career_analysis", save_career_analysis)
 
     workflow.add_edge(START, "store_document")
     workflow.add_edge("store_document", "extract_resume")
@@ -73,16 +61,7 @@ def build_profile_graph(checkpointer=None):
             "rejected": END,
         },
     )
-    workflow.add_conditional_edges(
-        "save_profile",
-        _route_after_save,
-        {
-            "changed": "generate_profile",
-            "unchanged": END,
-        },
-    )
-    workflow.add_edge("generate_profile", "save_career_analysis")
-    workflow.add_edge("save_career_analysis", END)
+    workflow.add_edge("save_profile", END)
 
     return workflow.compile(
         checkpointer=(

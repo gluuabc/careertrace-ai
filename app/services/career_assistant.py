@@ -75,6 +75,9 @@ def respond_to_user(
                 "job_candidates": result.get("job_candidates", []),
                 "people_candidates": result.get("people_candidates", []),
                 "workflow_stage": result.get("workflow_stage"),
+                "personalization_references": result.get(
+                    "personalization_references", {}
+                ),
             }
         )
     return response

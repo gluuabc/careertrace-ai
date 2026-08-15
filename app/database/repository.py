@@ -1,9 +1,10 @@
 from collections.abc import Callable, Iterable
 from datetime import datetime, timezone
 from typing import Any
+import json
 import threading
 
-from sqlalchemy import func, select, update
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.orm import Session
 
 from app.database.database import SessionLocal, session_scope
@@ -13,13 +14,20 @@ from app.database.models import (
     CareerAnalysisVersion,
     CareerPreference,
     Conversation,
+    ConversationMemorySignal,
+    ConversationMemoryState,
     Document,
     Experience,
+    JudgeWorkspaceCredential,
     Memory,
     MemoryCandidate,
+    MemoryExtractionRun,
     Message,
     Profile,
     ProfileDocumentSource,
+    ProfileFieldRevision,
+    ProfileRevisionChange,
+    ProfileRevisionDraft,
     ProfileVersion,
     Project,
     RetrievalDocument,
@@ -60,6 +68,43 @@ class ProfileRepository(AgentRepositoryMixin):
             session.add(user)
             session.flush()
             return self._user_dict(user)
+
+    def create_judge_workspace(self, recovery_code_hash: str) -> dict[str, Any]:
+        """Atomically create one isolated demo UUID and its hashed credential."""
+
+        clean_hash = self._required_text(recovery_code_hash, "recovery code hash")
+        if len(clean_hash) != 64:
+            raise ValueError("Recovery code hash must be a SHA-256 digest.")
+        with session_scope(self.session_factory) as session:
+            user = User(
+                name="Judge Demo",
+                email=None,
+                google_id=None,
+                profile_image=None,
+                is_demo=True,
+            )
+            user.judge_workspace_credentials.append(
+                JudgeWorkspaceCredential(recovery_code_hash=clean_hash)
+            )
+            session.add(user)
+            session.flush()
+            return self._user_dict(user)
+
+    def get_judge_workspace_by_recovery_hash(
+        self, recovery_code_hash: str
+    ) -> dict[str, Any]:
+        """Resolve only an active recovery credential for an isolated demo user."""
+
+        with session_scope(self.session_factory) as session:
+            credential = session.scalar(
+                select(JudgeWorkspaceCredential).where(
+                    JudgeWorkspaceCredential.recovery_code_hash == recovery_code_hash,
+                    JudgeWorkspaceCredential.revoked_at.is_(None),
+                )
+            )
+            if credential is None or not credential.user.is_demo:
+                raise ValueError("Judge workspace recovery failed.")
+            return self._user_dict(credential.user)
 
     def get_demo_user(self, user_id: str) -> dict[str, Any]:
         """Resolve only the exact demo UUID already held by the current session."""
@@ -150,25 +195,80 @@ class ProfileRepository(AgentRepositoryMixin):
         profile_data: dict[str, Any],
         document_ids: Iterable[str] | None = None,
     ) -> dict[str, Any]:
-        """Create an immutable version only when confirmed facts changed."""
+        """Compatibility wrapper around the canonical field mutation boundary."""
+
+        return self.apply_profile_field_changes(
+            user_id,
+            profile_data,
+            source_type="document" if document_ids else "manual",
+            document_ids=document_ids,
+        )
+
+    def apply_profile_field_changes(
+        self,
+        user_id: str,
+        field_changes: dict[str, Any],
+        *,
+        source_type: str,
+        source_conversation_id: str | None = None,
+        source_message_ids: Iterable[str] | None = None,
+        document_ids: Iterable[str] | None = None,
+        operations: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        """Atomically apply explicit fields and record field-scoped audit history.
+
+        Whole profile snapshots remain the current source of truth. Retrieval rows
+        for the former current snapshot are deactivated in the same SQL
+        transaction so external embedding work can never leave stale profile data
+        marked current.
+        """
+
+        allowed_sources = {"manual", "conversation", "document", "history_restore"}
+        if source_type not in allowed_sources:
+            raise ValueError(f"Unsupported profile change source: {source_type}")
+        unknown_fields = set(field_changes) - set(self._profile_field_keys())
+        if unknown_fields:
+            raise ValueError(
+                "Unsupported profile fields: " + ", ".join(sorted(unknown_fields))
+            )
 
         with session_scope(self.session_factory) as session:
             user = self._require_user(session, user_id)
-            normalized = self._normalize_profile(profile_data)
+            if source_conversation_id is not None:
+                self._owned_conversation(session, user_id, source_conversation_id)
+
+            profile = user.profile
+            current_snapshot = (
+                dict(profile.current_version.snapshot_data)
+                if profile is not None and profile.current_version is not None
+                else {}
+            )
+            composed = {**current_snapshot, **field_changes}
+            normalized = self._normalize_profile(composed)
             self._validate_required_profile(normalized)
             if user.google_id:
                 normalized["name"] = user.name
                 normalized["email"] = user.email
 
-            profile = user.profile
-            if profile is not None and profile.current_version is not None:
-                current_snapshot = dict(profile.current_version.snapshot_data)
-                if self._comparable_profile(current_snapshot) == self._comparable_profile(
-                    normalized
-                ):
-                    result = self._profile_dict(user)
-                    result["profile_changed"] = False
-                    return result
+            before = self._normalize_profile(current_snapshot) if current_snapshot else {}
+            changed_fields = [
+                key
+                for key in self._profile_field_keys()
+                if before.get(key) != normalized.get(key)
+                and (current_snapshot or normalized.get(key) not in (None, "", []))
+            ]
+            if not changed_fields and profile is not None:
+                result = self._profile_dict(user)
+                result.update(
+                    profile_changed=False,
+                    field_revisions=[],
+                    retrieval_index_status=(
+                        profile.current_version.retrieval_index_status
+                        if profile.current_version
+                        else None
+                    ),
+                )
+                return result
 
             user.name = normalized["name"] or user.name
             if not user.is_demo:
@@ -195,6 +295,7 @@ class ProfileRepository(AgentRepositoryMixin):
                 user=user,
                 version_number=next_number,
                 snapshot_data=dict(normalized),
+                retrieval_index_status="pending",
             )
             session.add(version)
             session.flush()
@@ -217,10 +318,147 @@ class ProfileRepository(AgentRepositoryMixin):
 
             profile.current_version = version
             profile.version = next_number
+            revisions = []
+            source_ids = [str(item) for item in (source_message_ids or []) if item]
+            for field_key in changed_fields:
+                revision = ProfileFieldRevision(
+                    user=user,
+                    field_key=field_key,
+                    operation=(operations or {}).get(
+                        field_key,
+                        "set" if not current_snapshot else "replace",
+                    ),
+                    previous_value=before.get(field_key),
+                    new_value=normalized.get(field_key),
+                    source_type=source_type,
+                    source_conversation_id=source_conversation_id,
+                    source_message_ids=source_ids,
+                    resulting_profile_version=version,
+                )
+                session.add(revision)
+                revisions.append(revision)
+
+            session.execute(
+                update(RetrievalDocument)
+                .where(
+                    RetrievalDocument.user_id == user_id,
+                    RetrievalDocument.corpus_type.in_(["resume", "project"]),
+                    RetrievalDocument.active.is_(True),
+                )
+                .values(active=False)
+            )
             session.flush()
             result = self._profile_dict(user)
-            result["profile_changed"] = True
+            result.update(
+                profile_changed=True,
+                changed_fields=changed_fields,
+                field_revisions=[self._profile_field_revision_dict(item) for item in revisions],
+                retrieval_index_status="pending",
+            )
             return result
+
+    def set_profile_retrieval_index_status(
+        self,
+        user_id: str,
+        profile_version_id: str,
+        *,
+        status: str,
+        error: str | None = None,
+    ) -> None:
+        if status not in {"pending", "ready", "sparse_only", "failed"}:
+            raise ValueError("Unsupported profile retrieval index status.")
+        with session_scope(self.session_factory) as session:
+            version = session.scalar(
+                select(ProfileVersion).where(
+                    ProfileVersion.version_id == profile_version_id,
+                    ProfileVersion.user_id == user_id,
+                )
+            )
+            if version is None:
+                raise ValueError("Profile version was not found for this user.")
+            version.retrieval_index_status = status
+            version.retrieval_index_error = self._clean_optional(error)
+
+    def list_profile_field_revisions(
+        self, user_id: str, field_key: str | None = None
+    ) -> list[dict[str, Any]]:
+        with session_scope(self.session_factory) as session:
+            self._require_user(session, user_id)
+            query = select(ProfileFieldRevision).where(
+                ProfileFieldRevision.user_id == user_id
+            )
+            if field_key is not None:
+                query = query.where(ProfileFieldRevision.field_key == field_key)
+            items = session.scalars(
+                query.order_by(
+                    ProfileFieldRevision.created_at.desc(),
+                    ProfileFieldRevision.revision_id.desc(),
+                )
+            ).all()
+            return [self._profile_field_revision_dict(item) for item in items]
+
+    def list_profile_field_history(
+        self, user_id: str
+    ) -> dict[str, list[dict[str, Any]]]:
+        """Return distinct prior values per field, including legacy snapshots."""
+
+        with session_scope(self.session_factory) as session:
+            user = self._require_user(session, user_id)
+            current = (
+                dict(user.profile.current_version.snapshot_data)
+                if user.profile is not None and user.profile.current_version is not None
+                else {}
+            )
+            history = {key: [] for key in self._profile_field_keys()}
+            seen = {
+                key: {self._profile_value_identity(current.get(key))}
+                for key in self._profile_field_keys()
+            }
+
+            revisions = session.scalars(
+                select(ProfileFieldRevision)
+                .where(ProfileFieldRevision.user_id == user_id)
+                .order_by(
+                    ProfileFieldRevision.created_at.desc(),
+                    ProfileFieldRevision.revision_id.desc(),
+                )
+            ).all()
+            for revision in revisions:
+                if revision.previous_value in (None, "", []):
+                    continue
+                identity = self._profile_value_identity(revision.previous_value)
+                if identity not in seen[revision.field_key]:
+                    seen[revision.field_key].add(identity)
+                    history[revision.field_key].append(
+                        {
+                            "value": revision.previous_value,
+                            "created_at": revision.created_at.isoformat(),
+                            "source_type": revision.source_type,
+                        }
+                    )
+
+            versions = session.scalars(
+                select(ProfileVersion)
+                .where(ProfileVersion.user_id == user_id)
+                .order_by(ProfileVersion.version_number.desc())
+            ).all()
+            for version in versions:
+                for field_key in self._profile_field_keys():
+                    value = version.snapshot_data.get(field_key)
+                    if value in (None, "", []):
+                        continue
+                    identity = self._profile_value_identity(value)
+                    if identity in seen[field_key]:
+                        continue
+                    seen[field_key].add(identity)
+                    history[field_key].append(
+                        {
+                            "value": value,
+                            "created_at": version.created_at.isoformat(),
+                            "source_type": "legacy_snapshot",
+                        }
+                    )
+            return history
 
     def list_profile_versions(self, user_id: str) -> list[dict[str, Any]]:
         with session_scope(self.session_factory) as session:
@@ -429,17 +667,71 @@ class ProfileRepository(AgentRepositoryMixin):
         content: str,
         confidence: float | None,
         source: str,
+        operation: str = "ADD",
+        existing_memory_id: str | None = None,
+        source_conversation_id: str | None = None,
+        source_message_ids: list[str] | None = None,
+        extraction_run_id: str | None = None,
+        event_time: datetime | None = None,
+        raw_temporal_expression: str | None = None,
     ) -> dict[str, Any]:
         if confidence is not None and not 0 <= confidence <= 1:
             raise ValueError("confidence must be between 0 and 1.")
+        clean_operation = operation.strip().upper()
+        if clean_operation not in {"ADD", "UPDATE", "REVOKE", "NOOP", "CONFLICT"}:
+            raise ValueError("Unsupported memory operation.")
         with session_scope(self.session_factory) as session:
             user = self._require_user(session, user_id)
+            if existing_memory_id:
+                existing = session.scalar(
+                    select(Memory).where(
+                        Memory.memory_id == existing_memory_id,
+                        Memory.user_id == user_id,
+                    )
+                )
+                if existing is None:
+                    raise ValueError("The referenced memory was not found for this user.")
+            if source_conversation_id:
+                self._owned_conversation(session, user_id, source_conversation_id)
+            clean_message_ids = list(dict.fromkeys(source_message_ids or []))
+            if clean_message_ids:
+                if not source_conversation_id:
+                    raise ValueError("Source messages require a source conversation.")
+                owned_message_ids = set(
+                    session.scalars(
+                        select(Message.message_id).where(
+                            Message.message_id.in_(clean_message_ids),
+                            Message.conversation_id == source_conversation_id,
+                        )
+                    ).all()
+                )
+                if owned_message_ids != set(clean_message_ids):
+                    raise ValueError("A source message was not found in this conversation.")
+            if extraction_run_id:
+                extraction_run = session.scalar(
+                    select(MemoryExtractionRun).where(
+                        MemoryExtractionRun.extraction_run_id == extraction_run_id,
+                        MemoryExtractionRun.user_id == user_id,
+                    )
+                )
+                if extraction_run is None or (
+                    source_conversation_id
+                    and extraction_run.conversation_id != source_conversation_id
+                ):
+                    raise ValueError("The extraction run was not found for this user and conversation.")
             candidate = MemoryCandidate(
                 user=user,
                 category=self._required_text(category, "category"),
                 content=self._required_text(content, "content"),
                 confidence=confidence,
                 source=self._required_text(source, "source"),
+                operation=clean_operation,
+                existing_memory_id=existing_memory_id,
+                source_conversation_id=source_conversation_id,
+                source_message_ids=clean_message_ids,
+                extraction_run_id=extraction_run_id,
+                event_time=event_time,
+                raw_temporal_expression=raw_temporal_expression,
             )
             session.add(candidate)
             session.flush()
@@ -456,7 +748,12 @@ class ProfileRepository(AgentRepositoryMixin):
             return [self._memory_candidate_dict(item) for item in candidates]
 
     def review_memory_candidate(
-        self, user_id: str, candidate_id: str, *, accept: bool
+        self,
+        user_id: str,
+        candidate_id: str,
+        *,
+        accept: bool,
+        conflict_resolution: str | None = None,
     ) -> dict[str, Any] | None:
         accepted_memory: dict[str, Any] | None = None
         with session_scope(self.session_factory) as session:
@@ -470,23 +767,85 @@ class ProfileRepository(AgentRepositoryMixin):
                 raise ValueError("Memory candidate was not found for this user.")
             if candidate.status != "pending":
                 raise ValueError("Memory candidate has already been reviewed.")
+            resolution = conflict_resolution or ("use_new" if accept else "reject_new")
+            if candidate.operation == "CONFLICT" and resolution not in {
+                "keep_existing", "use_new", "keep_both", "reject_new"
+            }:
+                raise ValueError("Unsupported conflict resolution.")
             candidate.status = "accepted" if accept else "rejected"
             candidate.reviewed_at = datetime.now(timezone.utc)
-            if not accept:
+            if not accept or resolution in {"keep_existing", "reject_new"}:
+                candidate.status = "rejected"
                 return None
+            existing = (
+                session.scalar(
+                    select(Memory).where(
+                        Memory.memory_id == candidate.existing_memory_id,
+                        Memory.user_id == user_id,
+                    )
+                )
+                if candidate.existing_memory_id
+                else None
+            )
+            if candidate.operation == "REVOKE":
+                if existing is None:
+                    raise ValueError("The memory selected for revocation no longer exists.")
+                existing.active = False
+                existing.revoked_at = datetime.now(timezone.utc)
+                existing.retrieval_index_status = "inactive"
+                existing.retrieval_index_error = None
+                session.execute(
+                    update(RetrievalDocument)
+                    .where(
+                        RetrievalDocument.user_id == user_id,
+                        RetrievalDocument.corpus_type == "approved_memory",
+                        RetrievalDocument.source_entity_id.like(f"{existing.memory_id}%"),
+                        RetrievalDocument.active.is_(True),
+                    )
+                    .values(active=False)
+                )
+                return self._memory_dict(existing)
+            if candidate.operation == "UPDATE" or (
+                candidate.operation == "CONFLICT" and resolution == "use_new"
+            ):
+                if existing is None:
+                    raise ValueError("The memory selected for update no longer exists.")
+                existing.active = False
+                existing.revoked_at = datetime.now(timezone.utc)
+                existing.retrieval_index_status = "inactive"
+                existing.retrieval_index_error = None
+                session.execute(
+                    update(RetrievalDocument)
+                    .where(
+                        RetrievalDocument.user_id == user_id,
+                        RetrievalDocument.corpus_type == "approved_memory",
+                        RetrievalDocument.source_entity_id.like(f"{existing.memory_id}%"),
+                        RetrievalDocument.active.is_(True),
+                    )
+                    .values(active=False)
+                )
             memory = Memory(
                 user=candidate.user,
                 category=candidate.category,
                 content=candidate.content,
                 confidence=candidate.confidence,
                 source=candidate.source,
+                active=True,
+                supersedes_memory_id=(
+                    existing.memory_id
+                    if existing is not None and resolution != "keep_both"
+                    else None
+                ),
+                event_time=candidate.event_time,
+                source_conversation_id=candidate.source_conversation_id,
+                source_message_ids=list(candidate.source_message_ids or []),
+                retrieval_index_status="pending",
             )
             session.add(memory)
             session.flush()
             accepted_memory = self._memory_dict(memory)
         if accepted_memory is not None:
-            # Approval is authoritative; retrieval indexing is additive and must not
-            # make the approval transaction depend on an external embedding service.
+            indexing_error = None
             try:
                 from app.database.retrieval_repository import RetrievalRepository
                 from app.services.retrieval_corpus import RetrievalCorpusIndexer
@@ -494,19 +853,153 @@ class ProfileRepository(AgentRepositoryMixin):
                 RetrievalCorpusIndexer(
                     RetrievalRepository(self.session_factory)
                 ).index_memory(user_id=user_id, memory=accepted_memory)
-            except Exception:
-                pass
+            except Exception as error:
+                indexing_error = type(error).__name__
+            with session_scope(self.session_factory) as session:
+                memory = session.scalar(
+                    select(Memory).where(
+                        Memory.memory_id == accepted_memory["memory_id"],
+                        Memory.user_id == user_id,
+                    )
+                )
+                memory.retrieval_index_status = "failed" if indexing_error else "synced"
+                memory.retrieval_index_error = indexing_error
+                session.flush()
+                accepted_memory = self._memory_dict(memory)
         return accepted_memory
 
-    def list_memories(self, user_id: str) -> list[dict[str, Any]]:
+    def list_memories(
+        self, user_id: str, *, include_inactive: bool = False
+    ) -> list[dict[str, Any]]:
         with session_scope(self.session_factory) as session:
             self._require_user(session, user_id)
+            query = select(Memory).where(Memory.user_id == user_id)
+            if not include_inactive:
+                query = query.where(Memory.active.is_(True))
             memories = session.scalars(
-                select(Memory)
-                .where(Memory.user_id == user_id)
+                query
                 .order_by(Memory.created_at.desc())
             ).all()
             return [self._memory_dict(item) for item in memories]
+
+    # --------------------------------------------------- profile revision drafts
+    def create_profile_revision_draft(
+        self,
+        user_id: str,
+        *,
+        source_type: str,
+        source_conversation_id: str | None,
+        source_message_ids: list[str],
+        changes: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        with session_scope(self.session_factory) as session:
+            user = self._require_user(session, user_id)
+            if source_conversation_id:
+                self._owned_conversation(session, user_id, source_conversation_id)
+            draft = ProfileRevisionDraft(
+                user=user,
+                source_type=self._required_text(source_type, "source type"),
+                source_conversation_id=source_conversation_id,
+                source_message_ids=list(dict.fromkeys(source_message_ids)),
+            )
+            for raw in changes:
+                draft.changes.append(
+                    ProfileRevisionChange(
+                        field_key=self._required_text(str(raw.get("field_key") or ""), "field key"),
+                        operation=self._required_text(str(raw.get("operation") or "replace"), "operation"),
+                        before_value=raw.get("before_value"),
+                        proposed_value=raw.get("proposed_value"),
+                        source_json=dict(raw.get("source") or {}),
+                    )
+                )
+            session.add(draft)
+            session.flush()
+            return self._profile_revision_draft_dict(draft)
+
+    def list_profile_revision_drafts(self, user_id: str) -> list[dict[str, Any]]:
+        with session_scope(self.session_factory) as session:
+            self._require_user(session, user_id)
+            drafts = session.scalars(
+                select(ProfileRevisionDraft)
+                .where(ProfileRevisionDraft.user_id == user_id)
+                .order_by(ProfileRevisionDraft.created_at.desc())
+            ).all()
+            return [self._profile_revision_draft_dict(item) for item in drafts]
+
+    def review_profile_revision_change(
+        self, user_id: str, change_id: str, *, accept: bool
+    ) -> dict[str, Any]:
+        with session_scope(self.session_factory) as session:
+            change = session.scalar(
+                select(ProfileRevisionChange)
+                .join(ProfileRevisionDraft)
+                .where(
+                    ProfileRevisionChange.change_id == change_id,
+                    ProfileRevisionDraft.user_id == user_id,
+                )
+            )
+            if change is None:
+                raise ValueError("Profile revision change was not found for this user.")
+            if change.status not in {"pending", "accepted"}:
+                raise ValueError("Profile revision change has already been reviewed.")
+            current = self._profile_dict(change.draft.user).get(change.field_key)
+            if accept and self._stable_json(current) != self._stable_json(change.before_value):
+                change.status = "stale"
+            else:
+                change.status = "accepted" if accept else "rejected"
+            session.flush()
+            return self._profile_revision_change_dict(change)
+
+    def apply_profile_revision_draft(
+        self, user_id: str, draft_id: str
+    ) -> dict[str, Any]:
+        changes: dict[str, Any] = {}
+        message_ids: list[str] = []
+        conversation_id: str | None = None
+        with session_scope(self.session_factory) as session:
+            draft = session.scalar(
+                select(ProfileRevisionDraft).where(
+                    ProfileRevisionDraft.draft_id == draft_id,
+                    ProfileRevisionDraft.user_id == user_id,
+                )
+            )
+            if draft is None:
+                raise ValueError("Profile revision draft was not found for this user.")
+            if draft.status == "applied":
+                return self._profile_revision_draft_dict(draft)
+            current_profile = self._profile_dict(draft.user)
+            for change in draft.changes:
+                if change.status != "accepted":
+                    continue
+                if self._stable_json(current_profile.get(change.field_key)) != self._stable_json(change.before_value):
+                    change.status = "stale"
+                    continue
+                changes[change.field_key] = change.proposed_value
+            message_ids = list(draft.source_message_ids or [])
+            conversation_id = draft.source_conversation_id
+            if not changes:
+                raise ValueError("No accepted non-stale Profile changes are available.")
+        self.apply_profile_field_changes(
+            user_id,
+            changes,
+            source_type="conversation",
+            source_conversation_id=conversation_id,
+            source_message_ids=message_ids,
+        )
+        with session_scope(self.session_factory) as session:
+            draft = session.scalar(
+                select(ProfileRevisionDraft).where(
+                    ProfileRevisionDraft.draft_id == draft_id,
+                    ProfileRevisionDraft.user_id == user_id,
+                )
+            )
+            for change in draft.changes:
+                if change.status == "accepted" and change.field_key in changes:
+                    change.status = "applied"
+            draft.status = "applied"
+            draft.applied_at = datetime.now(timezone.utc)
+            session.flush()
+            return self._profile_revision_draft_dict(draft)
 
     # ------------------------------------------------------------ conversation
     def create_conversation(self, user_id: str, title: str) -> dict[str, Any]:
@@ -517,6 +1010,20 @@ class ProfileRepository(AgentRepositoryMixin):
                 title=self._required_text(title, "title")[:200],
             )
             session.add(conversation)
+            session.flush()
+            return self._conversation_dict(conversation)
+
+    def rename_conversation(
+        self, user_id: str, conversation_id: str, title: str
+    ) -> dict[str, Any]:
+        """Rename an owned conversation without changing its identity/messages."""
+
+        with session_scope(self.session_factory) as session:
+            conversation = self._owned_conversation(
+                session, user_id, conversation_id
+            )
+            conversation.title = self._required_text(title, "title")[:200]
+            conversation.updated_at = datetime.now(timezone.utc)
             session.flush()
             return self._conversation_dict(conversation)
 
@@ -588,6 +1095,255 @@ class ProfileRepository(AgentRepositoryMixin):
             session.add(message)
             session.flush()
             return self._message_dict(message)
+
+    def record_conversation_memory_signals(
+        self,
+        user_id: str,
+        conversation_id: str,
+        source_message_id: str,
+        signals: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Idempotently persist current-thread hints and mark extraction pending."""
+
+        with session_scope(self.session_factory) as session:
+            conversation = self._owned_conversation(session, user_id, conversation_id)
+            source = session.scalar(
+                select(Message).where(
+                    Message.message_id == source_message_id,
+                    Message.conversation_id == conversation_id,
+                    Message.role == "user",
+                )
+            )
+            if source is None:
+                raise ValueError("Memory signal source must be a user message in this conversation.")
+            session.execute(
+                delete(ConversationMemorySignal).where(
+                    ConversationMemorySignal.source_message_id == source_message_id
+                )
+            )
+            records = []
+            for index, raw in enumerate(signals):
+                item = ConversationMemorySignal(
+                    user_id=user_id,
+                    conversation_id=conversation_id,
+                    source_message_id=source_message_id,
+                    signal_index=index,
+                    signal_type=self._required_text(str(raw.get("type") or ""), "signal type"),
+                    operation_hint=self._required_text(str(raw.get("operation_hint") or ""), "operation hint"),
+                    value_hint=[str(value).strip() for value in raw.get("value_hint") or [] if str(value).strip()],
+                )
+                session.add(item)
+                records.append(item)
+            if records:
+                state = session.get(ConversationMemoryState, conversation_id)
+                if state is None:
+                    state = ConversationMemoryState(
+                        user_id=user_id,
+                        conversation_id=conversation_id,
+                    )
+                    session.add(state)
+                state.pending = True
+                state.pending_boundary_message_id = source_message_id
+                state.updated_at = datetime.now(timezone.utc)
+            session.flush()
+            return [self._conversation_memory_signal_dict(item) for item in records]
+
+    def list_conversation_memory_signals(
+        self, user_id: str, conversation_id: str
+    ) -> list[dict[str, Any]]:
+        with session_scope(self.session_factory) as session:
+            self._owned_conversation(session, user_id, conversation_id)
+            records = session.scalars(
+                select(ConversationMemorySignal)
+                .where(
+                    ConversationMemorySignal.user_id == user_id,
+                    ConversationMemorySignal.conversation_id == conversation_id,
+                )
+                .order_by(
+                    ConversationMemorySignal.created_at,
+                    ConversationMemorySignal.signal_index,
+                )
+            ).all()
+            return [self._conversation_memory_signal_dict(item) for item in records]
+
+    def get_conversation_memory_state(
+        self, user_id: str, conversation_id: str
+    ) -> dict[str, Any] | None:
+        with session_scope(self.session_factory) as session:
+            self._owned_conversation(session, user_id, conversation_id)
+            state = session.get(ConversationMemoryState, conversation_id)
+            return self._conversation_memory_state_dict(state) if state else None
+
+    def mark_conversation_extraction_pending(
+        self,
+        user_id: str,
+        conversation_id: str,
+        boundary_message_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Persist a boundary immediately; this method never invokes an LLM."""
+
+        with session_scope(self.session_factory) as session:
+            conversation = self._owned_conversation(session, user_id, conversation_id)
+            state = session.get(ConversationMemoryState, conversation_id)
+            if state is None:
+                return None
+            messages = sorted(conversation.messages, key=lambda item: item.created_at)
+            boundary = (
+                next((item for item in messages if item.message_id == boundary_message_id), None)
+                if boundary_message_id
+                else (messages[-1] if messages else None)
+            )
+            if boundary is None:
+                return self._conversation_memory_state_dict(state)
+            state.pending = True
+            state.pending_boundary_message_id = boundary.message_id
+            state.updated_at = datetime.now(timezone.utc)
+            session.flush()
+            return self._conversation_memory_state_dict(state)
+
+    def list_pending_conversation_memory_states(
+        self, user_id: str
+    ) -> list[dict[str, Any]]:
+        with session_scope(self.session_factory) as session:
+            self._require_user(session, user_id)
+            states = session.scalars(
+                select(ConversationMemoryState)
+                .where(
+                    ConversationMemoryState.user_id == user_id,
+                    ConversationMemoryState.pending.is_(True),
+                )
+                .order_by(ConversationMemoryState.updated_at)
+            ).all()
+            return [self._conversation_memory_state_dict(item) for item in states]
+
+    def create_memory_extraction_run(
+        self,
+        user_id: str,
+        conversation_id: str,
+        *,
+        start_watermark_message_id: str | None,
+        end_boundary_message_id: str,
+        input_mode: str,
+        input_token_count: int,
+    ) -> dict[str, Any]:
+        with session_scope(self.session_factory) as session:
+            self._owned_conversation(session, user_id, conversation_id)
+            existing = session.scalar(
+                select(MemoryExtractionRun).where(
+                    MemoryExtractionRun.user_id == user_id,
+                    MemoryExtractionRun.conversation_id == conversation_id,
+                    MemoryExtractionRun.start_watermark_message_id == start_watermark_message_id,
+                    MemoryExtractionRun.end_boundary_message_id == end_boundary_message_id,
+                )
+            )
+            if existing is not None:
+                if existing.status == "completed":
+                    return self._memory_extraction_run_dict(existing)
+                existing.attempt += 1
+                existing.status = "processing"
+                existing.error_summary = None
+                existing.input_mode = input_mode
+                existing.input_token_count = input_token_count
+                session.flush()
+                return self._memory_extraction_run_dict(existing)
+            item = MemoryExtractionRun(
+                user_id=user_id,
+                conversation_id=conversation_id,
+                start_watermark_message_id=start_watermark_message_id,
+                end_boundary_message_id=end_boundary_message_id,
+                status="processing",
+                attempt=1,
+                input_mode=input_mode,
+                input_token_count=input_token_count,
+            )
+            session.add(item)
+            session.flush()
+            return self._memory_extraction_run_dict(item)
+
+    def finish_memory_extraction_run(
+        self,
+        user_id: str,
+        extraction_run_id: str,
+        *,
+        success: bool,
+        error_summary: str | None = None,
+    ) -> dict[str, Any]:
+        with session_scope(self.session_factory) as session:
+            run = session.scalar(
+                select(MemoryExtractionRun).where(
+                    MemoryExtractionRun.extraction_run_id == extraction_run_id,
+                    MemoryExtractionRun.user_id == user_id,
+                )
+            )
+            if run is None:
+                raise ValueError("Memory extraction run was not found for this user.")
+            run.status = "completed" if success else "failed"
+            run.completed_at = datetime.now(timezone.utc)
+            run.error_summary = error_summary
+            state = session.get(ConversationMemoryState, run.conversation_id)
+            if state is not None:
+                state.processing = False
+                if success:
+                    state.last_memory_extraction_message_id = run.end_boundary_message_id
+                    state.pending = False
+                    state.pending_boundary_message_id = None
+                else:
+                    state.pending = True
+            session.flush()
+            return self._memory_extraction_run_dict(run)
+
+    def get_effective_conversation_context(
+        self, user_id: str, conversation_id: str
+    ) -> dict[str, Any]:
+        """Apply ordered conversation hints without mutating durable profile/memory."""
+
+        persisted_profile = self.get_profile(user_id) or {}
+        effective_profile = dict(persisted_profile)
+        flexible: dict[str, list[str]] = {}
+        list_fields = {"skills", "projects", "experience", "education"}
+        for signal in self.list_conversation_memory_signals(user_id, conversation_id):
+            signal_type = signal["type"]
+            operation = signal["operation_hint"]
+            values = list(signal["value_hint"])
+            if signal_type.startswith("profile."):
+                field = signal_type.split(".", 1)[1]
+                if field in list_fields:
+                    current = list(effective_profile.get(field) or [])
+                    if operation == "replace":
+                        current = values
+                    elif operation == "remove":
+                        removed = {value.casefold() for value in values}
+                        current = [
+                            item for item in current
+                            if str(item).casefold() not in removed
+                        ]
+                    else:
+                        existing = {str(item).casefold() for item in current}
+                        current.extend(value for value in values if value.casefold() not in existing)
+                    effective_profile[field] = current
+                elif operation == "remove":
+                    effective_profile[field] = None
+                elif values:
+                    value: Any = values[-1]
+                    if field == "graduation_year" and str(value).isdigit():
+                        value = int(value)
+                    effective_profile[field] = value
+            elif signal_type.startswith("memory."):
+                current = list(flexible.get(signal_type) or [])
+                if operation == "replace":
+                    current = values
+                elif operation == "remove":
+                    removed = {value.casefold() for value in values}
+                    current = [value for value in current if value.casefold() not in removed]
+                else:
+                    current.extend(value for value in values if value.casefold() not in {item.casefold() for item in current})
+                flexible[signal_type] = current
+        return {
+            "persisted_profile": persisted_profile,
+            "effective_profile": effective_profile,
+            "current_thread_memories": flexible,
+            "signals": self.list_conversation_memory_signals(user_id, conversation_id),
+        }
 
     # ------------------------------------------------------------- starred Q&A
     def star_qa_pair(
@@ -799,8 +1555,8 @@ class ProfileRepository(AgentRepositoryMixin):
             )
 
     @staticmethod
-    def _comparable_profile(profile: dict[str, Any]) -> dict[str, Any]:
-        keys = (
+    def _profile_field_keys() -> tuple[str, ...]:
+        return (
             "name",
             "email",
             "education",
@@ -820,6 +1576,14 @@ class ProfileRepository(AgentRepositoryMixin):
             "work_authorization",
             "remote_preference",
         )
+
+    @staticmethod
+    def _profile_value_identity(value: Any) -> str:
+        return json.dumps(value, sort_keys=True, ensure_ascii=False, default=str)
+
+    @staticmethod
+    def _comparable_profile(profile: dict[str, Any]) -> dict[str, Any]:
+        keys = ProfileRepository._profile_field_keys()
         return {key: profile.get(key) for key in keys}
 
     @classmethod
@@ -900,6 +1664,38 @@ class ProfileRepository(AgentRepositoryMixin):
             "updated_at": user.updated_at.isoformat(),
         }
 
+    @staticmethod
+    def _conversation_memory_signal_dict(
+        item: ConversationMemorySignal,
+    ) -> dict[str, Any]:
+        return {
+            "signal_id": item.signal_id,
+            "user_id": item.user_id,
+            "conversation_id": item.conversation_id,
+            "source_message_id": item.source_message_id,
+            "signal_index": item.signal_index,
+            "type": item.signal_type,
+            "operation_hint": item.operation_hint,
+            "value_hint": list(item.value_hint or []),
+            "created_at": item.created_at.isoformat(),
+        }
+
+    @staticmethod
+    def _conversation_memory_state_dict(
+        item: ConversationMemoryState,
+    ) -> dict[str, Any]:
+        return {
+            "user_id": item.user_id,
+            "conversation_id": item.conversation_id,
+            "last_memory_extraction_message_id": item.last_memory_extraction_message_id,
+            "pending_boundary_message_id": item.pending_boundary_message_id,
+            "pending": item.pending,
+            "processing": item.processing,
+            "lease_expires_at": item.lease_expires_at.isoformat() if item.lease_expires_at else None,
+            "created_at": item.created_at.isoformat(),
+            "updated_at": item.updated_at.isoformat(),
+        }
+
     @classmethod
     def _profile_dict(cls, user: User) -> dict[str, Any]:
         profile = user.profile
@@ -912,6 +1708,10 @@ class ProfileRepository(AgentRepositoryMixin):
                     "profile_version": profile.current_version.version_number,
                     "profile_version_id": profile.current_version.version_id,
                     "updated_at": profile.current_version.created_at.isoformat(),
+                    "retrieval_index_status": (
+                        profile.current_version.retrieval_index_status
+                    ),
+                    "retrieval_index_error": profile.current_version.retrieval_index_error,
                     "source_documents": [
                         cls._document_dict(item.document)
                         for item in profile.current_version.document_sources
@@ -990,6 +1790,26 @@ class ProfileRepository(AgentRepositoryMixin):
                 cls._document_dict(item.document)
                 for item in version.document_sources
             ],
+            "retrieval_index_status": version.retrieval_index_status,
+            "retrieval_index_error": version.retrieval_index_error,
+        }
+
+    @staticmethod
+    def _profile_field_revision_dict(
+        revision: ProfileFieldRevision,
+    ) -> dict[str, Any]:
+        return {
+            "revision_id": revision.revision_id,
+            "user_id": revision.user_id,
+            "field_key": revision.field_key,
+            "operation": revision.operation,
+            "previous_value": revision.previous_value,
+            "new_value": revision.new_value,
+            "source_type": revision.source_type,
+            "source_conversation_id": revision.source_conversation_id,
+            "source_message_ids": list(revision.source_message_ids or []),
+            "resulting_profile_version_id": revision.resulting_profile_version_id,
+            "created_at": revision.created_at.isoformat(),
         }
 
     @staticmethod
@@ -1043,6 +1863,13 @@ class ProfileRepository(AgentRepositoryMixin):
             "content": item.content,
             "confidence": item.confidence,
             "source": item.source,
+            "operation": item.operation,
+            "existing_memory_id": item.existing_memory_id,
+            "source_conversation_id": item.source_conversation_id,
+            "source_message_ids": list(item.source_message_ids or []),
+            "extraction_run_id": item.extraction_run_id,
+            "event_time": item.event_time.isoformat() if item.event_time else None,
+            "raw_temporal_expression": item.raw_temporal_expression,
             "status": item.status,
             "created_at": item.created_at.isoformat(),
             "reviewed_at": item.reviewed_at.isoformat()
@@ -1059,8 +1886,65 @@ class ProfileRepository(AgentRepositoryMixin):
             "content": item.content,
             "confidence": item.confidence,
             "source": item.source,
+            "active": item.active,
+            "supersedes_memory_id": item.supersedes_memory_id,
+            "revoked_at": item.revoked_at.isoformat() if item.revoked_at else None,
+            "event_time": item.event_time.isoformat() if item.event_time else None,
+            "source_conversation_id": item.source_conversation_id,
+            "source_message_ids": list(item.source_message_ids or []),
+            "retrieval_index_status": item.retrieval_index_status,
+            "retrieval_index_error": item.retrieval_index_error,
             "created_at": item.created_at.isoformat(),
         }
+
+    @staticmethod
+    def _memory_extraction_run_dict(item: MemoryExtractionRun) -> dict[str, Any]:
+        return {
+            "extraction_run_id": item.extraction_run_id,
+            "user_id": item.user_id,
+            "conversation_id": item.conversation_id,
+            "start_watermark_message_id": item.start_watermark_message_id,
+            "end_boundary_message_id": item.end_boundary_message_id,
+            "status": item.status,
+            "attempt": item.attempt,
+            "input_mode": item.input_mode,
+            "input_token_count": item.input_token_count,
+            "error_summary": item.error_summary,
+            "created_at": item.created_at.isoformat(),
+            "completed_at": item.completed_at.isoformat() if item.completed_at else None,
+        }
+
+    @classmethod
+    def _profile_revision_draft_dict(cls, item: ProfileRevisionDraft) -> dict[str, Any]:
+        return {
+            "draft_id": item.draft_id,
+            "user_id": item.user_id,
+            "source_type": item.source_type,
+            "source_conversation_id": item.source_conversation_id,
+            "source_message_ids": list(item.source_message_ids or []),
+            "status": item.status,
+            "created_at": item.created_at.isoformat(),
+            "applied_at": item.applied_at.isoformat() if item.applied_at else None,
+            "changes": [cls._profile_revision_change_dict(change) for change in item.changes],
+        }
+
+    @staticmethod
+    def _profile_revision_change_dict(item: ProfileRevisionChange) -> dict[str, Any]:
+        return {
+            "change_id": item.change_id,
+            "draft_id": item.draft_id,
+            "field_key": item.field_key,
+            "operation": item.operation,
+            "before_value": item.before_value,
+            "proposed_value": item.proposed_value,
+            "status": item.status,
+            "source": dict(item.source_json or {}),
+            "created_at": item.created_at.isoformat(),
+        }
+
+    @staticmethod
+    def _stable_json(value: Any) -> str:
+        return json.dumps(value, sort_keys=True, ensure_ascii=False, default=str)
 
     @staticmethod
     def _conversation_dict(item: Conversation) -> dict[str, Any]:

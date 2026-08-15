@@ -15,40 +15,88 @@ depends_on = None
 
 
 def upgrade() -> None:
-    inspector = sa.inspect(op.get_bind())
+    bind = op.get_bind()
+    inspector = sa.inspect(bind)
+    sqlite = bind.dialect.name == "sqlite"
     message_columns = {item["name"] for item in inspector.get_columns("messages")}
-    if "reply_to_message_id" not in message_columns:
-        op.add_column(
-            "messages",
-            sa.Column(
-                "reply_to_message_id",
-                sa.String(36),
-                sa.ForeignKey("messages.message_id", ondelete="SET NULL"),
-                nullable=True,
-            ),
-        )
-        op.create_index(
-            "ix_messages_reply_to_message_id", "messages", ["reply_to_message_id"]
-        )
-
-    run_columns = {item["name"] for item in inspector.get_columns("agent_runs")}
-    for name in ("user_message_id", "assistant_message_id"):
-        if name not in run_columns:
+    message_indexes = {item["name"] for item in inspector.get_indexes("messages")}
+    message_foreign_columns = {
+        tuple(item.get("constrained_columns") or ())
+        for item in inspector.get_foreign_keys("messages")
+    }
+    if sqlite:
+        with op.batch_alter_table("messages") as batch:
+            if "reply_to_message_id" not in message_columns:
+                batch.add_column(sa.Column("reply_to_message_id", sa.String(36), nullable=True))
+            if ("reply_to_message_id",) not in message_foreign_columns:
+                batch.create_foreign_key(
+                    "fk_messages_reply_to_message_id",
+                    "messages",
+                    ["reply_to_message_id"],
+                    ["message_id"],
+                    ondelete="SET NULL",
+                )
+            if "ix_messages_reply_to_message_id" not in message_indexes:
+                batch.create_index("ix_messages_reply_to_message_id", ["reply_to_message_id"])
+    else:
+        if "reply_to_message_id" not in message_columns:
             op.add_column(
-                "agent_runs",
+                "messages",
                 sa.Column(
-                    name,
+                    "reply_to_message_id",
                     sa.String(36),
                     sa.ForeignKey("messages.message_id", ondelete="SET NULL"),
                     nullable=True,
                 ),
             )
-            op.create_index(f"ix_agent_runs_{name}", "agent_runs", [name])
-    if "state_json" not in run_columns:
-        op.add_column(
-            "agent_runs",
-            sa.Column("state_json", sa.JSON(), nullable=False, server_default="{}"),
-        )
+        if "ix_messages_reply_to_message_id" not in message_indexes:
+            op.create_index("ix_messages_reply_to_message_id", "messages", ["reply_to_message_id"])
+
+    inspector = sa.inspect(bind)
+    run_columns = {item["name"] for item in inspector.get_columns("agent_runs")}
+    run_indexes = {item["name"] for item in inspector.get_indexes("agent_runs")}
+    run_foreign_columns = {
+        tuple(item.get("constrained_columns") or ())
+        for item in inspector.get_foreign_keys("agent_runs")
+    }
+    if sqlite:
+        with op.batch_alter_table("agent_runs") as batch:
+            for name in ("user_message_id", "assistant_message_id"):
+                if name not in run_columns:
+                    batch.add_column(sa.Column(name, sa.String(36), nullable=True))
+                if (name,) not in run_foreign_columns:
+                    batch.create_foreign_key(
+                        f"fk_agent_runs_{name}",
+                        "messages",
+                        [name],
+                        ["message_id"],
+                        ondelete="SET NULL",
+                    )
+                if f"ix_agent_runs_{name}" not in run_indexes:
+                    batch.create_index(f"ix_agent_runs_{name}", [name])
+            if "state_json" not in run_columns:
+                batch.add_column(
+                    sa.Column("state_json", sa.JSON(), nullable=False, server_default="{}")
+                )
+    else:
+        for name in ("user_message_id", "assistant_message_id"):
+            if name not in run_columns:
+                op.add_column(
+                    "agent_runs",
+                    sa.Column(
+                        name,
+                        sa.String(36),
+                        sa.ForeignKey("messages.message_id", ondelete="SET NULL"),
+                        nullable=True,
+                    ),
+                )
+            if f"ix_agent_runs_{name}" not in run_indexes:
+                op.create_index(f"ix_agent_runs_{name}", "agent_runs", [name])
+        if "state_json" not in run_columns:
+            op.add_column(
+                "agent_runs",
+                sa.Column("state_json", sa.JSON(), nullable=False, server_default="{}"),
+            )
 
     if "starred_qa_pairs" not in set(inspector.get_table_names()):
         op.create_table(

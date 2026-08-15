@@ -74,7 +74,14 @@ Classify the user's latest request into exactly one supported CareerIntent.
 Use conversation history only to resolve references and follow-ups. Do not plan
 the workflow, call tools, infer missing entities, or change profile data. Set
 needs_user_input only when one concise clarification is required to select or
-continue a workflow. Return only the requested structured decision."""
+continue a workflow. In the same structured response, mark memory_worthy and
+return memory_signals only for durable information the user explicitly states.
+Use only the supported namespaced profile.* and memory.* signal types. A normal
+task such as "find internships" is not memory-worthy. A mixed request such as
+"I prefer smaller AI startups; find internships" remains job_search and also
+emits memory.preference. value_hint must contain only short explicit values;
+operation_hint is add, replace, or remove. Never infer a profile fact or update
+durable memory. Return only the requested structured decision."""
 
 
 def build_system_prompt(skill_catalog: str) -> str:

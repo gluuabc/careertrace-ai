@@ -70,11 +70,17 @@ class JobSearchTests(unittest.TestCase):
             first = service.search(user_id=user["user_id"], run_id=run["run_id"], request=JobSearchRequest(target_roles=["Engineer"], profile_skills=["Python"], desired_job_skills=["SQL"], requested_count=12, max_results=20, page_size=10), source_call_budget=2)
             second = service.search(user_id=user["user_id"], run_id=run["run_id"], request=JobSearchRequest(target_roles=["Engineer"], profile_skills=["Python"], desired_job_skills=["SQL"], requested_count=12, max_results=20, page_size=10, cursor="10"), source_call_budget=2)
         self.assertEqual(first.data["page"]["returned_count"], 10)
-        self.assertEqual(first.data["page"]["next_cursor"], "10")
+        self.assertIsNone(first.data["page"]["next_cursor"])
         self.assertTrue(all(len(item["description_excerpt"]) <= 300 for item in first.data["page"]["items"]))
-        self.assertEqual(second.data["page"]["returned_count"], 2)
+        self.assertEqual(second.data["page"]["returned_count"], 0)
         self.assertEqual(adapter.calls, 1)
         engine.dispose()
+
+    def test_legacy_result_limits_are_read_and_clamped_without_failure(self):
+        request = JobSearchRequest(requested_count=12, max_results=20, page_size=20)
+        self.assertEqual(request.requested_count, 10)
+        self.assertEqual(request.max_results, 10)
+        self.assertEqual(request.page_size, 10)
 
 
 if __name__ == "__main__":

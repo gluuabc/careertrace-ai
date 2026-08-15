@@ -15,6 +15,10 @@ def utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _bounded_env_int(name: str, default: int, maximum: int) -> int:
+    return max(1, min(int(os.getenv(name, str(default))), maximum))
+
+
 class CareerIntent(StrEnum):
     CONCISE_GUIDANCE = "concise_guidance"
     ACTION_PLAN = "action_plan"
@@ -26,11 +30,41 @@ class CareerIntent(StrEnum):
     UNSUPPORTED = "unsupported"
 
 
+class MemorySignal(BaseModel):
+    type: Literal[
+        "profile.school",
+        "profile.major",
+        "profile.graduation_year",
+        "profile.skills",
+        "profile.projects",
+        "profile.experience",
+        "profile.work_authorization",
+        "memory.preference",
+        "memory.goal",
+        "memory.constraint",
+        "memory.event",
+    ]
+    operation_hint: Literal["add", "replace", "remove"] = "add"
+    value_hint: list[str] = Field(default_factory=list)
+
+    @field_validator("value_hint")
+    @classmethod
+    def normalize_value_hint(cls, values: list[str]) -> list[str]:
+        return list(dict.fromkeys(str(value).strip() for value in values if str(value).strip()))
+
+
 class IntentDecision(BaseModel):
     intent: CareerIntent
     goal: str
     needs_user_input: bool = False
     clarification_question: str | None = None
+    memory_worthy: bool = False
+    memory_signals: list[MemorySignal] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def align_memory_worthy(self):
+        self.memory_worthy = bool(self.memory_signals)
+        return self
 
 
 class AgentTodoItem(BaseModel):
@@ -80,6 +114,20 @@ class RequirementState(StrEnum):
     UNKNOWN = "unknown"
 
 
+class SourceStatus(StrEnum):
+    OFFICIAL_SOURCE = "official_source"
+    VERIFIED_PUBLIC_SOURCE = "verified_public_source"
+    USER_PROVIDED = "user_provided"
+    DEMO_SNAPSHOT = "demo_snapshot"
+    UNVERIFIED_PUBLIC_SOURCE = "unverified_public_source"
+
+
+class RequirementStatus(StrEnum):
+    MATCHES = "matches"
+    REQUIREMENTS_NOT_FULLY_VERIFIED = "requirements_not_fully_verified"
+    CONFLICT = "conflict"
+
+
 class PeopleVerificationStatus(StrEnum):
     VERIFIED_PUBLIC = "verified_public"
     USER_PROVIDED_UNVERIFIED = "user_provided_unverified"
@@ -104,17 +152,17 @@ class JobSearchRequest(BaseModel):
     salary_preference: str | None = None
     hard_preference_fields: list[str] = Field(default_factory=list)
     requested_count: int = Field(
-        default_factory=lambda: int(os.getenv("JOB_SEARCH_DEFAULT_N", "5")),
+        default_factory=lambda: _bounded_env_int("JOB_SEARCH_DEFAULT_N", 5, 10),
         ge=1,
-        le=20,
+        le=10,
     )
     max_results: int = Field(
-        default_factory=lambda: int(os.getenv("JOB_SEARCH_MAX_RESULTS", "20")),
+        default_factory=lambda: _bounded_env_int("JOB_SEARCH_MAX_RESULTS", 10, 10),
         ge=1,
-        le=20,
+        le=10,
     )
     cursor: str | None = None
-    page_size: int = Field(default=10, ge=1, le=20)
+    page_size: int = Field(default=5, ge=1, le=10)
 
     @model_validator(mode="before")
     @classmethod
@@ -128,6 +176,9 @@ class JobSearchRequest(BaseModel):
         migrated["desired_job_skills"] = list(
             dict.fromkeys([*(migrated.get("desired_job_skills") or []), *legacy])
         )
+        for field in ("requested_count", "max_results", "page_size"):
+            if field in migrated:
+                migrated[field] = min(max(int(migrated[field]), 1), 10)
         return migrated
 
     @field_validator("hard_preference_fields")
@@ -174,6 +225,11 @@ class JobCandidate(BaseModel):
     job_required_skills: list[str] = Field(default_factory=list)
     job_preferred_skills: list[str] = Field(default_factory=list)
     ranking_components: dict[str, Any] = Field(default_factory=dict)
+    source_status: SourceStatus = SourceStatus.UNVERIFIED_PUBLIC_SOURCE
+    requirement_status: RequirementStatus = RequirementStatus.REQUIREMENTS_NOT_FULLY_VERIFIED
+    is_demo_sample: bool = False
+    snapshot_date: str | None = None
+    source_verified_at_snapshot: bool | None = None
     verification_status: Literal["verified", "requirements_not_fully_verified", "conflict"] = "requirements_not_fully_verified"
 
 
@@ -195,9 +251,21 @@ class PeopleSearchRequest(BaseModel):
     school: str | None = None
     research_topics: list[str] = Field(default_factory=list)
     role_keywords: list[str] = Field(default_factory=list)
-    requested_count: int = Field(default=5, ge=1, le=20)
+    requested_count: int = Field(default=5, ge=1, le=10)
+    max_results: int = Field(default=10, ge=1, le=10)
     cursor: str | None = None
-    page_size: int = Field(default=10, ge=1, le=20)
+    page_size: int = Field(default=5, ge=1, le=10)
+
+    @model_validator(mode="before")
+    @classmethod
+    def clamp_legacy_result_limits(cls, value: Any) -> Any:
+        if not isinstance(value, dict):
+            return value
+        migrated = dict(value)
+        for field in ("requested_count", "max_results", "page_size"):
+            if field in migrated:
+                migrated[field] = min(max(int(migrated[field]), 1), 10)
+        return migrated
 
 
 class ContactChannel(BaseModel):
@@ -235,6 +303,10 @@ class PeopleCandidate(BaseModel):
     identity_confidence: Literal["verified", "unverified", "unknown"] = "unknown"
     source_trust: dict[str, Any] = Field(default_factory=dict)
     ranking_components: dict[str, Any] = Field(default_factory=dict)
+    source_status: SourceStatus = SourceStatus.UNVERIFIED_PUBLIC_SOURCE
+    is_demo_sample: bool = False
+    snapshot_date: str | None = None
+    source_verified_at_snapshot: bool | None = None
 
 
 class PeopleSearchSufficiency(BaseModel):
@@ -379,9 +451,13 @@ class CareerAgentState(TypedDict, total=False):
     status: dict[str, Any]
     runtime_context: str
     routing_source: str
+    memory_worthy: bool
+    memory_signals: list[dict[str, Any]]
+    effective_profile: dict[str, Any]
     user_message_id: str
     stop_after_tools: bool
     partial_result: bool
+    personalization_references: dict[str, list[dict[str, Any]]]
 
 
 def validate_todos(items: list[AgentTodoItem]) -> list[AgentTodoItem]:

@@ -19,6 +19,7 @@ from app.database.models import (
     ResumeRevisionChange,
     ResumeRevisionDraft,
     SearchSession,
+    SearchPhaseMetric,
     SearchSourceProgress,
     UserConnection,
 )
@@ -51,9 +52,50 @@ class AgentRepositoryMixin:
             ).order_by(ModelCallMetric.created_at)).all()
             return [self._model_metric_dict(item) for item in items]
 
+    def create_search_phase_metric(
+        self, user_id: str, **values: Any
+    ) -> dict[str, Any]:
+        allowed = {column.name for column in SearchPhaseMetric.__table__.columns} - {
+            "search_phase_metric_id", "user_id", "created_at"
+        }
+        unknown = set(values) - allowed
+        if unknown:
+            raise ValueError(f"Unsupported search metric fields: {sorted(unknown)}")
+        # Metadata must stay bounded and must never contain source/private text.
+        metadata = dict(values.get("metadata_json") or {})
+        if set(metadata) - {"provider_count", "shortlist_count", "display_count"}:
+            raise ValueError("Search metric metadata contains unsupported fields.")
+        values["metadata_json"] = metadata
+        with session_scope(self.session_factory) as session:
+            user = self._require_user(session, user_id)
+            item = SearchPhaseMetric(user=user, **values)
+            session.add(item)
+            session.flush()
+            return self._search_phase_metric_dict(item)
+
+    def list_search_phase_metrics(
+        self, user_id: str, run_id: str | None = None
+    ) -> list[dict[str, Any]]:
+        with session_scope(self.session_factory) as session:
+            self._require_user(session, user_id)
+            query = select(SearchPhaseMetric).where(
+                SearchPhaseMetric.user_id == user_id
+            )
+            if run_id is not None:
+                query = query.where(SearchPhaseMetric.run_id == run_id)
+            items = session.scalars(query.order_by(SearchPhaseMetric.created_at)).all()
+            return [self._search_phase_metric_dict(item) for item in items]
+
     @staticmethod
     def _model_metric_dict(item: ModelCallMetric) -> dict[str, Any]:
         return {column.name: getattr(item, column.name) for column in ModelCallMetric.__table__.columns}
+
+    @staticmethod
+    def _search_phase_metric_dict(item: SearchPhaseMetric) -> dict[str, Any]:
+        return {
+            column.name: getattr(item, column.name)
+            for column in SearchPhaseMetric.__table__.columns
+        }
 
     def get_or_create_search_session(
         self,
