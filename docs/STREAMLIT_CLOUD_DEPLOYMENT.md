@@ -14,6 +14,12 @@ Local `.env` is private developer configuration and is ignored by Git.
 `.env.example` is the public configuration contract and contains no secrets.
 Streamlit Cloud **Secrets** is the deployment-only store for completed values.
 
+## Database migration prerequisite
+
+**PASS — 2026-08-15.** The fresh persistent Cockroach database `careertrace`
+was upgraded successfully through every Alembic revision. `alembic current`
+reported `20260815_16 (head)` before the deployment checkpoint continued.
+
 ## Before opening Streamlit Cloud
 
 1. Provision a persistent Cockroach application database. Do not use the
