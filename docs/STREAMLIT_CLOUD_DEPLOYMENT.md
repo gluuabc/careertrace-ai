@@ -29,7 +29,12 @@ Streamlit Cloud **Secrets** is the deployment-only store for completed values.
    checks migration state on startup; it must not use a local SQLite database.
 4. Confirm the S3 application identity has only the documented object actions
    for `careertrace-resumes`.
-5. Prepare a private completed copy of
+5. Copy the Cockroach CA certificate PEM into `COCKROACH_CA_CERT`. At runtime,
+   CareerTrace writes it to `/tmp/careertrace-cockroach-ca.crt` with restrictive
+   permissions and injects that path as `sslrootcert` while retaining
+   `sslmode=verify-full`. The same resolved URL is used by SQLAlchemy and the
+   CockroachDBSaver. Certificate contents are never logged.
+6. Prepare a private completed copy of
    `docs/streamlit-secrets.example.toml`. Do not save that completed file in the
    repository. Do not copy a machine-local `sslrootcert=/Users/...` parameter
    into the cloud `DATABASE_URL`.
@@ -55,7 +60,9 @@ local SQLite URL, a recovery code, or a local certificate path.
 
 ## Required deployment secrets
 
-- Persistent application `DATABASE_URL` using `cockroachdb://`.
+- Persistent application `DATABASE_URL` using `cockroachdb://` and
+  `sslmode=verify-full`.
+- Multiline `COCKROACH_CA_CERT` containing the Cockroach CA certificate PEM.
 - `LANGGRAPH_CHECKPOINT_BACKEND="cockroachdb"` and checkpoint schema.
 - Server-side AWS credential-chain values, region, Bedrock generation/token/
   embedding models, and private S3 bucket.

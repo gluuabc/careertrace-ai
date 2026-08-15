@@ -653,6 +653,8 @@ LANGSMITH_PROJECT=CareerTrace
 
 # Local SQL memory
 DATABASE_URL=sqlite:///data/careertrace.db
+# Optional PEM text for deployed Cockroach TLS; leave blank for local SQLite.
+COCKROACH_CA_CERT=
 LANGGRAPH_CHECKPOINT_BACKEND=sqlite
 LANGGRAPH_CHECKPOINT_DB=data/langgraph_checkpoints.sqlite
 LANGGRAPH_CHECKPOINT_SCHEMA=careertrace_checkpoints
@@ -705,6 +707,7 @@ application SQL and workflow recovery must use CockroachDB:
 
 ```env
 DATABASE_URL=cockroachdb://<application-user>:<password>@<host>:26257/<database>?sslmode=verify-full
+COCKROACH_CA_CERT=<multiline-Cockroach-CA-PEM>
 LANGGRAPH_CHECKPOINT_BACKEND=cockroachdb
 LANGGRAPH_CHECKPOINT_SCHEMA=careertrace_checkpoints
 ```
@@ -713,6 +716,12 @@ The checkpoint schema is created automatically and managed by
 `CockroachDBSaver`. The same Profile graph is compiled in both modes. See
 [the compatibility record](docs/CHECKPOINT_COMPATIBILITY.md), including why the
 generic Postgres saver is not used.
+
+In hosted environments, `COCKROACH_CA_CERT` is materialized as a private
+runtime file and injected into the shared resolved database URL as
+`sslrootcert`. This keeps `sslmode=verify-full` portable without putting a
+machine-local certificate path in deployment configuration. SQLAlchemy,
+Alembic, setup checks, and the CockroachDBSaver all use this resolver.
 
 Register the exact `OAUTH_REDIRECT_URI` as an authorized redirect URI in the
 Google OAuth client. Generate a cookie secret with:

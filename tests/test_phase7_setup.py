@@ -67,6 +67,7 @@ def test_no_secret_values_exist_in_public_configuration():
         "TAVILY_API_KEY",
         "COCKROACH_CLOUD_MCP_API_KEY",
         "COCKROACH_TEST_DATABASE_URL",
+        "COCKROACH_CA_CERT",
     }
     assert all(example[name] == "" for name in secret_names)
     assert not (PROJECT_ROOT / ".env").read_text(errors="ignore") in (
@@ -95,6 +96,29 @@ def test_deployed_configuration_requires_cockroach_for_data_and_checkpoints():
     assert failed_names == {"application database", "checkpoint backend"}
 
 
+def test_deployed_cockroach_requires_verify_full_and_portable_ca():
+    environment = _valid_environment()
+    environment.update(
+        {
+            "DATABASE_URL": (
+                "cockroachdb://user:password@example.test/db?sslmode=verify-full"
+            ),
+            "LANGGRAPH_CHECKPOINT_BACKEND": "cockroachdb",
+        }
+    )
+    checks_without_ca = configuration_checks(environment, mode="deployed")
+    assert "Cockroach TLS" in {
+        check.name for check in checks_without_ca if check.failed
+    }
+
+    environment["COCKROACH_CA_CERT"] = "synthetic PEM configured"
+    checks_with_ca = configuration_checks(environment, mode="deployed")
+    assert not [check for check in checks_with_ca if check.failed]
+    assert not any(
+        environment["COCKROACH_CA_CERT"] in check.detail for check in checks_with_ca
+    )
+
+
 def test_checkpoint_dependency_is_cockroach_specific_not_generic_postgres():
     requirements = (PROJECT_ROOT / "requirements.txt").read_text()
     assert "langchain-cockroachdb==0.2.1" in requirements
@@ -119,6 +143,7 @@ def test_streamlit_cloud_template_uses_deployed_persistence_without_test_secrets
     template = tomllib.loads(template_path.read_text())
     assert template["DATABASE_URL"].startswith("cockroachdb://")
     assert template["LANGGRAPH_CHECKPOINT_BACKEND"] == "cockroachdb"
+    assert "-----BEGIN CERTIFICATE-----" in template["COCKROACH_CA_CERT"]
     assert template["BEDROCK_MODEL_REASONING"] == "global.anthropic.claude-sonnet-4-6"
     assert template["JUDGE_DEMO_ENABLED"] == "true"
     assert template["PLAYWRIGHT_ENABLED"] == "false"

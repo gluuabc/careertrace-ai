@@ -16,6 +16,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from dotenv import load_dotenv
+from sqlalchemy.engine import make_url
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -81,6 +82,47 @@ def configuration_checks(
     elif database_url:
         scheme = database_url.split(":", 1)[0]
         checks.append(Check("application database", "PASS", f"configured scheme: {scheme}"))
+
+    if mode == "deployed" and database_url.startswith("cockroachdb"):
+        try:
+            parsed_database_url = make_url(env["DATABASE_URL"].strip())
+            sslmode = str(parsed_database_url.query.get("sslmode", "")).casefold()
+            sslrootcert = str(parsed_database_url.query.get("sslrootcert", "")).strip()
+            ca_configured = bool(env.get("COCKROACH_CA_CERT", "").strip())
+            if sslmode != "verify-full":
+                checks.append(
+                    Check(
+                        "Cockroach TLS",
+                        "FAIL",
+                        "deployed mode requires sslmode=verify-full",
+                    )
+                )
+            elif ca_configured:
+                checks.append(
+                    Check(
+                        "Cockroach TLS",
+                        "PASS",
+                        "verify-full with deployment CA certificate",
+                    )
+                )
+            elif not sslrootcert or sslrootcert.startswith(("/Users/", "/home/", "~")):
+                checks.append(
+                    Check(
+                        "Cockroach TLS",
+                        "FAIL",
+                        "configure COCKROACH_CA_CERT or a deployment-accessible sslrootcert",
+                    )
+                )
+            else:
+                checks.append(
+                    Check(
+                        "Cockroach TLS",
+                        "PASS",
+                        "verify-full with deployment-accessible sslrootcert",
+                    )
+                )
+        except Exception:
+            checks.append(Check("Cockroach TLS", "FAIL", "invalid DATABASE_URL"))
 
     google = all(
         env.get(name, "").strip()

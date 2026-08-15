@@ -1,4 +1,5 @@
 import os
+import tempfile
 import threading
 from contextlib import contextmanager
 from pathlib import Path
@@ -15,7 +16,9 @@ load_dotenv()
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_DATABASE_URL = f"sqlite:///{PROJECT_ROOT / 'data' / 'careertrace.db'}"
+COCKROACH_CA_PATH = Path(tempfile.gettempdir()) / "careertrace-cockroach-ca.crt"
 _migration_lock = threading.Lock()
+_ca_materialization_lock = threading.Lock()
 T = TypeVar("T")
 
 
@@ -23,8 +26,45 @@ class Base(DeclarativeBase):
     """Base class shared by all SQLAlchemy models."""
 
 
+def materialize_cockroach_ca(
+    certificate: str,
+    destination: str | Path | None = None,
+) -> Path:
+    """Write a configured Cockroach CA PEM to a private runtime file."""
+
+    pem = certificate.strip()
+    if not (
+        pem.startswith("-----BEGIN CERTIFICATE-----")
+        and "-----END CERTIFICATE-----" in pem
+    ):
+        raise ValueError("COCKROACH_CA_CERT must contain a PEM certificate.")
+
+    target = Path(destination or COCKROACH_CA_PATH)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with _ca_materialization_lock:
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{target.name}.", dir=target.parent
+        )
+        temporary_path = Path(temporary_name)
+        try:
+            os.fchmod(descriptor, 0o600)
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                descriptor = -1
+                handle.write(pem + "\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary_path, target)
+            target.chmod(0o600)
+        except Exception:
+            if descriptor >= 0:
+                os.close(descriptor)
+            temporary_path.unlink(missing_ok=True)
+            raise
+    return target
+
+
 def resolve_database_url(database_url: str | None = None) -> str:
-    """Resolve relative SQLite files against the repository, not process CWD."""
+    """Resolve portable SQLite paths and optional Cockroach CA configuration."""
 
     raw_url = database_url or os.getenv("DATABASE_URL", DEFAULT_DATABASE_URL)
     parsed = make_url(raw_url)
@@ -38,6 +78,13 @@ def resolve_database_url(database_url: str | None = None) -> str:
             database_path = (PROJECT_ROOT / database_path).resolve()
         database_path.parent.mkdir(parents=True, exist_ok=True)
         return str(parsed.set(database=str(database_path)))
+    if parsed.drivername.startswith("cockroachdb"):
+        certificate = os.getenv("COCKROACH_CA_CERT", "").strip()
+        if certificate:
+            certificate_path = materialize_cockroach_ca(certificate)
+            return parsed.update_query_dict(
+                {"sslrootcert": str(certificate_path)}, append=False
+            ).render_as_string(hide_password=False)
     return raw_url
 
 
