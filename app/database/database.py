@@ -88,6 +88,12 @@ def resolve_database_url(database_url: str | None = None) -> str:
     return raw_url
 
 
+def escape_alembic_config_value(value: str) -> str:
+    """Escape percent signs only for Alembic's interpolating Config boundary."""
+
+    return value.replace("%", "%%")
+
+
 def create_database_engine(database_url: str | None = None) -> Engine:
     """Create a portable engine with SQLite behavior isolated here."""
 
@@ -141,7 +147,8 @@ def init_db(target_engine: Engine | None = None) -> None:
         config = Config(str(PROJECT_ROOT / "alembic.ini"))
         config.set_main_option("script_location", str(PROJECT_ROOT / "migrations"))
         config.set_main_option(
-            "sqlalchemy.url", resolve_database_url()
+            "sqlalchemy.url",
+            escape_alembic_config_value(resolve_database_url()),
         )
         command.upgrade(config, "head")
 
