@@ -183,3 +183,37 @@ def test_boundary_does_not_hijack_unrelated_intents(intent):
 
     assert bounded.intent == intent
     assert changed is False
+
+
+def test_incompatible_multi_action_request_requires_clarification(routing_context):
+    request = "Find internships and draft outreach to the recruiters."
+    decision = IntentDecision(intent=CareerIntent.JOB_SEARCH, goal=request)
+
+    _graph, _run, result = classify(routing_context, request, decision)
+
+    assert result["intent"] == CareerIntent.CLARIFICATION
+    assert result["needs_user_input"] is True
+    assert result["routing_source"] == "llm_boundary_override"
+    assert result["routing_diagnostics"]["validation_result"] == "overridden"
+    assert result["routing_diagnostics"]["escalated"] is False
+    assert result["routing_diagnostics"]["final_intent"] == "clarification"
+    assert set(result["routing_diagnostics"]) == {
+        "classifier_version",
+        "prompt_version",
+        "model_role",
+        "validation_result",
+        "escalated",
+        "final_intent",
+    }
+    assert request not in str(result["routing_diagnostics"])
+
+
+def test_vague_request_uses_deterministic_abstain_path(routing_context):
+    request = "Help me with my career."
+    decision = IntentDecision(intent=CareerIntent.CONCISE_GUIDANCE, goal=request)
+
+    _graph, _run, result = classify(routing_context, request, decision)
+
+    assert result["intent"] == CareerIntent.CLARIFICATION
+    assert result["needs_user_input"] is True
+    assert result["routing_diagnostics"]["validation_result"] == "overridden"

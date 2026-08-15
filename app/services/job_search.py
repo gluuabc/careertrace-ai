@@ -141,10 +141,25 @@ def apply_hard_filters(candidate: JobCandidate, request: JobSearchRequest) -> Jo
     if request.locations:
         if not candidate.location:
             set_state("location", RequirementState.UNKNOWN)
-        elif not any(_normalized(item) in _normalized(candidate.location) for item in request.locations):
-            set_state("location", RequirementState.CONFLICT)
         else:
-            set_state("location", RequirementState.MATCH)
+            location = _normalized(candidate.location)
+            if any(_normalized(item) in location for item in request.locations):
+                set_state("location", RequirementState.MATCH)
+            elif any(
+                term in location
+                for term in ("multiple locations", "various locations", "nationwide", "united states")
+            ):
+                set_state("location", RequirementState.UNKNOWN)
+            else:
+                set_state("location", RequirementState.CONFLICT)
+    requested_roles = _normalized(" ".join(request.target_roles))
+    candidate_title = _normalized(candidate.title)
+    junior_request = any(term in requested_roles for term in ("intern", "junior", "entry level", "new grad"))
+    senior_request = any(term in requested_roles for term in ("senior", "staff", "principal", "lead", "director"))
+    junior_candidate = any(term in candidate_title for term in ("intern", "junior", "entry level", "new grad"))
+    senior_candidate = any(term in candidate_title for term in ("senior", "staff", "principal", "lead", "director"))
+    if (junior_request and senior_candidate) or (senior_request and junior_candidate):
+        set_state("seniority", RequirementState.CONFLICT)
     if request.remote_preference and request.remote_preference.casefold() not in {"flexible", "any"}:
         preference = request.remote_preference.casefold()
         is_remote = "remote" in _normalized(candidate.location) or "remote" in haystack
@@ -192,10 +207,36 @@ def apply_hard_filters(candidate: JobCandidate, request: JobSearchRequest) -> Jo
             required = _normalized(request.work_authorization_requirement)
             if required in eligibility:
                 set_state("work_authorization", RequirementState.MATCH)
-            elif any(term in eligibility for term in ("sponsorship", "authorized to work", "citizen", "visa")):
-                set_state("work_authorization", RequirementState.CONFLICT)
             else:
-                set_state("work_authorization", RequirementState.UNKNOWN)
+                user_needs_sponsorship = (
+                    "require sponsorship" in required
+                    or "need sponsorship" in required
+                ) and "do not" not in required
+                user_does_not_need_sponsorship = any(
+                    term in required
+                    for term in ("do not require sponsorship", "no sponsorship", "authorized to work")
+                )
+                posting_denies_sponsorship = any(
+                    term in eligibility
+                    for term in ("no sponsorship", "not sponsor", "without sponsorship", "sponsorship is not available")
+                )
+                posting_requires_sponsorship = "sponsorship required" in eligibility
+                posting_offers_sponsorship = any(
+                    term in eligibility
+                    for term in ("sponsorship available", "sponsorship provided", "will sponsor")
+                )
+                if user_needs_sponsorship and posting_denies_sponsorship:
+                    set_state("work_authorization", RequirementState.CONFLICT)
+                elif user_needs_sponsorship and posting_offers_sponsorship:
+                    set_state("work_authorization", RequirementState.MATCH)
+                elif user_does_not_need_sponsorship and posting_requires_sponsorship:
+                    set_state("work_authorization", RequirementState.CONFLICT)
+                elif user_does_not_need_sponsorship and (
+                    "authorized to work" in eligibility or posting_denies_sponsorship
+                ):
+                    set_state("work_authorization", RequirementState.MATCH)
+                else:
+                    set_state("work_authorization", RequirementState.UNKNOWN)
     if "industries" in request.hard_preference_fields:
         if not request.industries:
             set_state("industries", RequirementState.UNKNOWN)

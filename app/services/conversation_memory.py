@@ -170,15 +170,10 @@ def _deterministic_proposals(payload: dict[str, Any]) -> list[ExtractedMemoryPro
 def _validated_extraction_proposals(
     payload: dict[str, Any], proposals: list[ExtractedMemoryProposal]
 ) -> list[ExtractedMemoryProposal]:
-    """Replace classifier goals with only deterministically supported goals."""
+    """Allow only proposals backed by recorded deterministic user signals."""
 
-    non_goals = [proposal for proposal in proposals if proposal.category != "goal"]
-    explicit_goals = [
-        proposal
-        for proposal in _deterministic_proposals(payload)
-        if proposal.category == "goal"
-    ]
-    return [*non_goals, *explicit_goals]
+    del proposals
+    return _deterministic_proposals(payload)
 
 
 class ConversationMemoryExtractor:

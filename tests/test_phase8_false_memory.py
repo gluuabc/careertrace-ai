@@ -41,6 +41,25 @@ class FalseGoalModel:
         )
 
 
+class UnsupportedProfileFactModel:
+    def with_structured_output(self, _schema):
+        return self
+
+    def invoke(self, _messages):
+        return MemoryExtractionOutput(
+            proposals=[
+                ExtractedMemoryProposal(
+                    destination="profile",
+                    category="profile_fact",
+                    field_key="school",
+                    operation="replace",
+                    values=["Example University"],
+                    source_message_ids=[],
+                )
+            ]
+        )
+
+
 @pytest.fixture
 def memory_workspace():
     engine = create_database_engine("sqlite://")
@@ -103,6 +122,20 @@ def test_classifier_proposed_goal_requires_deterministic_support():
     assert merge_memory_signals(classified, explicit) == explicit
 
 
+def test_classifier_proposed_non_goal_fact_requires_deterministic_support():
+    classified = [
+        MemorySignal(
+            type="profile.school",
+            operation_hint="replace",
+            value_hint=["Example University"],
+        )
+    ]
+
+    assert merge_memory_signals(classified, []) == []
+    explicit = detect_memory_signals("I attend Example University.")
+    assert merge_memory_signals(classified, explicit) == explicit
+
+
 def test_extractor_rejects_false_classifier_goal_for_advisory_question(
     memory_workspace,
 ):
@@ -122,6 +155,27 @@ def test_extractor_rejects_false_classifier_goal_for_advisory_question(
     ).extract(user["user_id"], conversation["conversation_id"])
 
     assert repository.list_memory_candidates(user["user_id"]) == []
+
+
+def test_extractor_rejects_unsupported_profile_fact_from_search_question(
+    memory_workspace,
+):
+    repository, user, conversation = memory_workspace
+    repository.add_message(
+        user["user_id"],
+        conversation["conversation_id"],
+        "user",
+        "Find alumni from Example University working in robotics.",
+    )
+    repository.mark_conversation_extraction_pending(
+        user["user_id"], conversation["conversation_id"]
+    )
+
+    ConversationMemoryExtractor(
+        repository, lambda _kind: UnsupportedProfileFactModel()
+    ).extract(user["user_id"], conversation["conversation_id"])
+
+    assert repository.list_profile_revision_drafts(user["user_id"]) == []
 
 
 def test_explicit_goal_survives_classifier_and_recovery_exactly_once(

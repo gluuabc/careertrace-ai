@@ -451,6 +451,7 @@ class CareerAgentState(TypedDict, total=False):
     status: dict[str, Any]
     runtime_context: str
     routing_source: str
+    routing_diagnostics: dict[str, Any]
     memory_worthy: bool
     memory_signals: list[dict[str, Any]]
     effective_profile: dict[str, Any]

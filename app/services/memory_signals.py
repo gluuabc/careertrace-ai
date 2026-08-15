@@ -66,16 +66,12 @@ def detect_memory_signals(text: str) -> list[MemorySignal]:
 def merge_memory_signals(
     classified: list[MemorySignal], explicit: list[MemorySignal]
 ) -> list[MemorySignal]:
-    """Keep classifier signals except goals lacking deterministic user evidence."""
+    """Permit durable signals only when deterministic user evidence supports them.
 
-    merged = [item for item in classified if item.type != "memory.goal"]
-    seen = {
-        (item.type, item.operation_hint, *item.value_hint)
-        for item in merged
-    }
-    for item in explicit:
-        key = (item.type, item.operation_hint, *item.value_hint)
-        if key not in seen:
-            seen.add(key)
-            merged.append(item)
-    return merged
+    The classifier remains useful for routing, but it cannot turn an unsupported
+    proposal into durable state. Missing an unusual phrasing is safer than saving
+    a question, hypothetical, or assistant suggestion as a user fact.
+    """
+
+    del classified
+    return list(explicit)

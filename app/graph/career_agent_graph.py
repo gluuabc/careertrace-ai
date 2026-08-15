@@ -14,6 +14,7 @@ from pydantic import BaseModel
 from app.database.repository import ProfileRepository, profile_repository
 from app.graph.checkpoint import get_default_checkpointer
 from app.llm.model import get_llm
+from app.prompts import ROUTING_CLASSIFIER_VERSION, ROUTING_PROMPT_VERSION
 from app.services.context_manager import ContextManager, context_manager
 from app.services.errors import safe_provider_message, sanitize_diagnostic
 from app.services.memory_signals import detect_memory_signals, merge_memory_signals
@@ -108,7 +109,50 @@ def _is_role_guidance_request(request: str) -> bool:
 def enforce_intent_boundaries(
     request: str, decision: IntentDecision
 ) -> tuple[IntentDecision, bool]:
-    """Prevent non-retrieval role discussion from entering source workflows."""
+    """Prevent uncertain or non-retrieval requests from entering source workflows."""
+
+    value = " ".join(request.casefold().split())
+    if re.fullmatch(
+        r"(?:please\s+)?(?:help|advise|guide)\s+me(?:\s+with|\s+on|\s+about)?\s+(?:my\s+)?career[.!?]?",
+        value,
+    ):
+        return decision.model_copy(
+            update={
+                "intent": CareerIntent.CLARIFICATION,
+                "needs_user_input": True,
+                "clarification_question": (
+                    "Would you like career guidance, a job search, resume help, or outreach help?"
+                ),
+            }
+        ), True
+    requested_actions = {
+        action
+        for action, patterns in {
+            CareerIntent.JOB_SEARCH: (
+                rf"\b(?:find|search|show|list|locate)\b.{{0,100}}\b{OPPORTUNITY_NOUNS}\b",
+            ),
+            CareerIntent.PEOPLE_SEARCH: (
+                r"\b(?:find|search|show|locate)\b.{0,100}\b(?:people|person|alumni|recruiters?|mentors?|professionals?)\b",
+            ),
+            CareerIntent.RESUME_REVISION: (
+                r"\b(?:edit|revise|rewrite|tailor|improve|update)\b.{0,80}\b(?:resume|cv)\b",
+            ),
+            CareerIntent.OUTREACH: (
+                r"\b(?:draft|write|compose|create)\b.{0,80}\b(?:message|email|outreach|note)\b",
+            ),
+        }.items()
+        if any(re.search(pattern, value) for pattern in patterns)
+    }
+    if len(requested_actions) > 1:
+        return decision.model_copy(
+            update={
+                "intent": CareerIntent.CLARIFICATION,
+                "needs_user_input": True,
+                "clarification_question": (
+                    "Which action should I handle first?"
+                ),
+            }
+        ), True
 
     if decision.intent != CareerIntent.JOB_SEARCH:
         return decision, False
@@ -353,6 +397,22 @@ class CareerAgentGraph:
             )
             if boundary_overrode:
                 routing_source = "llm_boundary_override"
+        routing_diagnostics = {
+            "classifier_version": ROUTING_CLASSIFIER_VERSION,
+            "prompt_version": ROUTING_PROMPT_VERSION,
+            "model_role": "cheap",
+            "validation_result": (
+                "deterministic_fallback"
+                if routing_source in {
+                    "deterministic_fallback", "clarification_after_failure"
+                }
+                else "overridden"
+                if routing_source == "llm_boundary_override"
+                else "accepted"
+            ),
+            "escalated": False,
+            "final_intent": decision.intent.value,
+        }
         decision.memory_signals = merge_memory_signals(
             decision.memory_signals, detect_memory_signals(request)
         )
@@ -376,7 +436,13 @@ class CareerAgentGraph:
         )
         TrajectoryRecorder(state["user_id"], state["run_id"], self.repository).step(
             "classify_intent",
-            f"Routed request to {decision.intent.value}; routing_source={routing_source}.",
+            (
+                f"Routed request to {decision.intent.value}; "
+                f"classifier_version={ROUTING_CLASSIFIER_VERSION}; "
+                f"prompt_version={ROUTING_PROMPT_VERSION}; "
+                f"validation={routing_diagnostics['validation_result']}; "
+                "escalated=false."
+            ),
         )
         return {
             "intent": decision.intent,
@@ -385,6 +451,7 @@ class CareerAgentGraph:
             "final_response": decision.clarification_question or "",
             "workflow_stage": "preparing_workflow",
             "routing_source": routing_source,
+            "routing_diagnostics": routing_diagnostics,
             "memory_worthy": decision.memory_worthy,
             "memory_signals": signal_payload,
             "warnings": warnings,
@@ -976,6 +1043,7 @@ class CareerAgentGraph:
                 ),
                 "source_call_count": state.get("total_source_calls", 0),
                 "personalization_references": state.get("personalization_references", {}),
+                "routing_diagnostics": state.get("routing_diagnostics", {}),
             },
         )
         TrajectoryRecorder(state["user_id"], state["run_id"], self.repository).step("finalize", "Prepared observable final response.", "failed" if failed else "completed")
