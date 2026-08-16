@@ -19,6 +19,7 @@ from app.database.models import (
     ResumeRevisionChange,
     ResumeRevisionDraft,
     SearchSession,
+    SearchPhaseMetric,
     SearchSourceProgress,
     UserConnection,
 )
@@ -51,9 +52,50 @@ class AgentRepositoryMixin:
             ).order_by(ModelCallMetric.created_at)).all()
             return [self._model_metric_dict(item) for item in items]
 
+    def create_search_phase_metric(
+        self, user_id: str, **values: Any
+    ) -> dict[str, Any]:
+        allowed = {column.name for column in SearchPhaseMetric.__table__.columns} - {
+            "search_phase_metric_id", "user_id", "created_at"
+        }
+        unknown = set(values) - allowed
+        if unknown:
+            raise ValueError(f"Unsupported search metric fields: {sorted(unknown)}")
+        # Metadata must stay bounded and must never contain source/private text.
+        metadata = dict(values.get("metadata_json") or {})
+        if set(metadata) - {"provider_count", "shortlist_count", "display_count"}:
+            raise ValueError("Search metric metadata contains unsupported fields.")
+        values["metadata_json"] = metadata
+        with session_scope(self.session_factory) as session:
+            user = self._require_user(session, user_id)
+            item = SearchPhaseMetric(user=user, **values)
+            session.add(item)
+            session.flush()
+            return self._search_phase_metric_dict(item)
+
+    def list_search_phase_metrics(
+        self, user_id: str, run_id: str | None = None
+    ) -> list[dict[str, Any]]:
+        with session_scope(self.session_factory) as session:
+            self._require_user(session, user_id)
+            query = select(SearchPhaseMetric).where(
+                SearchPhaseMetric.user_id == user_id
+            )
+            if run_id is not None:
+                query = query.where(SearchPhaseMetric.run_id == run_id)
+            items = session.scalars(query.order_by(SearchPhaseMetric.created_at)).all()
+            return [self._search_phase_metric_dict(item) for item in items]
+
     @staticmethod
     def _model_metric_dict(item: ModelCallMetric) -> dict[str, Any]:
         return {column.name: getattr(item, column.name) for column in ModelCallMetric.__table__.columns}
+
+    @staticmethod
+    def _search_phase_metric_dict(item: SearchPhaseMetric) -> dict[str, Any]:
+        return {
+            column.name: getattr(item, column.name)
+            for column in SearchPhaseMetric.__table__.columns
+        }
 
     def get_or_create_search_session(
         self,
@@ -372,6 +414,68 @@ class AgentRepositoryMixin:
                 .order_by(AgentRun.started_at.desc())
             ).all()
             return [self._agent_run_dict(run, include_children=True) for run in runs]
+
+    def get_latest_agent_display_result(
+        self, user_id: str, conversation_id: str
+    ) -> dict[str, Any] | None:
+        """Rehydrate one conversation's latest finalized display state from SQL."""
+
+        with session_scope(self.session_factory) as session:
+            self._owned_conversation(session, user_id, conversation_id)
+            run = session.scalar(
+                select(AgentRun)
+                .where(
+                    AgentRun.user_id == user_id,
+                    AgentRun.conversation_id == conversation_id,
+                    AgentRun.status.in_(("completed", "partial")),
+                )
+                .order_by(AgentRun.started_at.desc())
+            )
+            if run is None:
+                return None
+            state = dict(run.state_json or {})
+            result = {
+                "type": "final",
+                "user_id": user_id,
+                "conversation_id": conversation_id,
+                "run_id": run.run_id,
+                "workflow_stage": state.get("workflow_stage"),
+                "status": dict(state.get("status") or {}),
+                "todo_items": list(state.get("todo_items") or []),
+                "warnings": list(state.get("warnings") or []),
+                "candidate_count": int(state.get("candidate_count") or 0),
+                "verified_candidate_count": int(
+                    state.get("verified_candidate_count") or 0
+                ),
+                "unverified_candidate_count": int(
+                    state.get("unverified_candidate_count") or 0
+                ),
+                "source_call_count": int(state.get("source_call_count") or 0),
+                "personalization_references": dict(
+                    state.get("personalization_references") or {}
+                ),
+                "job_candidates": [],
+                "people_candidates": [],
+            }
+            search = session.scalar(
+                select(SearchSession)
+                .where(
+                    SearchSession.user_id == user_id,
+                    SearchSession.run_id == run.run_id,
+                )
+                .order_by(SearchSession.created_at.desc())
+            )
+            if search is not None:
+                key = (
+                    "job_candidates"
+                    if search.intent == "job_search"
+                    else "people_candidates"
+                    if search.intent == "people_search"
+                    else None
+                )
+                if key:
+                    result[key] = list(search.candidate_records or [])
+            return result
 
     def create_evidence(
         self,

@@ -77,6 +77,9 @@ class User(TimestampMixin, Base):
     profile_versions: Mapped[list["ProfileVersion"]] = relationship(
         back_populates="user", cascade="all, delete-orphan"
     )
+    profile_field_revisions: Mapped[list["ProfileFieldRevision"]] = relationship(
+        back_populates="user", cascade="all, delete-orphan"
+    )
     analysis_versions: Mapped[list["CareerAnalysisVersion"]] = relationship(
         back_populates="user", cascade="all, delete-orphan"
     )
@@ -87,6 +90,21 @@ class User(TimestampMixin, Base):
         back_populates="user", cascade="all, delete-orphan"
     )
     conversations: Mapped[list["Conversation"]] = relationship(
+        back_populates="user", cascade="all, delete-orphan"
+    )
+    conversation_memory_signals: Mapped[list["ConversationMemorySignal"]] = relationship(
+        back_populates="user", cascade="all, delete-orphan"
+    )
+    conversation_memory_states: Mapped[list["ConversationMemoryState"]] = relationship(
+        back_populates="user", cascade="all, delete-orphan"
+    )
+    memory_extraction_runs: Mapped[list["MemoryExtractionRun"]] = relationship(
+        back_populates="user", cascade="all, delete-orphan"
+    )
+    profile_revision_drafts: Mapped[list["ProfileRevisionDraft"]] = relationship(
+        back_populates="user", cascade="all, delete-orphan"
+    )
+    judge_workspace_credentials: Mapped[list["JudgeWorkspaceCredential"]] = relationship(
         back_populates="user", cascade="all, delete-orphan"
     )
     agent_runs: Mapped[list["AgentRun"]] = relationship(
@@ -119,6 +137,31 @@ class User(TimestampMixin, Base):
     model_call_metrics: Mapped[list["ModelCallMetric"]] = relationship(
         back_populates="user", cascade="all, delete-orphan"
     )
+    search_phase_metrics: Mapped[list["SearchPhaseMetric"]] = relationship(
+        back_populates="user", cascade="all, delete-orphan"
+    )
+
+
+class JudgeWorkspaceCredential(Base):
+    __tablename__ = "judge_workspace_credentials"
+
+    credential_id: Mapped[str] = mapped_column(
+        String(36), primary_key=True, default=_uuid
+    )
+    user_id: Mapped[str] = mapped_column(
+        ForeignKey("users.user_id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    recovery_code_hash: Mapped[str] = mapped_column(
+        String(64), unique=True, nullable=False, index=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utc_now, nullable=False, index=True
+    )
+    revoked_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
+
+    user: Mapped[User] = relationship(back_populates="judge_workspace_credentials")
 
 
 class Profile(TimestampMixin, Base):
@@ -248,6 +291,12 @@ class ProfileVersion(Base):
     )
     version_number: Mapped[int] = mapped_column(Integer, nullable=False)
     snapshot_data: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    retrieval_index_status: Mapped[str] = mapped_column(
+        String(30), default="pending", nullable=False, index=True
+    )
+    retrieval_index_error: Mapped[str | None] = mapped_column(
+        String(200), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utc_now, nullable=False, index=True
     )
@@ -257,6 +306,50 @@ class ProfileVersion(Base):
     )
     document_sources: Mapped[list["ProfileDocumentSource"]] = relationship(
         back_populates="profile_version", cascade="all, delete-orphan"
+    )
+    field_revisions: Mapped[list["ProfileFieldRevision"]] = relationship(
+        back_populates="resulting_profile_version", cascade="all, delete-orphan"
+    )
+
+
+class ProfileFieldRevision(Base):
+    """Field-scoped audit history for one internal profile snapshot mutation."""
+
+    __tablename__ = "profile_field_revisions"
+
+    revision_id: Mapped[str] = mapped_column(
+        String(36), primary_key=True, default=_uuid
+    )
+    user_id: Mapped[str] = mapped_column(
+        ForeignKey("users.user_id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    field_key: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
+    operation: Mapped[str] = mapped_column(String(30), nullable=False)
+    previous_value: Mapped[Any | None] = mapped_column(JSON, nullable=True)
+    new_value: Mapped[Any | None] = mapped_column(JSON, nullable=True)
+    source_type: Mapped[str] = mapped_column(String(30), nullable=False, index=True)
+    source_conversation_id: Mapped[str | None] = mapped_column(
+        ForeignKey("conversations.conversation_id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    source_message_ids: Mapped[list[str]] = mapped_column(
+        JSON, default=list, nullable=False
+    )
+    resulting_profile_version_id: Mapped[str] = mapped_column(
+        ForeignKey("profile_versions.version_id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utc_now, nullable=False, index=True
+    )
+
+    user: Mapped[User] = relationship(back_populates="profile_field_revisions")
+    resulting_profile_version: Mapped[ProfileVersion] = relationship(
+        back_populates="field_revisions"
     )
 
 
@@ -376,6 +469,17 @@ class MemoryCandidate(Base):
     content: Mapped[str] = mapped_column(Text, nullable=False)
     confidence: Mapped[float | None] = mapped_column(nullable=True)
     source: Mapped[str] = mapped_column(String(100), nullable=False)
+    operation: Mapped[str] = mapped_column(String(20), default="ADD", nullable=False, index=True)
+    existing_memory_id: Mapped[str | None] = mapped_column(
+        ForeignKey("memories.memory_id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    source_conversation_id: Mapped[str | None] = mapped_column(
+        ForeignKey("conversations.conversation_id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    source_message_ids: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
+    extraction_run_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    event_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    raw_temporal_expression: Mapped[str | None] = mapped_column(String(200), nullable=True)
     status: Mapped[str] = mapped_column(String(20), default="pending", nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utc_now, nullable=False, index=True
@@ -402,6 +506,20 @@ class Memory(Base):
     content: Mapped[str] = mapped_column(Text, nullable=False)
     confidence: Mapped[float | None] = mapped_column(nullable=True)
     source: Mapped[str] = mapped_column(String(100), nullable=False)
+    active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False, index=True)
+    supersedes_memory_id: Mapped[str | None] = mapped_column(
+        ForeignKey("memories.memory_id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    event_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    source_conversation_id: Mapped[str | None] = mapped_column(
+        ForeignKey("conversations.conversation_id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    source_message_ids: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
+    retrieval_index_status: Mapped[str] = mapped_column(
+        String(30), default="pending", nullable=False, index=True
+    )
+    retrieval_index_error: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utc_now, nullable=False, index=True
     )
@@ -432,6 +550,18 @@ class Conversation(TimestampMixin, Base):
     context_summaries: Mapped[list["ConversationContextSummary"]] = relationship(
         back_populates="conversation", cascade="all, delete-orphan"
     )
+    memory_signals: Mapped[list["ConversationMemorySignal"]] = relationship(
+        back_populates="conversation", cascade="all, delete-orphan"
+    )
+    memory_state: Mapped["ConversationMemoryState | None"] = relationship(
+        back_populates="conversation", cascade="all, delete-orphan", uselist=False
+    )
+    memory_extraction_runs: Mapped[list["MemoryExtractionRun"]] = relationship(
+        back_populates="conversation", cascade="all, delete-orphan"
+    )
+    profile_revision_drafts: Mapped[list["ProfileRevisionDraft"]] = relationship(
+        back_populates="conversation"
+    )
 
 
 class Message(Base):
@@ -460,6 +590,122 @@ class Message(Base):
     reply_to: Mapped["Message | None"] = relationship(
         remote_side=[message_id], foreign_keys=[reply_to_message_id]
     )
+
+
+class ConversationMemorySignal(Base):
+    """Conversation-scoped working signal; never a profile or approved memory write."""
+
+    __tablename__ = "conversation_memory_signals"
+    __table_args__ = (
+        UniqueConstraint(
+            "source_message_id", "signal_index", name="uq_conversation_signal_message_index"
+        ),
+    )
+
+    signal_id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    user_id: Mapped[str] = mapped_column(
+        ForeignKey("users.user_id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    conversation_id: Mapped[str] = mapped_column(
+        ForeignKey("conversations.conversation_id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    source_message_id: Mapped[str] = mapped_column(
+        ForeignKey("messages.message_id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    signal_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    signal_type: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
+    operation_hint: Mapped[str] = mapped_column(String(30), nullable=False)
+    value_hint: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utc_now, nullable=False, index=True
+    )
+
+    user: Mapped[User] = relationship(back_populates="conversation_memory_signals")
+    conversation: Mapped[Conversation] = relationship(back_populates="memory_signals")
+
+
+class ConversationMemoryState(TimestampMixin, Base):
+    __tablename__ = "conversation_memory_states"
+
+    conversation_id: Mapped[str] = mapped_column(
+        ForeignKey("conversations.conversation_id", ondelete="CASCADE"), primary_key=True
+    )
+    user_id: Mapped[str] = mapped_column(
+        ForeignKey("users.user_id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    last_memory_extraction_message_id: Mapped[str | None] = mapped_column(
+        ForeignKey("messages.message_id", ondelete="SET NULL"), nullable=True
+    )
+    pending_boundary_message_id: Mapped[str | None] = mapped_column(
+        ForeignKey("messages.message_id", ondelete="SET NULL"), nullable=True
+    )
+    pending: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False, index=True)
+    processing: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    user: Mapped[User] = relationship(back_populates="conversation_memory_states")
+    conversation: Mapped[Conversation] = relationship(back_populates="memory_state")
+
+
+class MemoryExtractionRun(Base):
+    __tablename__ = "memory_extraction_runs"
+    __table_args__ = (
+        UniqueConstraint(
+            "conversation_id",
+            "start_watermark_message_id",
+            "end_boundary_message_id",
+            name="uq_memory_extraction_segment",
+        ),
+    )
+
+    extraction_run_id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.user_id", ondelete="CASCADE"), nullable=False, index=True)
+    conversation_id: Mapped[str] = mapped_column(ForeignKey("conversations.conversation_id", ondelete="CASCADE"), nullable=False, index=True)
+    start_watermark_message_id: Mapped[str | None] = mapped_column(ForeignKey("messages.message_id", ondelete="SET NULL"), nullable=True)
+    end_boundary_message_id: Mapped[str] = mapped_column(ForeignKey("messages.message_id", ondelete="RESTRICT"), nullable=False, index=True)
+    status: Mapped[str] = mapped_column(String(30), default="pending", nullable=False, index=True)
+    attempt: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    input_mode: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    input_token_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    error_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utc_now, nullable=False, index=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    user: Mapped[User] = relationship(back_populates="memory_extraction_runs")
+    conversation: Mapped[Conversation] = relationship(back_populates="memory_extraction_runs")
+
+
+class ProfileRevisionDraft(Base):
+    __tablename__ = "profile_revision_drafts"
+
+    draft_id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.user_id", ondelete="CASCADE"), nullable=False, index=True)
+    source_type: Mapped[str] = mapped_column(String(50), nullable=False)
+    source_conversation_id: Mapped[str | None] = mapped_column(ForeignKey("conversations.conversation_id", ondelete="SET NULL"), nullable=True, index=True)
+    source_message_ids: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
+    status: Mapped[str] = mapped_column(String(30), default="pending", nullable=False, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utc_now, nullable=False, index=True)
+    applied_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    user: Mapped[User] = relationship(back_populates="profile_revision_drafts")
+    conversation: Mapped[Conversation | None] = relationship(back_populates="profile_revision_drafts")
+    changes: Mapped[list["ProfileRevisionChange"]] = relationship(back_populates="draft", cascade="all, delete-orphan")
+
+
+class ProfileRevisionChange(Base):
+    __tablename__ = "profile_revision_changes"
+
+    change_id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    draft_id: Mapped[str] = mapped_column(ForeignKey("profile_revision_drafts.draft_id", ondelete="CASCADE"), nullable=False, index=True)
+    field_key: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
+    operation: Mapped[str] = mapped_column(String(20), nullable=False)
+    before_value: Mapped[Any] = mapped_column(JSON, nullable=True)
+    proposed_value: Mapped[Any] = mapped_column(JSON, nullable=True)
+    status: Mapped[str] = mapped_column(String(30), default="pending", nullable=False, index=True)
+    source_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utc_now, nullable=False)
+
+    draft: Mapped[ProfileRevisionDraft] = relationship(back_populates="changes")
 
 
 class StarredQAPair(Base):
@@ -782,6 +1028,45 @@ class ModelCallMetric(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utc_now, nullable=False, index=True)
 
     user: Mapped[User] = relationship(back_populates="model_call_metrics")
+
+
+class SearchPhaseMetric(Base):
+    """Privacy-safe timing metadata for one internal search phase."""
+
+    __tablename__ = "search_phase_metrics"
+
+    search_phase_metric_id: Mapped[str] = mapped_column(
+        String(36), primary_key=True, default=_uuid
+    )
+    user_id: Mapped[str] = mapped_column(
+        ForeignKey("users.user_id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    run_id: Mapped[str | None] = mapped_column(
+        ForeignKey("agent_runs.run_id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    search_session_id: Mapped[str | None] = mapped_column(
+        ForeignKey("search_sessions.search_session_id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    phase: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
+    provider: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    duration_ms: Mapped[int] = mapped_column(Integer, nullable=False)
+    candidate_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    success: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    timed_out: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    embedding_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    embedding_cache_hit_count: Mapped[int] = mapped_column(
+        Integer, default=0, nullable=False
+    )
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(
+        JSON, default=dict, nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utc_now, nullable=False, index=True
+    )
+
+    user: Mapped[User] = relationship(back_populates="search_phase_metrics")
 
 
 class ConversationContextSummary(Base):

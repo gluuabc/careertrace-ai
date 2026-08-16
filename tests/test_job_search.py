@@ -44,6 +44,78 @@ class JobSearchTests(unittest.TestCase):
         )
         self.assertTrue(verified.hard_constraints_met)
 
+    def test_seniority_filter_is_plain_substring_match_not_semantic(self):
+        """Regression test for the seniority hard-filter substring bug.
+
+        Originally reproduced the bug: `apply_hard_filters` matched seniority
+        terms with unguarded substring containment (`"intern" in
+        candidate_title`), so "International Marketing Manager" was
+        misclassified as junior purely because "intern" is a substring of
+        "international" -- setting hard_requirement_states["seniority"] =
+        "conflict" and silently dropping the candidate. Now that the filter
+        uses word-boundary regex matching, this title must no longer conflict.
+        """
+        item = apply_hard_filters(
+            candidate(title="International Marketing Manager", eligibility="Open to all applicants."),
+            JobSearchRequest(target_roles=["Senior Product Manager"]),
+        )
+        self.assertNotEqual(item.hard_requirement_states.get("seniority"), "conflict")
+        self.assertNotIn("seniority", item.failed_hard_constraints)
+
+    def test_seniority_filter_does_not_false_positive_without_substring_collision(self):
+        """Control case: genuine junior/senior mismatches must still conflict.
+
+        This was already true before the fix (it isn't itself a repro of the
+        substring bug) and guards against a fix that's too permissive -- the
+        word-boundary matcher must still catch real seniority conflicts, not
+        merely stop matching substrings altogether.
+        """
+        item = apply_hard_filters(
+            candidate(title="Junior Software Engineer", eligibility="Open to all applicants."),
+            JobSearchRequest(target_roles=["Senior Product Manager"]),
+        )
+        self.assertEqual(item.hard_requirement_states.get("seniority"), "conflict")
+
+        clean = apply_hard_filters(
+            candidate(title="Software Engineer", eligibility="Open to all applicants."),
+            JobSearchRequest(target_roles=["Senior Product Manager"]),
+        )
+        self.assertNotEqual(clean.hard_requirement_states.get("seniority"), "conflict")
+
+    def test_seniority_filter_still_flags_true_positive_junior_titles(self):
+        junior_titles = [
+            "Software Engineering Intern",
+            "Summer Internship",
+            "Junior Data Analyst",
+            "Entry Level Analyst",
+            "Entry-Level Analyst",
+            "New Grad Software Engineer",
+        ]
+        for title in junior_titles:
+            with self.subTest(title=title):
+                item = apply_hard_filters(
+                    candidate(title=title, eligibility="Open to all applicants."),
+                    JobSearchRequest(target_roles=["Senior Product Manager"]),
+                )
+                self.assertEqual(item.hard_requirement_states.get("seniority"), "conflict")
+                self.assertIn("seniority", item.failed_hard_constraints)
+
+    def test_seniority_filter_does_not_flag_substring_collision_titles(self):
+        non_junior_titles = [
+            "International Marketing Manager",
+            "Internal Communications Lead",
+            "Interim Product Manager",
+            "Senior Interaction Designer",
+        ]
+        for title in non_junior_titles:
+            with self.subTest(title=title):
+                item = apply_hard_filters(
+                    candidate(title=title, eligibility="Open to all applicants."),
+                    JobSearchRequest(target_roles=["Senior Product Manager"]),
+                )
+                self.assertNotEqual(item.hard_requirement_states.get("seniority"), "conflict")
+                self.assertNotIn("seniority", item.failed_hard_constraints)
+
     def test_search_page_is_bounded_and_cached_for_internal_pagination(self):
         engine = create_database_engine("sqlite://")
         init_db(engine)
@@ -70,11 +142,17 @@ class JobSearchTests(unittest.TestCase):
             first = service.search(user_id=user["user_id"], run_id=run["run_id"], request=JobSearchRequest(target_roles=["Engineer"], profile_skills=["Python"], desired_job_skills=["SQL"], requested_count=12, max_results=20, page_size=10), source_call_budget=2)
             second = service.search(user_id=user["user_id"], run_id=run["run_id"], request=JobSearchRequest(target_roles=["Engineer"], profile_skills=["Python"], desired_job_skills=["SQL"], requested_count=12, max_results=20, page_size=10, cursor="10"), source_call_budget=2)
         self.assertEqual(first.data["page"]["returned_count"], 10)
-        self.assertEqual(first.data["page"]["next_cursor"], "10")
+        self.assertIsNone(first.data["page"]["next_cursor"])
         self.assertTrue(all(len(item["description_excerpt"]) <= 300 for item in first.data["page"]["items"]))
-        self.assertEqual(second.data["page"]["returned_count"], 2)
+        self.assertEqual(second.data["page"]["returned_count"], 0)
         self.assertEqual(adapter.calls, 1)
         engine.dispose()
+
+    def test_legacy_result_limits_are_read_and_clamped_without_failure(self):
+        request = JobSearchRequest(requested_count=12, max_results=20, page_size=20)
+        self.assertEqual(request.requested_count, 10)
+        self.assertEqual(request.max_results, 10)
+        self.assertEqual(request.page_size, 10)
 
 
 if __name__ == "__main__":

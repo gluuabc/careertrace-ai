@@ -19,11 +19,23 @@ from langgraph.types import Command
 from app.auth import require_authenticated_user
 from app.database import init_db, profile_repository
 from app.graph.profile_graph import profile_graph
-from app.nodes.profile import generate_profile
 from app.nodes.validation import find_profile_issues
 from app.services import document_service, respond_to_user
 from app.services.outreach import outreach_service
 from app.services.people_search import validate_connection_csv
+from app.services.profile_mutation import profile_mutation_service
+from app.services.conversation_memory import trigger_conversation_boundary
+from app.services.agent_results import primary_job_link, resolve_agent_display_result
+
+
+TOP_LEVEL_PAGE_LABELS = (
+    "Documents",
+    "My profile",
+    "Starred Q&A",
+    "Memory",
+    "Career Assistant",
+)
+DOCUMENT_PAGE_SECTIONS = ("Upload & Analyze", "Stored Documents")
 
 
 def _comma_list(value: str) -> list[str]:
@@ -496,7 +508,8 @@ def _render_profile(user_id: str) -> None:
         return
 
     st.subheader("My profile")
-    st.caption(f"Current profile version: v{profile['profile_version']}")
+    st.caption("Current values are stored in SQL; history is tracked per field.")
+    st.markdown("### Current Profile")
     if profile.get("source_documents"):
         st.caption(
             "Sources: "
@@ -504,10 +517,12 @@ def _render_profile(user_id: str) -> None:
                 item["filename"] for item in profile["source_documents"]
             )
         )
+    restore_preview = st.session_state.get("profile_restore_preview") or {}
+    form_profile = {**profile, **restore_preview}
     with st.form("edit_profile"):
         account = profile_repository.get_user(user_id)
         updated_profile = _profile_form(
-            profile,
+            form_profile,
             "edit",
             show_required=True,
             identity_locked=bool(account.get("google_id")),
@@ -519,11 +534,21 @@ def _render_profile(user_id: str) -> None:
                 details = ", ".join(missing_fields + errors)
                 st.error(f"Please correct the required profile fields: {details}")
             else:
-                result = profile_repository.upsert_profile(
-                    user_id, updated_profile
+                result = profile_mutation_service.apply_profile_field_changes(
+                    user_id,
+                    updated_profile,
+                    source_type=(
+                        "history_restore" if restore_preview else "manual"
+                    ),
                 )
                 if result["profile_changed"]:
-                    st.success("Profile changes saved. Career analysis is now stale.")
+                    st.session_state.pop("profile_restore_preview", None)
+                    st.success("Profile changes saved.")
+                    if result.get("retrieval_index_status") in {"failed", "sparse_only"}:
+                        st.warning(
+                            "The current profile is saved, but dense retrieval indexing "
+                            "needs attention. Sparse/structured profile data remains current."
+                        )
                     preference_labels = {
                         "target_roles": "Target roles",
                         "preferred_locations": "Preferred locations",
@@ -542,45 +567,62 @@ def _render_profile(user_id: str) -> None:
                 else:
                     st.info("No changes detected. Profile version was not updated.")
 
+    st.markdown("### Pending Profile Updates")
+    profile_drafts = profile_repository.list_profile_revision_drafts(user_id)
+    pending_profile_drafts = [
+        item for item in profile_drafts if item["status"] == "pending"
+    ]
+    if not pending_profile_drafts:
+        st.info("No conversation-derived profile changes are waiting for review.")
+    for draft in pending_profile_drafts:
+        with st.container(border=True):
+            st.caption("Profile change proposal — reviewed one field at a time")
+            for change in draft["changes"]:
+                st.write(f"**{change['field_key']}** · {change['operation']}")
+                st.write(f"Current: {change['before_value']}")
+                st.write(f"Proposed: {change['proposed_value']}")
+                if change["status"] == "pending":
+                    with st.container(horizontal=True):
+                        if st.button("Accept field change", key=f"accept_profile_change_{change['change_id']}"):
+                            profile_repository.review_profile_revision_change(user_id, change["change_id"], accept=True)
+                            st.rerun()
+                        if st.button("Reject field change", key=f"reject_profile_change_{change['change_id']}"):
+                            profile_repository.review_profile_revision_change(user_id, change["change_id"], accept=False)
+                            st.rerun()
+                else:
+                    st.caption(f"Status: {change['status']}")
+            if any(change["status"] == "accepted" for change in draft["changes"]):
+                if st.button("Apply accepted changes", key=f"apply_profile_draft_{draft['draft_id']}"):
+                    try:
+                        profile_repository.apply_profile_revision_draft(user_id, draft["draft_id"])
+                        st.success("Accepted profile fields were applied.")
+                        st.rerun()
+                    except ValueError as error:
+                        st.error(str(error))
 
-def _render_analysis(user_id: str) -> None:
-    profile = profile_repository.get_profile(user_id)
-    analysis = profile_repository.get_latest_analysis(user_id)
-    if profile is None:
-        st.info("Create a profile before generating career analysis.")
-        return
-
-    st.subheader("Career analysis")
-    if analysis:
-        st.caption(
-            f"Analysis v{analysis['analysis_version']} · generated "
-            f"{analysis['generated_at']} · profile v"
-            f"{analysis['profile_version_used']}"
-        )
-        if analysis["is_stale"]:
-            st.warning(
-                "Your profile has changed since this analysis was generated."
-            )
-        st.markdown("#### Strengths")
-        for item in analysis["strengths"]:
-            st.markdown(f"- {item}")
-        st.markdown("#### Possible roles")
-        for item in analysis["possible_roles"]:
-            st.markdown(f"- {item}")
-        st.markdown("#### Recommended next skills")
-        for item in analysis["recommended_next_skills"]:
-            st.markdown(f"- {item}")
-    else:
-        st.info("No stored career analysis yet.")
-
-    if st.button("Regenerate career analysis", type="primary"):
-        with st.spinner("Generating career analysis with Bedrock…"):
-            generated = generate_profile({"saved_profile": profile})[
-                "career_profile"
-            ]
-            profile_repository.save_analysis(user_id, generated)
-        st.success("Career analysis updated.")
-        st.rerun()
+    st.markdown("### Field History")
+    history = profile_repository.list_profile_field_history(user_id)
+    with st.expander("Previous values"):
+        has_history = False
+        for field_key, entries in history.items():
+            if not entries:
+                continue
+            has_history = True
+            st.markdown(f"**{field_key.replace('_', ' ').title()}**")
+            for index, entry in enumerate(entries):
+                value = entry["value"]
+                st.code(str(value), language=None)
+                if st.button(
+                    "Use this value",
+                    key=f"restore_{field_key}_{index}",
+                ):
+                    st.session_state.profile_restore_preview = {field_key: value}
+                    for key in list(st.session_state):
+                        if key.startswith("edit_"):
+                            del st.session_state[key]
+                    st.rerun()
+        if not has_history:
+            st.info("No field has changed yet.")
 
 
 def _render_starred_qa(user_id: str) -> None:
@@ -705,80 +747,40 @@ def _render_documents(user_id: str) -> None:
                         st.error(f"Document deletion failed: {error}")
 
 
+def _render_documents_page(user_id: str, *, is_demo: bool) -> None:
+    """Compose the existing upload workflow and stored-document UI in one page."""
+
+    upload_tab, stored_tab = st.tabs(DOCUMENT_PAGE_SECTIONS)
+    with upload_tab:
+        _render_upload(user_id, is_demo=is_demo)
+    with stored_tab:
+        _render_documents(user_id)
+
+
 def _render_memory(user_id: str) -> None:
     st.subheader("Memory")
     st.caption(
-        "Profile and analysis versions are immutable. Rollback changes only the "
-        "current pointer."
+        "Structured career facts are managed in My Profile. Review flexible "
+        "long-term context here."
     )
 
-    st.markdown("### Profile history")
-    profile_versions = profile_repository.list_profile_versions(user_id)
-    if not profile_versions:
-        st.info("No confirmed profile versions yet.")
-    for version in profile_versions:
-        label = f"Profile v{version['version_number']}"
-        if version["is_current"]:
-            label += " (Current)"
-        with st.expander(label, expanded=version["is_current"]):
-            st.caption(f"Created: {version['created_at']}")
-            sources = version.get("source_documents") or []
-            st.write(
-                "Sources: "
-                + (", ".join(item["filename"] for item in sources) or "Manual edit")
-            )
-            st.json(version["snapshot_data"])
-            if not version["is_current"] and st.button(
-                "Rollback to this profile version",
-                key=f"rollback_profile_{version['version_id']}",
-            ):
-                profile_repository.rollback_profile(user_id, version["version_id"])
-                for key in list(st.session_state):
-                    if key.startswith("edit_"):
-                        del st.session_state[key]
-                st.success("Current profile pointer updated.")
-                st.rerun()
-
-    st.markdown("### Career analysis history")
-    analysis_versions = profile_repository.list_analysis_versions(user_id)
-    if not analysis_versions:
-        st.info("No career analysis versions yet.")
-    for version in analysis_versions:
-        label = f"Career Analysis v{version['analysis_version']}"
-        if version["is_current"]:
-            label += " (Current)"
-        with st.expander(label, expanded=version["is_current"]):
-            st.caption(
-                f"Generated: {version['generated_at']} · Profile v"
-                f"{version['profile_version_used']}"
-            )
-            st.json(
-                {
-                    "strengths": version["strengths"],
-                    "possible_roles": version["possible_roles"],
-                    "recommended_next_skills": version[
-                        "recommended_next_skills"
-                    ],
-                }
-            )
-            if not version["is_current"] and st.button(
-                "Rollback to this analysis",
-                key=f"rollback_analysis_{version['analysis_version_id']}",
-            ):
-                profile_repository.rollback_analysis(
-                    user_id, version["analysis_version_id"]
-                )
-                st.success("Current analysis pointer updated.")
-                st.rerun()
-
-    st.markdown("### Memory candidates")
+    st.markdown("### Memory Candidates")
     candidates = profile_repository.list_memory_candidates(user_id)
     pending = [item for item in candidates if item["status"] == "pending"]
     if not pending:
         st.info("No AI memory suggestions are waiting for review.")
     for candidate in pending:
         with st.container(border=True):
-            st.write(f"**{candidate['category']}** — {candidate['content']}")
+            st.write(f"**{candidate['operation']} {candidate['category']}** — {candidate['content']}")
+            existing = next(
+                (
+                    item for item in profile_repository.list_memories(user_id, include_inactive=True)
+                    if item["memory_id"] == candidate.get("existing_memory_id")
+                ),
+                None,
+            )
+            if existing:
+                st.write(f"Existing: {existing['content']}")
             confidence = (
                 candidate["confidence"]
                 if candidate["confidence"] is not None
@@ -789,13 +791,21 @@ def _render_memory(user_id: str) -> None:
                 f"{confidence}"
             )
             with st.container(horizontal=True):
+                accept_label = {
+                    "ADD": "Approve",
+                    "UPDATE": "Approve update",
+                    "REVOKE": "Approve revoke",
+                    "CONFLICT": "Use new",
+                }.get(candidate["operation"], "Approve")
                 if st.button(
-                    "Accept",
+                    accept_label,
                     key=f"accept_memory_{candidate['candidate_id']}",
                 ):
-                    profile_repository.review_memory_candidate(
+                    result = profile_repository.review_memory_candidate(
                         user_id, candidate["candidate_id"], accept=True
                     )
+                    if result and result.get("retrieval_index_status") == "failed":
+                        st.warning("Saved in SQL, but assistant retrieval indexing needs retry.")
                     st.rerun()
                 if st.button(
                     "Reject",
@@ -805,13 +815,39 @@ def _render_memory(user_id: str) -> None:
                         user_id, candidate["candidate_id"], accept=False
                     )
                     st.rerun()
+                if candidate["operation"] == "CONFLICT" and st.button(
+                    "Keep existing",
+                    key=f"keep_existing_memory_{candidate['candidate_id']}",
+                ):
+                    profile_repository.review_memory_candidate(
+                        user_id, candidate["candidate_id"], accept=False,
+                        conflict_resolution="keep_existing",
+                    )
+                    st.rerun()
+                if candidate["operation"] == "CONFLICT" and st.button(
+                    "Keep both",
+                    key=f"keep_both_memory_{candidate['candidate_id']}",
+                ):
+                    profile_repository.review_memory_candidate(
+                        user_id, candidate["candidate_id"], accept=True,
+                        conflict_resolution="keep_both",
+                    )
+                    st.rerun()
 
-    st.markdown("### Approved flexible memory")
+    st.markdown("### Approved Memories")
     memories = profile_repository.list_memories(user_id)
     if not memories:
         st.info("No approved flexible memories yet.")
     for memory in memories:
-        st.markdown(f"- **{memory['category']}**: {memory['content']}")
+        with st.container(border=True):
+            st.write(memory["content"])
+            timestamp = memory.get("event_time") or memory["created_at"]
+            st.caption(
+                f"Type: {memory['category']} · Source: {memory['source']} · "
+                f"Date: {timestamp}"
+            )
+            if memory["retrieval_index_status"] == "failed":
+                st.warning("Saved in SQL; assistant retrieval indexing needs retry.")
 
 
 def _render_connections(user_id: str) -> None:
@@ -937,30 +973,80 @@ def _render_agent_activity(
 
 
 def _render_agent_results(user_id: str, conversation_id: str) -> None:
-    result = st.session_state.get("agent_last_result") or {}
+    result = resolve_agent_display_result(
+        profile_repository,
+        user_id,
+        conversation_id,
+        st.session_state.get("agent_last_result"),
+    )
     if result.get("conversation_id") == conversation_id:
+        references = result.get("personalization_references") or {}
+        profile_references = references.get("profile") or []
+        memory_references = references.get("approved_memories") or []
+        if profile_references or memory_references:
+            with st.expander("Personalization references", expanded=False):
+                if profile_references:
+                    st.markdown("**Profile**")
+                    for item in profile_references:
+                        st.write(f"- {item['field']}: {item['value']}")
+                if memory_references:
+                    st.markdown("**Approved Memories**")
+                    for item in memory_references:
+                        st.write(f"- {item['title']}: {item['summary']}")
         jobs = result.get("job_candidates") or []
-        verified = [item for item in jobs if item.get("hard_constraints_met")]
-        unverified = [item for item in jobs if not item.get("hard_constraints_met")]
+        demo_jobs = [item for item in jobs if item.get("is_demo_sample")]
+        live_jobs = [item for item in jobs if not item.get("is_demo_sample")]
+        verified = [item for item in live_jobs if item.get("hard_constraints_met")]
+        unverified = [item for item in live_jobs if not item.get("hard_constraints_met")]
         if verified:
-            st.markdown("### Verified job candidates")
+            st.markdown("### Live results — matching requirements")
             for item in verified:
                 with st.container(border=True):
                     st.write(f"**{item.get('title') or 'unknown'} — {item.get('company') or 'unknown'}**")
                     st.write(f"Location: {item.get('location') or 'unknown'} · Employment: {item.get('employment_type') or 'unknown'}")
                     st.write(f"Eligibility: {item.get('eligibility') or 'unknown'}")
-                    if item.get("application_url"):
-                        st.link_button("Official application", item["application_url"])
-                    st.caption(f"Source: {item.get('source_url')} · Retrieved: {item.get('retrieved_at')}")
+                    link = primary_job_link(item)
+                    if link:
+                        st.link_button(*link)
+                    st.caption(
+                        f"Source status: {str(item.get('source_status') or 'unknown').replace('_', ' ').title()} · "
+                        f"Requirement status: {str(item.get('requirement_status') or 'unknown').replace('_', ' ').title()} · "
+                        f"Retrieved: {item.get('retrieved_at')}"
+                    )
         if unverified:
-            st.markdown("### Eligibility not verified")
-            st.caption("These candidates do not count toward the verified total.")
+            st.markdown("### Live results — requirements not fully verified")
+            st.caption(
+                "These may come from an official source, but one or more requested "
+                "requirements were not stated. They do not count toward the matching total."
+            )
             for item in unverified:
-                st.markdown(f"- **{item.get('title') or 'unknown'} — {item.get('company') or 'unknown'}** · [source]({item.get('source_url')})")
+                link = primary_job_link(item)
+                link_markdown = (
+                    f"[{link[0]}]({link[1]})" if link else "Posting unavailable"
+                )
+                st.markdown(
+                    f"- **{item.get('title') or 'unknown'} — {item.get('company') or 'unknown'}** · "
+                    f"{str(item.get('source_status') or 'unknown').replace('_', ' ').title()} · "
+                    f"{link_markdown}"
+                )
+        if demo_jobs:
+            st.markdown("### Demo snapshot suggestions")
+            st.warning(
+                "Historical public-source samples for judge testing. These are not "
+                "claimed to be currently open postings."
+            )
+            for item in demo_jobs:
+                st.markdown(
+                    f"- **{item.get('title') or 'unknown'} — {item.get('company') or 'unknown'}** · "
+                    f"snapshot {item.get('snapshot_date') or 'date unknown'} · "
+                    f"[snapshot source]({item.get('source_url')})"
+                )
         people = result.get("people_candidates") or []
-        if people:
-            st.markdown("### People candidates")
-            for item in people:
+        live_people = [item for item in people if not item.get("is_demo_sample")]
+        demo_people = [item for item in people if item.get("is_demo_sample")]
+        if live_people:
+            st.markdown("### Live people results")
+            for item in live_people:
                 with st.container(border=True):
                     st.write(f"**{item.get('name')}** — {item.get('current_role') or 'role unknown'}")
                     st.write(f"Organization: {item.get('organization') or 'unknown'}")
@@ -968,6 +1054,18 @@ def _render_agent_results(user_id: str, conversation_id: str) -> None:
                     public_channels = [channel for channel in item.get("contact_channels") or [] if channel.get("visibility") == "public"]
                     st.write("Public contact: " + (", ".join(channel.get("value", "") for channel in public_channels) or "unavailable"))
                     st.link_button("Public source", item["public_source_url"])
+        if demo_people:
+            st.markdown("### Demo snapshot suggestions")
+            st.warning(
+                "Historical OpenAlex samples for judge testing. Current roles and "
+                "affiliations are not asserted."
+            )
+            for item in demo_people:
+                st.markdown(
+                    f"- **{item.get('name') or 'unknown'}** · snapshot "
+                    f"{item.get('snapshot_date') or 'date unknown'} · "
+                    f"[snapshot source]({item.get('public_source_url')})"
+                )
 
     resume_drafts = profile_repository.list_resume_revision_drafts(user_id)
     if resume_drafts:
@@ -1008,7 +1106,17 @@ def _render_career_assistant(user_id: str) -> None:
     )
     _render_connections(user_id)
     conversations = profile_repository.list_conversations(user_id)
+    st.markdown("### Previous Conversations")
     if st.button("New conversation", icon=":material/add:"):
+        previous_id = st.session_state.get("active_conversation_id")
+        if previous_id:
+            try:
+                trigger_conversation_boundary(
+                    user_id, str(previous_id), process_now=True,
+                    repository=profile_repository,
+                )
+            except Exception:
+                st.warning("Memory extraction is pending and will retry after login.")
         conversation = profile_repository.create_conversation(
             user_id, f"Career conversation {len(conversations) + 1}"
         )
@@ -1020,11 +1128,12 @@ def _render_career_assistant(user_id: str) -> None:
         st.info("Create a conversation to start chatting.")
         return
     conversation_ids = [item["conversation_id"] for item in conversations]
-    active_id = st.session_state.get("active_conversation_id")
+    previous_active_id = st.session_state.get("active_conversation_id")
+    active_id = previous_active_id
     if active_id not in conversation_ids:
         active_id = conversation_ids[0]
     active_id = st.selectbox(
-        "Conversation",
+        "Continue conversation",
         conversation_ids,
         index=conversation_ids.index(active_id),
         key="conversation_selector",
@@ -1032,7 +1141,35 @@ def _render_career_assistant(user_id: str) -> None:
             item["title"] for item in conversations if item["conversation_id"] == item_id
         ),
     )
+    if previous_active_id and active_id != previous_active_id:
+        try:
+            trigger_conversation_boundary(
+                user_id, str(previous_active_id), process_now=True,
+                repository=profile_repository,
+            )
+        except Exception:
+            st.warning("Memory extraction is pending and will retry after login.")
     st.session_state.active_conversation_id = active_id
+    active_title = next(
+        item["title"] for item in conversations
+        if item["conversation_id"] == active_id
+    )
+    with st.expander("Rename conversation"):
+        with st.form(f"rename_conversation_{active_id}"):
+            renamed_title = st.text_input(
+                "Conversation title",
+                value=active_title,
+                key=f"conversation_title_{active_id}",
+            )
+            if st.form_submit_button("Save title"):
+                try:
+                    profile_repository.rename_conversation(
+                        user_id, active_id, renamed_title
+                    )
+                    st.success("Conversation renamed.")
+                    st.rerun()
+                except ValueError as error:
+                    st.error(str(error))
     _render_agent_activity(user_id, active_id)
     _render_agent_results(user_id, active_id)
     conversation = profile_repository.get_conversation(user_id, active_id)
@@ -1096,31 +1233,15 @@ def main() -> None:
     st.caption("Persistent career profile management with bounded AI reasoning")
     if is_demo:
         st.warning("Demo workspace — uses synthetic data")
-    (
-        upload_tab,
-        profile_tab,
-        starred_tab,
-        documents_tab,
-        memory_tab,
-        assistant_tab,
-    ) = st.tabs(
-        [
-            "Document upload",
-            "My profile",
-            "Starred Q&A",
-            "Documents",
-            "Memory",
-            "Career Assistant",
-        ]
+    documents_tab, profile_tab, starred_tab, memory_tab, assistant_tab = st.tabs(
+        TOP_LEVEL_PAGE_LABELS
     )
-    with upload_tab:
-        _render_upload(user_id, is_demo=is_demo)
+    with documents_tab:
+        _render_documents_page(user_id, is_demo=is_demo)
     with profile_tab:
         _render_profile(user_id)
     with starred_tab:
         _render_starred_qa(user_id)
-    with documents_tab:
-        _render_documents(user_id)
     with memory_tab:
         _render_memory(user_id)
     with assistant_tab:

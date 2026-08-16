@@ -16,6 +16,7 @@ from app.database.retrieval_repository import RetrievalRepository
 from app.services.retrieval import HybridRetrievalService
 from app.services.token_accounting import heuristic_input_tokens, heuristic_text_tokens
 from app.services.token_accounting import ModelCallObserver
+from app.services.memory_retrieval import ProgressiveMemoryService
 
 
 def estimate_tokens(text: str) -> int:
@@ -35,11 +36,15 @@ class ContextManager:
         registry: SkillRegistry = skill_registry,
         retrieval_repository: RetrievalRepository | None = None,
         retrieval_service: HybridRetrievalService | None = None,
+        memory_service: ProgressiveMemoryService | None = None,
     ):
         self.repository = repository
         self.registry = registry
         self.retrieval_repository = retrieval_repository or RetrievalRepository(repository.session_factory)
         self.retrieval_service = retrieval_service or HybridRetrievalService(self.retrieval_repository)
+        self.memory_service = memory_service or ProgressiveMemoryService(
+            repository, self.retrieval_service
+        )
 
     @staticmethod
     def model_context_limit() -> int:
@@ -73,26 +78,37 @@ class ContextManager:
         selected_entities: dict[str, Any],
         loaded_skills: dict[str, str],
         agent_status: dict[str, Any],
+        conversation_id: str | None = None,
         memory_query: str = "",
+        reference_sink: dict[str, Any] | None = None,
     ) -> str:
-        profile = self.repository.get_profile(user_id)
-        memories: list[dict[str, Any]] = []
-        if self.retrieval_repository.has_documents(user_id, ["approved_memory"]):
-            try:
-                result = self.retrieval_service.retrieve(user_id=user_id, query=memory_query, corpus_types=["approved_memory"], top_k=5)
-                memories = [
-                    {"category": item.title, "content": item.text_excerpt}
-                    for item in result.items
-                ]
-            except Exception:
-                memories = []
+        intent = current_task.get("intent") or current_task.get("workflow") or "concise_guidance"
+        progressive = self.memory_service.build_context(
+            user_id=user_id,
+            conversation_id=conversation_id,
+            intent=intent,
+            query=memory_query,
+            include_source_context=any(
+                term in memory_query.casefold()
+                for term in ("why did", "when did", "source", "provenance", "conflict", "previous context")
+            ),
+        )
+        overlay = progressive["current_conversation_overlay"]
+        if reference_sink is not None:
+            reference_sink.clear()
+            reference_sink.update(progressive["personalization_references"])
         payload = {
             "current_time": datetime.now(timezone.utc).isoformat(),
-            "confirmed_profile": profile,
-            "approved_flexible_memories": [
-                {"category": item["category"], "content": item["content"]}
-                for item in memories
+            "relevant_profile_fields": progressive["profile"],
+            "current_conversation_profile_overlay": {
+                "signals": overlay["signals"],
+                "precedence": "latest current-conversation explicit statement wins",
+            },
+            "selected_approved_memories": progressive["memory_details"],
+            "current_conversation_memory_overlay": overlay[
+                "current_thread_memories"
             ],
+            "memory_source_context": progressive["memory_source_context"],
             "conversation_summary": conversation_summary,
             "current_task": current_task,
             "selected_entities": selected_entities,
@@ -225,6 +241,7 @@ class ContextManager:
         loaded_skills: dict[str, str] | None = None,
         agent_status: dict[str, Any] | None = None,
         run_id: str | None = None,
+        reference_sink: dict[str, Any] | None = None,
     ) -> list[BaseMessage]:
         conversation = self.repository.get_conversation(user_id, conversation_id)
         summary = self.repository.get_latest_context_summary(user_id, conversation_id)
@@ -243,6 +260,7 @@ class ContextManager:
                 history = history[boundary_index + 1 :]
         runtime = self.runtime_block(
             user_id=user_id,
+            conversation_id=conversation_id,
             conversation_summary=(
                 (
                     summary["summary"]
@@ -256,6 +274,7 @@ class ContextManager:
             loaded_skills=loaded_skills or {},
             agent_status=agent_status or {},
             memory_query=current_request,
+            reference_sink=reference_sink,
         )
         messages: list[BaseMessage] = [
             SystemMessage(content=build_system_prompt(self.registry.catalog())),
@@ -279,6 +298,7 @@ class ContextManager:
             loaded_skills=loaded_skills or {},
             agent_status=agent_status or {},
             run_id=run_id,
+            reference_sink=reference_sink,
         )
 
     def _compress_if_needed(
@@ -294,6 +314,7 @@ class ContextManager:
         loaded_skills: dict[str, str],
         agent_status: dict[str, Any],
         run_id: str | None,
+        reference_sink: dict[str, Any] | None,
     ) -> list[BaseMessage]:
         total = sum(estimate_tokens(str(message.content)) for message in messages)
         total += estimate_bound_tool_schema_tokens()
@@ -349,6 +370,7 @@ class ContextManager:
             loaded_skills=loaded_skills,
             agent_status=agent_status,
             run_id=run_id,
+            reference_sink=reference_sink,
         )
 
     def final_preflight_messages(self, messages: list[BaseMessage]) -> tuple[list[BaseMessage], int, bool]:

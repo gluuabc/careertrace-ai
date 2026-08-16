@@ -4,6 +4,7 @@ import hashlib
 import os
 import re
 from datetime import datetime, timezone
+from time import perf_counter
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
@@ -12,7 +13,16 @@ from app.services.evidence import EvidenceService, evidence_service
 from app.database.retrieval_repository import RetrievalRepository
 from app.services.retrieval import HybridRetrievalService
 from app.services.retrieval_corpus import RetrievalCorpusIndexer
-from app.state.agent_schema import JobCandidate, JobSearchRequest, RequirementState, SearchPage, SearchSufficiency, ToolExecutionResult
+from app.state.agent_schema import JobCandidate, JobSearchRequest, RequirementState, RequirementStatus, SearchPage, SearchSufficiency, SourceStatus, ToolExecutionResult
+from app.services.search_telemetry import SearchTelemetryRecorder
+from app.services.demo_search_fixtures import (
+    load_demo_search_fixtures,
+    should_use_demo_fallback,
+)
+from app.services.search_providers import (
+    JUDGE_HARD_SEARCH_SECONDS,
+    run_provider_fetches,
+)
 from app.tools.sources.catalog import CompanyCatalog
 from app.tools.sources.greenhouse import GreenhouseAdapter
 from app.tools.sources.lever import LeverAdapter
@@ -21,13 +31,12 @@ from app.tools.sources.playwright import PlaywrightAdapter
 from app.tools.sources.tavily import TavilyAdapter
 from app.tools.sources.trust import assess_job_source
 
-ELIGIBILITY_TERMS = re.compile(
-    r"([^.!?]*(?:currently enrolled|student|graduat(?:e|ing|ion)|work authorization|"
-    r"authorized to work|sponsorship|citizen|degree)[^.!?]*[.!?]?)",
+ELIGIBILITY_KEYWORDS = re.compile(
+    r"currently enrolled|student|graduat(?:e|ing|ion)|work authorization|"
+    r"authorized to work|sponsorship|citizen|degree",
     re.I,
 )
-
-
+SENTENCE_BOUNDARY = re.compile(r"(?<=[.!?])\s+|[\r\n]+")
 def canonical_url(value: str | None) -> str | None:
     if not value:
         return None
@@ -39,10 +48,23 @@ def _normalized(value: str | None) -> str:
     return " ".join(str(value or "").casefold().split())
 
 
+_JUNIOR_SENIORITY_PATTERN = re.compile(r"\b(?:intern(?:ship|s)?|junior|entry[\s-]+level|new\s+grad)\b")
+_SENIOR_SENIORITY_PATTERN = re.compile(r"\b(?:senior|staff|principal|lead|director)\b")
+
+
+def _matches_seniority_terms(normalized_text: str, pattern: re.Pattern[str]) -> bool:
+    return bool(pattern.search(normalized_text))
+
+
 def extract_explicit_eligibility(description: str | None) -> str | None:
     if not description:
         return None
-    matches = [" ".join(item.split()) for item in ELIGIBILITY_TERMS.findall(description)]
+    bounded = description[:20_000]
+    matches = [
+        " ".join(sentence.split())
+        for sentence in SENTENCE_BOUNDARY.split(bounded)
+        if ELIGIBILITY_KEYWORDS.search(sentence)
+    ]
     return " ".join(matches[:3])[:1000] or None
 
 
@@ -65,6 +87,14 @@ def deduplicate_jobs(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
         seen.add(key)
         result.append(item)
     return result
+
+
+def lexical_job_shortlist(candidates: list[JobCandidate], request: JobSearchRequest, *, limit: int = 30) -> list[JobCandidate]:
+    terms = [_normalized(item) for item in [*request.target_roles, *request.role_keywords, *request.desired_job_skills, *request.profile_skills, *request.industries] if _normalized(item)]
+    def score(candidate: JobCandidate) -> tuple[int, str]:
+        text = _normalized(" ".join(filter(None, [candidate.title, candidate.company, candidate.location, candidate.description_excerpt])))
+        return (-sum(term in text for term in terms), candidate.candidate_id)
+    return sorted(candidates, key=score)[: min(max(1, limit), 30)]
 
 
 SKILL_TERMS = (
@@ -119,10 +149,25 @@ def apply_hard_filters(candidate: JobCandidate, request: JobSearchRequest) -> Jo
     if request.locations:
         if not candidate.location:
             set_state("location", RequirementState.UNKNOWN)
-        elif not any(_normalized(item) in _normalized(candidate.location) for item in request.locations):
-            set_state("location", RequirementState.CONFLICT)
         else:
-            set_state("location", RequirementState.MATCH)
+            location = _normalized(candidate.location)
+            if any(_normalized(item) in location for item in request.locations):
+                set_state("location", RequirementState.MATCH)
+            elif any(
+                term in location
+                for term in ("multiple locations", "various locations", "nationwide", "united states")
+            ):
+                set_state("location", RequirementState.UNKNOWN)
+            else:
+                set_state("location", RequirementState.CONFLICT)
+    requested_roles = _normalized(" ".join(request.target_roles))
+    candidate_title = _normalized(candidate.title)
+    junior_request = _matches_seniority_terms(requested_roles, _JUNIOR_SENIORITY_PATTERN)
+    senior_request = _matches_seniority_terms(requested_roles, _SENIOR_SENIORITY_PATTERN)
+    junior_candidate = _matches_seniority_terms(candidate_title, _JUNIOR_SENIORITY_PATTERN)
+    senior_candidate = _matches_seniority_terms(candidate_title, _SENIOR_SENIORITY_PATTERN)
+    if (junior_request and senior_candidate) or (senior_request and junior_candidate):
+        set_state("seniority", RequirementState.CONFLICT)
     if request.remote_preference and request.remote_preference.casefold() not in {"flexible", "any"}:
         preference = request.remote_preference.casefold()
         is_remote = "remote" in _normalized(candidate.location) or "remote" in haystack
@@ -170,10 +215,36 @@ def apply_hard_filters(candidate: JobCandidate, request: JobSearchRequest) -> Jo
             required = _normalized(request.work_authorization_requirement)
             if required in eligibility:
                 set_state("work_authorization", RequirementState.MATCH)
-            elif any(term in eligibility for term in ("sponsorship", "authorized to work", "citizen", "visa")):
-                set_state("work_authorization", RequirementState.CONFLICT)
             else:
-                set_state("work_authorization", RequirementState.UNKNOWN)
+                user_needs_sponsorship = (
+                    "require sponsorship" in required
+                    or "need sponsorship" in required
+                ) and "do not" not in required
+                user_does_not_need_sponsorship = any(
+                    term in required
+                    for term in ("do not require sponsorship", "no sponsorship", "authorized to work")
+                )
+                posting_denies_sponsorship = any(
+                    term in eligibility
+                    for term in ("no sponsorship", "not sponsor", "without sponsorship", "sponsorship is not available")
+                )
+                posting_requires_sponsorship = "sponsorship required" in eligibility
+                posting_offers_sponsorship = any(
+                    term in eligibility
+                    for term in ("sponsorship available", "sponsorship provided", "will sponsor")
+                )
+                if user_needs_sponsorship and posting_denies_sponsorship:
+                    set_state("work_authorization", RequirementState.CONFLICT)
+                elif user_needs_sponsorship and posting_offers_sponsorship:
+                    set_state("work_authorization", RequirementState.MATCH)
+                elif user_does_not_need_sponsorship and posting_requires_sponsorship:
+                    set_state("work_authorization", RequirementState.CONFLICT)
+                elif user_does_not_need_sponsorship and (
+                    "authorized to work" in eligibility or posting_denies_sponsorship
+                ):
+                    set_state("work_authorization", RequirementState.MATCH)
+                else:
+                    set_state("work_authorization", RequirementState.UNKNOWN)
     if "industries" in request.hard_preference_fields:
         if not request.industries:
             set_state("industries", RequirementState.UNKNOWN)
@@ -188,6 +259,7 @@ def apply_hard_filters(candidate: JobCandidate, request: JobSearchRequest) -> Jo
     candidate.unknown_fields = sorted(set(candidate.unknown_fields + unknown))
     candidate.hard_constraints_met = not conflicts and not unknown
     candidate.verification_status = "conflict" if conflicts else ("requirements_not_fully_verified" if unknown else "verified")
+    candidate.requirement_status = RequirementStatus.CONFLICT if conflicts else (RequirementStatus.REQUIREMENTS_NOT_FULLY_VERIFIED if unknown else RequirementStatus.MATCHES)
     return candidate
 
 
@@ -226,6 +298,7 @@ class JobSearchService:
         request: JobSearchRequest,
         source_call_budget: int | None = None,
     ) -> ToolExecutionResult:
+        search_started = perf_counter()
         configured_max = int(os.getenv("AGENT_MAX_SOURCE_CALLS", "12"))
         max_calls = max(
             0,
@@ -241,10 +314,22 @@ class JobSearchService:
             requested_count=request.requested_count,
             source_call_budget=max_calls,
         )
+        telemetry = SearchTelemetryRecorder(
+            self.repository,
+            user_id=user_id,
+            run_id=run_id,
+            search_session_id=session["search_session_id"],
+        )
         offset = int(request.cursor or 0) if str(request.cursor or "0").isdigit() else 0
         cached = list(session.get("candidate_records") or [])
         if cached and request.cursor is not None:
-            return self._page_result(cached, request, session, offset=offset)
+            result = self._page_result(cached, request, session, offset=offset)
+            telemetry.observe(
+                "search_tool",
+                round((perf_counter() - search_started) * 1000),
+                candidate_count=len(result.data["page"]["items"]),
+            )
+            return result
         iteration = int(session.get("iteration") or 0) + 1
         existing_candidates = [JobCandidate.model_validate(item) for item in cached]
 
@@ -282,6 +367,9 @@ class JobSearchService:
         query_hash = hashlib.sha256(
             repr(sorted(request.model_dump(mode="json", exclude={"cursor"}).items())).encode()
         ).hexdigest()
+        judge_mode = bool(self.repository.get_user(user_id).get("is_demo"))
+        fetch_tasks: list[tuple[str, str, Any]] = []
+        sources_by_key = {}
         for source in targets:
             if source_calls >= max_calls:
                 break
@@ -307,23 +395,42 @@ class JobSearchService:
                 )
                 continue
             if source.ats_type == "greenhouse" and source.board_token:
-                fetch = lambda: self.greenhouse.search(board_token=source.board_token, company=source.company)
+                fetch = lambda source=source: self.greenhouse.search(board_token=source.board_token, company=source.company)
             elif source.ats_type == "lever" and source.lever_site:
-                fetch = lambda: self.lever.search(site_name=source.lever_site, company=source.company)
+                fetch = lambda source=source: self.lever.search(site_name=source.lever_site, company=source.company)
             elif source.careers_url:
-                fetch = lambda: self.public_pages.search(url=source.careers_url, company=source.company)
+                fetch = lambda source=source: self.public_pages.search(url=source.careers_url, company=source.company)
             else:
                 coverage[source_key] = {"source_status": "known_but_unavailable", "reason": "No source endpoint is configured."}
                 continue
             reservation = self.repository.reserve_search_source_calls(user_id, session["search_session_id"], 1)
             if not reservation["reserved_calls"]:
                 break
-            result = fetch()
+            fetch_tasks.append((source_key, source.ats_type or "public", fetch))
+            sources_by_key[source_key] = source
             source_calls += 1
+        remaining_budget = (
+            max(0.0, JUDGE_HARD_SEARCH_SECONDS - (perf_counter() - search_started))
+            if judge_mode
+            else None
+        )
+        fetched = run_provider_fetches(fetch_tasks, timeout_seconds=remaining_budget)
+        provider_timed_out = any(item[2] for item in fetched.values())
+        for source_key, (result, provider_duration_ms, timed_out) in fetched.items():
+            source = sources_by_key[source_key]
+            telemetry.observe(
+                "provider_fetch",
+                provider_duration_ms,
+                provider=source.ats_type or "public",
+                candidate_count=len(result.records),
+                success=result.ok,
+                timed_out=timed_out,
+            )
             if (
                 result.ok
                 and not result.records
                 and source.careers_url
+                and not (judge_mode and perf_counter() - search_started >= JUDGE_HARD_SEARCH_SECONDS)
                 and os.getenv("PLAYWRIGHT_ENABLED", "false").strip().casefold() in {"1", "true", "yes"}
             ):
                 render_reservation = self.repository.reserve_search_source_calls(user_id, session["search_session_id"], 1)
@@ -338,6 +445,9 @@ class JobSearchService:
                 detail_content: list[str] = []
                 official_host = urlsplit(source.careers_url).hostname
                 for discovered in result.records:
+                    if judge_mode and perf_counter() - search_started >= JUDGE_HARD_SEARCH_SECONDS:
+                        warnings.append("Live provider detail budget reached; partial results were preserved.")
+                        break
                     detail_url = discovered.get("application_url")
                     if not detail_url:
                         continue
@@ -346,10 +456,18 @@ class JobSearchService:
                     )
                     if not detail_reservation["reserved_calls"]:
                         break
+                    provider_started = perf_counter()
                     detail = self.public_pages.fetch_job_detail(
                         url=detail_url,
                         company=source.company,
                         allowed_hosts={official_host} if official_host else None,
+                    )
+                    telemetry.observe(
+                        "provider_fetch",
+                        round((perf_counter() - provider_started) * 1000),
+                        provider=detail.source_name,
+                        candidate_count=len(detail.records),
+                        success=detail.ok,
                     )
                     source_calls += 1
                     if detail.ok and detail.records:
@@ -383,6 +501,7 @@ class JobSearchService:
             if not result.ok:
                 warnings.append(f"{source.company}/{result.source_name}: source unavailable")
                 continue
+            evidence_started = perf_counter()
             evidence, storage_warnings = self.evidence.store(
                 user_id=user_id,
                 run_id=run_id,
@@ -392,6 +511,14 @@ class JobSearchService:
                 content_type=result.content_type,
                 raw_content=result.raw_content,
                 structured_content={"record_count": len(result.records)},
+                index_for_retrieval=False,
+                phase_observer=telemetry.observe,
+            )
+            telemetry.observe(
+                "evidence_persistence",
+                round((perf_counter() - evidence_started) * 1000),
+                provider=result.source_name,
+                candidate_count=len(result.records),
             )
             warnings.extend(storage_warnings)
             evidence_ids.append(evidence["evidence_id"])
@@ -400,7 +527,9 @@ class JobSearchService:
                 raw_records.append(item)
 
         tavily_enabled = os.getenv("TAVILY_ENABLED", "false").strip().casefold() == "true" and bool(os.getenv("TAVILY_API_KEY", "").strip())
-        if tavily_enabled and source_calls < max_calls:
+        if tavily_enabled and source_calls < max_calls and not (
+            judge_mode and perf_counter() - search_started >= JUDGE_HARD_SEARCH_SECONDS
+        ):
             reservation = self.repository.reserve_search_source_calls(user_id, session["search_session_id"], 1)
             if reservation["reserved_calls"]:
                 query = " ".join([*(request.target_roles or request.role_keywords), *(request.preferred_companies or []), "jobs careers"])
@@ -410,10 +539,21 @@ class JobSearchService:
                     host = urlsplit(candidate_url).hostname if candidate_url else None
                     if host:
                         domains.append(host)
+                provider_started = perf_counter()
                 discovery = self.tavily.search(query=query, max_results=min(5, request.max_results), include_domains=domains or None)
+                telemetry.observe(
+                    "provider_discovery",
+                    round((perf_counter() - provider_started) * 1000),
+                    provider="tavily",
+                    candidate_count=len(discovery.records),
+                    success=discovery.ok,
+                )
                 source_calls += 1
                 coverage["tavily"] = {"source_status": discovery.source_status, "returned_count": len(discovery.records), "discovery_only": True}
                 for discovered in discovery.records:
+                    if judge_mode and perf_counter() - search_started >= JUDGE_HARD_SEARCH_SECONDS:
+                        warnings.append("Live discovery budget reached; partial results were preserved.")
+                        break
                     if source_calls >= max_calls:
                         break
                     url = discovered.get("url")
@@ -423,10 +563,19 @@ class JobSearchService:
                     if not detail_reservation["reserved_calls"]:
                         break
                     host = urlsplit(url).hostname
+                    provider_started = perf_counter()
                     detail = self.public_pages.fetch_job_detail(url=url, allowed_hosts={host} if host else None)
+                    telemetry.observe(
+                        "provider_fetch",
+                        round((perf_counter() - provider_started) * 1000),
+                        provider=detail.source_name,
+                        candidate_count=len(detail.records),
+                        success=detail.ok,
+                    )
                     source_calls += 1
                     if not detail.ok:
                         continue
+                    evidence_started = perf_counter()
                     evidence, storage_warnings = self.evidence.store(
                         user_id=user_id,
                         run_id=run_id,
@@ -436,17 +585,35 @@ class JobSearchService:
                         content_type=detail.content_type,
                         raw_content=detail.raw_content,
                         structured_content=detail.records[0] if detail.records else None,
+                        index_for_retrieval=False,
+                        phase_observer=telemetry.observe,
+                    )
+                    telemetry.observe(
+                        "evidence_persistence",
+                        round((perf_counter() - evidence_started) * 1000),
+                        provider=detail.source_name,
+                        candidate_count=len(detail.records),
                     )
                     warnings.extend(storage_warnings)
                     evidence_ids.append(evidence["evidence_id"])
                     for item in detail.records:
                         item.update(source_name=detail.source_name, source_url=detail.source_url, evidence_ids=[evidence["evidence_id"]])
                         raw_records.append(item)
+        dedupe_started = perf_counter()
+        deduplicated = deduplicate_jobs(raw_records)
+        telemetry.observe(
+            "deduplication",
+            round((perf_counter() - dedupe_started) * 1000),
+            candidate_count=len(deduplicated),
+        )
+        normalized_started = perf_counter()
+        hard_filter_duration_seconds = 0.0
         normalized: list[JobCandidate] = list(existing_candidates)
         role_terms = [_normalized(item) for item in request.target_roles + request.role_keywords if item]
-        for item in deduplicate_jobs(raw_records):
-            text = _normalized(f"{item.get('title')} {item.get('description')}")
-            eligibility = item.get("eligibility") or extract_explicit_eligibility(item.get("description"))
+        for item in deduplicated:
+            description = str(item.get("description") or "")[:20_000]
+            text = _normalized(f"{item.get('title')} {description}")
+            eligibility = item.get("eligibility") or extract_explicit_eligibility(description)
             identifier = item.get("source_job_id") or canonical_url(item.get("application_url")) or repr(item)
             candidate = JobCandidate(
                 candidate_id="job_" + hashlib.sha256(str(identifier).encode()).hexdigest()[:20],
@@ -460,7 +627,7 @@ class JobSearchService:
                 source_name=item["source_name"],
                 source_url=item["source_url"],
                 posted_at=item.get("posted_at"),
-                description_excerpt=(item.get("description") or "")[:1500] or None,
+                description_excerpt=description[:1500] or None,
                 salary=item.get("salary"),
                 evidence_ids=item.get("evidence_ids") or [],
                 eligibility_evidence_id=(item.get("evidence_ids") or [None])[0] if eligibility else None,
@@ -468,7 +635,7 @@ class JobSearchService:
             )
             profile_skills = {_normalized(item) for item in request.profile_skills}
             overlap = sorted(skill for skill in profile_skills if skill and skill in text)
-            required_skills, preferred_skills = extract_explicit_job_skills(item.get("description") or "", request)
+            required_skills, preferred_skills = extract_explicit_job_skills(description, request)
             desired_overlap = sorted(skill for skill in request.desired_job_skills if _normalized(skill) in text)
             candidate.job_required_skills = required_skills
             candidate.job_preferred_skills = preferred_skills
@@ -487,12 +654,30 @@ class JobSearchService:
                 + "."
                 + citation
             )
+            hard_started = perf_counter()
             apply_hard_filters(candidate, request)
+            hard_filter_duration_seconds += perf_counter() - hard_started
             if candidate.candidate_id not in {existing.candidate_id for existing in normalized}:
                 normalized.append(candidate)
 
-        rankable = [item for item in normalized if item.verification_status != "conflict"]
-        indexed_ids: list[str] = []
+        hard_filter_duration_ms = round(hard_filter_duration_seconds * 1000)
+        telemetry.observe(
+            "normalization",
+            max(0, round((perf_counter() - normalized_started) * 1000) - hard_filter_duration_ms),
+            candidate_count=len(normalized),
+        )
+        telemetry.observe(
+            "hard_filtering",
+            hard_filter_duration_ms,
+            candidate_count=len(normalized),
+        )
+        shortlist_started = perf_counter()
+        rankable = lexical_job_shortlist(
+            [item for item in normalized if item.requirement_status != RequirementStatus.CONFLICT],
+            request,
+            limit=30,
+        )
+        telemetry.observe("sparse_shortlist", round((perf_counter() - shortlist_started) * 1000), candidate_count=len(rankable), metadata={"shortlist_count": len(rankable)})
         for candidate in rankable:
             trust = assess_job_source(
                 candidate.source_url,
@@ -500,26 +685,27 @@ class JobSearchService:
                 approved_hosts=approved_job_hosts,
             )
             candidate.deterministic_match_features["source_trust"] = trust.model_dump()
-            if not trust.trusted_for_claims and candidate.verification_status == "verified":
-                candidate.verification_status = "requirements_not_fully_verified"
-                candidate.unknown_fields = sorted(set([*candidate.unknown_fields, "source_authenticity"]))
-            documents = self.indexer.index_candidate(
-                corpus_type="job",
-                user_id=user_id,
-                search_session_id=session["search_session_id"],
-                run_id=run_id,
-                candidate_id=candidate.candidate_id,
-                title=f"{candidate.title or ''} — {candidate.company or ''}".strip(" —"),
-                text="\n".join(filter(None, [candidate.title, candidate.company, candidate.location, candidate.employment_type, candidate.description_excerpt, candidate.eligibility])),
-                metadata={"source_name": candidate.source_name, "source_url": candidate.source_url, "verification_status": candidate.verification_status, "hard_requirement_states": {key: str(value) for key, value in candidate.hard_requirement_states.items()}},
-                evidence_ids=candidate.evidence_ids,
-            )
-            indexed_ids.extend(item["retrieval_document_id"] for item in documents)
+            candidate.source_status = SourceStatus.OFFICIAL_SOURCE if trust.trusted_for_claims else SourceStatus.UNVERIFIED_PUBLIC_SOURCE
+        embedding_candidates = rankable[:20]
+        embedding_started = perf_counter()
+        documents, embedding_stats = self.indexer.index_candidate_batch(
+            corpus_type="job", user_id=user_id,
+            search_session_id=session["search_session_id"], run_id=run_id,
+            candidates=[{
+                "candidate_id": candidate.candidate_id,
+                "title": f"{candidate.title or ''} — {candidate.company or ''}".strip(" —"),
+                "text": "\n".join(filter(None, [candidate.title, candidate.company, candidate.location, candidate.employment_type, candidate.description_excerpt, candidate.eligibility])),
+                "metadata": {"source_name": candidate.source_name, "source_url": candidate.source_url, "source_status": candidate.source_status, "requirement_status": candidate.requirement_status, "verification_status": candidate.verification_status, "hard_requirement_states": {key: str(value) for key, value in candidate.hard_requirement_states.items()}},
+                "evidence_ids": candidate.evidence_ids,
+            } for candidate in embedding_candidates], max_workers=4,
+        )
+        telemetry.observe("embedding", round((perf_counter() - embedding_started) * 1000), candidate_count=len(embedding_candidates), embedding_count=embedding_stats["embedding_count"], embedding_cache_hit_count=embedding_stats["embedding_cache_hit_count"])
+        indexed_ids = [item["retrieval_document_id"] for item in documents]
         query = " ".join([*request.target_roles, *request.role_keywords, *request.desired_job_skills, *request.industries]).strip() or "career opportunity"
         ranked_ids: list[str] = []
         rank_components: dict[str, dict[str, Any]] = {}
         if indexed_ids:
-            retrieval_result = self.retrieval.retrieve(user_id=user_id, query=query, corpus_types=["job"], top_k=min(request.max_results, 10), document_ids=indexed_ids)
+            retrieval_result = self.retrieval.retrieve(user_id=user_id, query=query, corpus_types=["job"], top_k=min(request.max_results, 10), document_ids=indexed_ids, phase_observer=telemetry.observe)
             warnings.extend(retrieval_result.warnings)
             for hit in retrieval_result.items:
                 candidate_id = str(hit.metadata.get("candidate_id") or "")
@@ -545,7 +731,34 @@ class JobSearchService:
             limiting_constraints=sorted({field for item in unverified for field in item.unknown_fields}),
             suggested_relaxations=[],
         )
-        records = [item.model_dump(mode="json") for item in [*verified, *unverified]]
+        live_records = [
+            item.model_dump(mode="json") for item in [*verified, *unverified]
+        ][:10]
+        demo_records: list[dict[str, Any]] = []
+        if should_use_demo_fallback(
+            judge_mode=judge_mode,
+            useful_live_count=len(live_records),
+            elapsed_seconds=perf_counter() - search_started,
+            provider_timed_out=provider_timed_out,
+        ):
+            live_ids = {item["candidate_id"] for item in live_records}
+            demo_records = [
+                JobCandidate.model_validate(item).model_dump(mode="json")
+                for item in load_demo_search_fixtures("jobs")
+                if item.get("candidate_id") not in live_ids
+            ][: max(0, min(request.requested_count, 10) - len(live_records))]
+            if demo_records:
+                warnings.append(
+                    "Demo snapshot suggestions are historical public-source samples, "
+                    "not claims that a posting is currently open."
+                )
+                telemetry.observe(
+                    "demo_snapshot_fallback",
+                    0,
+                    candidate_count=len(demo_records),
+                    metadata={"display_count": len(demo_records)},
+                )
+        records = [*live_records, *demo_records][:10]
         session = self.repository.update_search_session(
             user_id,
             session["search_session_id"],
@@ -563,6 +776,11 @@ class JobSearchService:
         result.source_calls = source_calls
         if isinstance(result.data, dict):
             result.data["sufficiency"] = sufficiency.model_dump(mode="json")
+        telemetry.observe(
+            "search_tool",
+            round((perf_counter() - search_started) * 1000),
+            candidate_count=len(result.data["page"]["items"]),
+        )
         return result
 
     @staticmethod
@@ -573,7 +791,7 @@ class JobSearchService:
         *,
         offset: int,
     ) -> ToolExecutionResult:
-        page_size = min(request.page_size, 20)
+        page_size = min(request.page_size, 10)
         page_records = records[offset : offset + page_size]
         summaries = []
         for item in page_records:
@@ -588,6 +806,8 @@ class JobSearchService:
                     "last_seen_iteration", "source_keys", "hard_requirement_states",
                     "job_required_skills", "job_preferred_skills", "ranking_components",
                     "verification_status",
+                    "source_status", "requirement_status", "is_demo_sample",
+                    "snapshot_date", "source_verified_at_snapshot",
                 )
             }
             excerpt = summary.get("description_excerpt")

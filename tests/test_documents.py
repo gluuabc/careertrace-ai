@@ -78,6 +78,34 @@ class DocumentServiceTests(unittest.TestCase):
         self.assertEqual(self.repository.list_documents(self.user["user_id"]), [])
         self.assertEqual(self.storage.objects, {})
 
+    def test_document_download_is_user_scoped_after_page_merge(self):
+        other = self.repository.get_or_create_user("Grace", "grace@example.com")
+        document = self.service.upload(
+            user_id=self.user["user_id"],
+            filename="resume.pdf",
+            content_type=PDF_MIME,
+            data=b"%PDF-1.4\nresume",
+            document_type="resume",
+        )
+        with self.assertRaisesRegex(ValueError, "not found"):
+            self.service.download(other["user_id"], document["document_id"])
+
+    def test_document_delete_is_user_scoped_after_page_merge(self):
+        other = self.repository.get_or_create_user("Grace", "grace@example.com")
+        document = self.service.upload(
+            user_id=self.user["user_id"],
+            filename="resume.pdf",
+            content_type=PDF_MIME,
+            data=b"%PDF-1.4\nresume",
+            document_type="resume",
+        )
+        with self.assertRaisesRegex(ValueError, "not found"):
+            self.service.delete(other["user_id"], document["document_id"])
+        self.assertEqual(
+            self.service.download(self.user["user_id"], document["document_id"]),
+            b"%PDF-1.4\nresume",
+        )
+
     def test_accepts_valid_docx_and_rejects_mismatches(self):
         validated = validate_document(
             filename="portfolio.docx",

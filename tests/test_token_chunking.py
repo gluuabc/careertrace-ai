@@ -1,5 +1,6 @@
 import io
 import json
+import os
 import unittest
 from unittest.mock import patch
 
@@ -26,6 +27,23 @@ class TokenAndChunkingTests(unittest.TestCase):
         self.assertEqual(fallback.count_source,"heuristic_fallback")
         self.assertGreater(heuristic_input_tokens([HumanMessage(content="hello")],tools=list(CAREER_AGENT_TOOLS)),heuristic_input_tokens([HumanMessage(content="hello")],tools=[]))
         self.assertTrue(canonical_tool_schemas())
+
+    def test_provider_aware_count_can_use_separate_supported_model(self):
+        class Client:
+            def count_tokens(self, **kwargs):
+                self.kwargs = kwargs
+                return {"inputTokens": 7}
+
+        client = Client()
+        with patch.dict(os.environ, {"BEDROCK_COUNT_TOKENS_MODEL": "direct-token-model"}):
+            result = BedrockTokenAccounting(client).count_message_input(
+                "generation-profile",
+                [HumanMessage(content="hello")],
+                tools=[],
+                exact_trigger=0,
+            )
+        self.assertEqual(result.count_source, "bedrock_count_tokens")
+        self.assertEqual(client.kwargs["modelId"], "direct-token-model")
 
     def test_final_preflight_counts_tool_messages(self):
         base=[HumanMessage(content="request")]

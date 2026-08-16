@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Protocol
 
 import boto3
+from botocore.config import Config
 
 
 CHUNKING_STRATEGY = "recursive_structure_v1"
@@ -154,7 +155,15 @@ class TitanEmbeddingProvider:
     def __init__(self, client=None):
         self.model_id = os.getenv("BEDROCK_EMBEDDING_MODEL", "amazon.titan-embed-text-v2:0")
         self.dimensions = int(os.getenv("BEDROCK_EMBEDDING_DIMENSIONS", "1024"))
-        self.client = client or boto3.client("bedrock-runtime", region_name=os.getenv("AWS_REGION", "us-east-1"))
+        self.client = client or boto3.client(
+            "bedrock-runtime",
+            region_name=os.getenv("AWS_REGION", "us-east-1"),
+            config=Config(
+                connect_timeout=float(os.getenv("BEDROCK_CONNECT_TIMEOUT_SECONDS", "3")),
+                read_timeout=float(os.getenv("BEDROCK_READ_TIMEOUT_SECONDS", "10")),
+                retries={"max_attempts": int(os.getenv("BEDROCK_MAX_ATTEMPTS", "2")), "mode": "standard"},
+            ),
+        )
         self.last_input_tokens: int | None = None
 
     def embed(self, text: str) -> list[float]:
