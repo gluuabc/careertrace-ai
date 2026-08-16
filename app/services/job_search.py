@@ -48,6 +48,14 @@ def _normalized(value: str | None) -> str:
     return " ".join(str(value or "").casefold().split())
 
 
+_JUNIOR_SENIORITY_PATTERN = re.compile(r"\b(?:intern(?:ship|s)?|junior|entry[\s-]+level|new\s+grad)\b")
+_SENIOR_SENIORITY_PATTERN = re.compile(r"\b(?:senior|staff|principal|lead|director)\b")
+
+
+def _matches_seniority_terms(normalized_text: str, pattern: re.Pattern[str]) -> bool:
+    return bool(pattern.search(normalized_text))
+
+
 def extract_explicit_eligibility(description: str | None) -> str | None:
     if not description:
         return None
@@ -154,10 +162,10 @@ def apply_hard_filters(candidate: JobCandidate, request: JobSearchRequest) -> Jo
                 set_state("location", RequirementState.CONFLICT)
     requested_roles = _normalized(" ".join(request.target_roles))
     candidate_title = _normalized(candidate.title)
-    junior_request = any(term in requested_roles for term in ("intern", "junior", "entry level", "new grad"))
-    senior_request = any(term in requested_roles for term in ("senior", "staff", "principal", "lead", "director"))
-    junior_candidate = any(term in candidate_title for term in ("intern", "junior", "entry level", "new grad"))
-    senior_candidate = any(term in candidate_title for term in ("senior", "staff", "principal", "lead", "director"))
+    junior_request = _matches_seniority_terms(requested_roles, _JUNIOR_SENIORITY_PATTERN)
+    senior_request = _matches_seniority_terms(requested_roles, _SENIOR_SENIORITY_PATTERN)
+    junior_candidate = _matches_seniority_terms(candidate_title, _JUNIOR_SENIORITY_PATTERN)
+    senior_candidate = _matches_seniority_terms(candidate_title, _SENIOR_SENIORITY_PATTERN)
     if (junior_request and senior_candidate) or (senior_request and junior_candidate):
         set_state("seniority", RequirementState.CONFLICT)
     if request.remote_preference and request.remote_preference.casefold() not in {"flexible", "any"}:
