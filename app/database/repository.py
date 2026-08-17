@@ -778,6 +778,15 @@ class ProfileRepository(AgentRepositoryMixin):
         accept: bool,
         conflict_resolution: str | None = None,
     ) -> dict[str, Any] | None:
+        preview = next(
+            (item for item in self.list_memory_candidates(user_id) if item["candidate_id"] == candidate_id),
+            None,
+        )
+        if preview and preview.get("memory_kind") in {"semantic", "episodic"}:
+            return self._review_structured_memory_candidate(
+                user_id, candidate_id, accept=accept,
+                conflict_resolution=conflict_resolution,
+            )
         accepted_memory: dict[str, Any] | None = None
         with session_scope(self.session_factory) as session:
             candidate = session.scalar(
@@ -930,6 +939,105 @@ class ProfileRepository(AgentRepositoryMixin):
                 session.flush()
                 accepted_memory = self._memory_dict(memory)
         return accepted_memory
+
+    def _review_structured_memory_candidate(
+        self, user_id: str, candidate_id: str, *, accept: bool,
+        conflict_resolution: str | None,
+    ) -> dict[str, Any] | None:
+        result: dict[str, Any] | None = None
+        kind = ""
+        with session_scope(self.session_factory) as session:
+            candidate = session.scalar(select(MemoryCandidate).where(
+                MemoryCandidate.candidate_id == candidate_id,
+                MemoryCandidate.user_id == user_id,
+            ))
+            if candidate is None or candidate.status != "pending":
+                raise ValueError("Memory candidate was not found or has already been reviewed.")
+            resolution = conflict_resolution or ("use_new" if accept else "reject_new")
+            if candidate.operation == "CONFLICT" and resolution not in {"keep_existing", "use_new", "keep_both", "reject_new"}:
+                raise ValueError("Unsupported conflict resolution.")
+            candidate.reviewed_at = datetime.now(timezone.utc)
+            candidate.status = "accepted" if accept else "rejected"
+            if not accept or resolution in {"keep_existing", "reject_new"}:
+                candidate.status = "rejected"
+                return None
+            kind = candidate.memory_kind
+            if kind == "semantic":
+                existing = session.scalar(select(SemanticMemory).where(
+                    SemanticMemory.semantic_memory_id == candidate.existing_entity_id,
+                    SemanticMemory.user_id == user_id,
+                )) if candidate.existing_entity_id else None
+                if candidate.operation == "REVOKE":
+                    if existing is None:
+                        raise ValueError("The semantic memory selected for revocation no longer exists.")
+                    existing.active = False
+                    existing.revoked_at = datetime.now(timezone.utc)
+                    existing.retrieval_index_status = "inactive"
+                    session.execute(update(RetrievalDocument).where(
+                        RetrievalDocument.user_id == user_id,
+                        RetrievalDocument.corpus_type == "semantic_memory",
+                        RetrievalDocument.source_entity_id.like(f"{existing.semantic_memory_id}%"),
+                    ).values(active=False))
+                    return self._semantic_memory_dict(existing)
+                if candidate.operation in {"UPDATE", "CONFLICT"} and resolution == "use_new":
+                    if existing is None:
+                        raise ValueError("The semantic memory selected for update no longer exists.")
+                    existing.active = False
+                    existing.revoked_at = datetime.now(timezone.utc)
+                    existing.retrieval_index_status = "inactive"
+                    session.execute(update(RetrievalDocument).where(
+                        RetrievalDocument.user_id == user_id,
+                        RetrievalDocument.corpus_type == "semantic_memory",
+                        RetrievalDocument.source_entity_id.like(f"{existing.semantic_memory_id}%"),
+                    ).values(active=False))
+                item = SemanticMemory(
+                    user_id=user_id, semantic_group=candidate.semantic_group or candidate.category,
+                    topic_key=candidate.topic_key,
+                    value=candidate.proposed_value if candidate.proposed_value is not None else candidate.content,
+                    source=candidate.source, source_conversation_id=candidate.source_conversation_id,
+                    source_message_ids=list(candidate.source_message_ids or []), evidence_text=candidate.evidence_text,
+                    active=True, retrieval_index_status="pending",
+                    supersedes_semantic_memory_id=existing.semantic_memory_id if existing and resolution != "keep_both" else None,
+                )
+                session.add(item)
+                session.flush()
+                result = self._semantic_memory_dict(item)
+            else:
+                item = CareerEvent(
+                    user_id=user_id, content=candidate.content, event_status=candidate.event_status or "unknown",
+                    event_time=candidate.event_time, raw_temporal_expression=candidate.raw_temporal_expression,
+                    source=candidate.source, source_conversation_id=candidate.source_conversation_id,
+                    source_message_ids=list(candidate.source_message_ids or []), evidence_text=candidate.evidence_text,
+                    active=True, retrieval_index_status="pending",
+                )
+                session.add(item)
+                session.flush()
+                result = self._career_event_dict(item)
+        if result is None:
+            return None
+        error_name = None
+        try:
+            from app.database.retrieval_repository import RetrievalRepository
+            from app.services.retrieval_corpus import RetrievalCorpusIndexer
+            indexer = RetrievalCorpusIndexer(RetrievalRepository(self.session_factory))
+            if kind == "semantic":
+                indexer.index_semantic_memory(user_id=user_id, memory=result)
+            else:
+                indexer.index_career_event(user_id=user_id, event=result)
+        except Exception as error:
+            error_name = type(error).__name__
+        with session_scope(self.session_factory) as session:
+            if kind == "semantic":
+                item = session.get(SemanticMemory, result["semantic_memory_id"])
+                item.retrieval_index_status = "failed" if error_name else "synced"
+                item.retrieval_index_error = error_name
+                result = self._semantic_memory_dict(item)
+            else:
+                item = session.get(CareerEvent, result["career_event_id"])
+                item.retrieval_index_status = "failed" if error_name else "synced"
+                item.retrieval_index_error = error_name
+                result = self._career_event_dict(item)
+        return result
 
     def list_memories(
         self, user_id: str, *, include_inactive: bool = False
@@ -1380,12 +1488,23 @@ class ProfileRepository(AgentRepositoryMixin):
         effective_profile = dict(persisted_profile)
         flexible: dict[str, list[str]] = {}
         list_fields = {"skills", "projects", "experience", "education"}
+        newest_profile_write: dict[str, datetime] = {}
+        for revision in self.list_profile_field_revisions(user_id):
+            newest_profile_write.setdefault(
+                revision["field_key"], datetime.fromisoformat(revision["created_at"])
+            )
         for signal in self.list_conversation_memory_signals(user_id, conversation_id):
             signal_type = signal["type"]
             operation = signal["operation_hint"]
             values = list(signal["value_hint"])
             if signal_type.startswith("profile."):
                 field = signal_type.split(".", 1)[1]
+                saved_at = newest_profile_write.get(field)
+                signal_at = datetime.fromisoformat(signal["created_at"])
+                if saved_at is not None and signal_at <= saved_at:
+                    # A later explicit Profile save/approval is authoritative for
+                    # this field; stale conversation hints cannot override it.
+                    continue
                 if field in list_fields:
                     current = list(effective_profile.get(field) or [])
                     if operation == "replace":

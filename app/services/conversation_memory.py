@@ -119,6 +119,7 @@ def build_memory_extraction_input(
         item for item in repository.list_memories(user_id)
         if item["category"] in memory_types
     ][:5]
+    active_semantic = repository.list_semantic_memories(user_id)
     groups: dict[str, list[dict[str, Any]]] = {}
     for signal in signals:
         groups.setdefault(signal["type"], []).append(signal)
@@ -136,6 +137,8 @@ def build_memory_extraction_input(
         "signals_grouped_chronologically": groups,
         "relevant_profile": {field: profile.get(field) for field in referenced_fields},
         "relevant_approved_memories": relevant_memories,
+        "active_semantic_groups": sorted({item["semantic_group"] for item in active_semantic}),
+        "active_semantic_topic_keys": sorted({item["topic_key"] for item in active_semantic if item.get("topic_key")}),
         "estimated_input_tokens": selected_tokens,
         "max_input_tokens": max_tokens,
         "marked_source_message_ids": sorted(marked_ids),
@@ -318,9 +321,16 @@ class ConversationMemoryExtractor:
             return run
         try:
             prompt = [HumanMessage(content=(
-                "Extract only explicit durable candidate proposals from this bounded "
-                "conversation segment. Profile fields win over flexible memory. Compare "
-                "same-type statements chronologically. Do not invent values or event times.\n"
+                "Extract only explicit, self-owned durable candidate proposals from USER messages. "
+                "Use destination profile, semantic_memory, episodic_memory, or none. Profile fields "
+                "win whenever the fact fits the supplied canonical Profile schema. Semantic groups "
+                "are normalized open strings; preference, goal, constraint, interest, work_style, "
+                "value, and motivation are non-exhaustive examples. Reuse an active topic_key when "
+                "it accurately fits, otherwise propose safe snake_case. Future career plans are "
+                "episodic with planned status. Provide an exact evidence substring and character "
+                "offsets into its source user message. Never paraphrase evidence or invent temporal "
+                "values. Numeric confidence is internal only.\nCanonical Profile fields: "
+                + ", ".join(ProfileFacts.model_fields) + "\n"
                 + json.dumps(payload, ensure_ascii=False, default=str)
             ))]
             try:

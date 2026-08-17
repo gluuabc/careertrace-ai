@@ -843,11 +843,12 @@ def _render_memory(user_id: str) -> None:
                     st.rerun()
 
     st.markdown("### Approved Memories")
-    memories = [
+    memory_rows = [
         *profile_repository.list_semantic_memories(user_id),
         *profile_repository.list_career_events(user_id),
         *profile_repository.list_memories(user_id),
     ]
+    memories = list({item["memory_id"]: item for item in reversed(memory_rows)}.values())
     if not memories:
         st.info("No approved flexible memories yet.")
     for memory in memories:

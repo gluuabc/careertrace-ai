@@ -6,6 +6,8 @@ Revises: 20260815_16
 
 from alembic import op
 import sqlalchemy as sa
+from datetime import datetime
+import json
 
 
 revision = "20260817_17"
@@ -106,38 +108,61 @@ def upgrade() -> None:
 
     connection = op.get_bind()
     legacy = connection.execute(sa.text("SELECT * FROM memories")).mappings().all()
-    semantic = sa.table("semantic_memories", *(sa.column(name) for name in (
-        "semantic_memory_id", "user_id", "semantic_group", "topic_key", "value", "source",
-        "source_conversation_id", "source_message_ids", "evidence_text", "active",
-        "supersedes_semantic_memory_id", "revoked_at", "retrieval_index_status",
-        "retrieval_index_error", "created_at")))
-    events = sa.table("career_events", *(sa.column(name) for name in (
-        "career_event_id", "user_id", "career_path_id", "content", "event_status", "event_time",
-        "raw_temporal_expression", "title", "description", "start_date", "end_date", "outcome",
-        "source", "source_conversation_id", "source_message_ids", "evidence_text", "active",
-        "supersedes_event_id", "revoked_at", "retrieval_index_status", "retrieval_index_error", "created_at")))
+    semantic = sa.table(
+        "semantic_memories",
+        sa.column("semantic_memory_id", sa.String), sa.column("user_id", sa.String),
+        sa.column("semantic_group", sa.String), sa.column("topic_key", sa.String),
+        sa.column("value", sa.JSON), sa.column("source", sa.String),
+        sa.column("source_conversation_id", sa.String), sa.column("source_message_ids", sa.JSON),
+        sa.column("evidence_text", sa.Text), sa.column("active", sa.Boolean),
+        sa.column("supersedes_semantic_memory_id", sa.String), sa.column("revoked_at", sa.DateTime(timezone=True)),
+        sa.column("retrieval_index_status", sa.String), sa.column("retrieval_index_error", sa.Text),
+        sa.column("created_at", sa.DateTime(timezone=True)),
+    )
+    events = sa.table(
+        "career_events",
+        sa.column("career_event_id", sa.String), sa.column("user_id", sa.String),
+        sa.column("career_path_id", sa.String), sa.column("content", sa.Text),
+        sa.column("event_status", sa.String), sa.column("event_time", sa.DateTime(timezone=True)),
+        sa.column("raw_temporal_expression", sa.String), sa.column("title", sa.String),
+        sa.column("description", sa.Text), sa.column("start_date", sa.DateTime(timezone=True)),
+        sa.column("end_date", sa.DateTime(timezone=True)), sa.column("outcome", sa.Text),
+        sa.column("source", sa.String), sa.column("source_conversation_id", sa.String),
+        sa.column("source_message_ids", sa.JSON), sa.column("evidence_text", sa.Text),
+        sa.column("active", sa.Boolean), sa.column("supersedes_event_id", sa.String),
+        sa.column("revoked_at", sa.DateTime(timezone=True)), sa.column("retrieval_index_status", sa.String),
+        sa.column("retrieval_index_error", sa.Text), sa.column("created_at", sa.DateTime(timezone=True)),
+    )
     for row in legacy:
+        def timestamp(value):
+            return datetime.fromisoformat(value) if isinstance(value, str) else value
+        def json_list(value):
+            return json.loads(value) if isinstance(value, str) else (value or [])
         if row["category"] == "event":
             connection.execute(events.insert().values(
                 career_event_id=row["memory_id"], user_id=row["user_id"], career_path_id=None,
-                content=row["content"], event_status="unknown", event_time=row.get("event_time"),
+                content=row["content"], event_status="unknown", event_time=timestamp(row.get("event_time")),
                 raw_temporal_expression=None, title=None, description=None, start_date=None, end_date=None,
                 outcome=None, source=row["source"], source_conversation_id=row.get("source_conversation_id"),
-                source_message_ids=row.get("source_message_ids") or [], evidence_text=None,
+                source_message_ids=json_list(row.get("source_message_ids")), evidence_text=None,
                 active=row.get("active", True), supersedes_event_id=row.get("supersedes_memory_id"),
-                revoked_at=row.get("revoked_at"), retrieval_index_status=row.get("retrieval_index_status") or "pending",
-                retrieval_index_error=row.get("retrieval_index_error"), created_at=row["created_at"],
+                revoked_at=timestamp(row.get("revoked_at")), retrieval_index_status=row.get("retrieval_index_status") or "pending",
+                retrieval_index_error=row.get("retrieval_index_error"), created_at=timestamp(row["created_at"]),
             ))
         else:
             connection.execute(semantic.insert().values(
                 semantic_memory_id=row["memory_id"], user_id=row["user_id"], semantic_group=row["category"],
                 topic_key=None, value=row["content"], source=row["source"],
-                source_conversation_id=row.get("source_conversation_id"), source_message_ids=row.get("source_message_ids") or [],
+                source_conversation_id=row.get("source_conversation_id"), source_message_ids=json_list(row.get("source_message_ids")),
                 evidence_text=None, active=row.get("active", True),
-                supersedes_semantic_memory_id=row.get("supersedes_memory_id"), revoked_at=row.get("revoked_at"),
+                supersedes_semantic_memory_id=row.get("supersedes_memory_id"), revoked_at=timestamp(row.get("revoked_at")),
                 retrieval_index_status=row.get("retrieval_index_status") or "pending",
-                retrieval_index_error=row.get("retrieval_index_error"), created_at=row["created_at"],
+                retrieval_index_error=row.get("retrieval_index_error"), created_at=timestamp(row["created_at"]),
             ))
+        connection.execute(sa.text(
+            "UPDATE retrieval_documents SET corpus_type = :corpus "
+            "WHERE corpus_type = 'approved_memory' AND source_entity_id LIKE :prefix"
+        ), {"corpus": "episodic_event" if row["category"] == "event" else "semantic_memory", "prefix": f"{row['memory_id']}%"})
 
 
 def downgrade() -> None:
