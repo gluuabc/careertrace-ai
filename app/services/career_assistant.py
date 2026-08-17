@@ -67,6 +67,7 @@ def respond_to_user(
         event_handler(
             {
                 "type": "final",
+                "user_id": user_id,
                 "run_id": result.get("run_id"),
                 "conversation_id": conversation_id,
                 "status": result.get("status"),
@@ -75,6 +76,9 @@ def respond_to_user(
                 "job_candidates": result.get("job_candidates", []),
                 "people_candidates": result.get("people_candidates", []),
                 "workflow_stage": result.get("workflow_stage"),
+                "personalization_references": result.get(
+                    "personalization_references", {}
+                ),
             }
         )
     return response

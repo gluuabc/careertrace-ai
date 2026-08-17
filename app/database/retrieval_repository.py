@@ -15,7 +15,7 @@ from app.database.models import RetrievalDocument, RetrievalQueryLog, User
 
 
 TOKEN = re.compile(r"[a-z0-9+#.][a-z0-9_+#.-]*", re.I)
-CORPUS_TYPES = {"job", "person", "user_connection", "resume", "project", "uploaded_document_chunk", "approved_memory", "evidence"}
+CORPUS_TYPES = {"job", "person", "user_connection", "resume", "project", "uploaded_document_chunk", "approved_memory", "semantic_memory", "episodic_event", "evidence"}
 
 
 def _tokens(value: str) -> list[str]:

@@ -69,12 +69,35 @@ and one concrete next action. Never pretend success.
 </skill_catalog>"""
 
 
+ROUTING_CLASSIFIER_VERSION = "intent-decision-v2"
+ROUTING_PROMPT_VERSION = "routing-2026-08-15-v2"
+
+
 ROUTING_SYSTEM_PROMPT = """You are the controlled CareerTrace intent router.
-Classify the user's latest request into exactly one supported CareerIntent.
-Use conversation history only to resolve references and follow-ups. Do not plan
-the workflow, call tools, infer missing entities, or change profile data. Set
-needs_user_input only when one concise clarification is required to select or
-continue a workflow. Return only the requested structured decision."""
+Classify only the user's latest request into one supported CareerIntent.
+Conversation history and active workflow may resolve a pronoun or direct
+follow-up, but a new self-contained request overrides stale workflow context.
+Do not plan a workflow, call tools, infer missing entities, or change profile
+data.
+
+job_search requires an explicit request to retrieve actual opportunities, such
+as finding, searching, showing, or listing current openings or jobs to apply to.
+Role comparison, fit, requirements, skill gaps, prioritization, and career-path
+advice are concise_guidance even when they mention jobs, roles, or internships.
+A mixed advice request that explicitly asks for openings is job_search.
+people_search retrieves people. resume_revision edits a resume. outreach drafts
+a message. If the user requests multiple incompatible actions without priority,
+use clarification and ask one concise question. Also use clarification when the
+request lacks enough information to select a supported workflow.
+
+Memory signals are proposals only. Emit them only for explicit first-person
+durable statements. Questions, comparisons, hypotheticals, prior assistant
+recommendations, and role alternatives are not memory. A mixed explicit durable
+statement plus a question may emit only the explicit statement. Use only the
+supported namespaced profile.* and memory.* signal types. value_hint contains
+only short explicit values; operation_hint is add, replace, or remove. Never
+infer a profile fact or durable memory. Return only the requested structured
+IntentDecision."""
 
 
 def build_system_prompt(skill_catalog: str) -> str:

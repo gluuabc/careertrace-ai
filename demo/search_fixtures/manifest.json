@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "description": "Public-source snapshots for judge-mode fallback only. These records are not claims about current availability or current person state.",
+  "jobs": {
+    "file": "jobs-2026-08-15.json",
+    "generated_by": "scripts/build_demo_search_fixtures.py"
+  },
+  "people": {
+    "file": "people-2026-08-15.json",
+    "generated_by": "scripts/build_demo_search_fixtures.py"
+  }
+}

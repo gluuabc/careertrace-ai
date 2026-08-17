@@ -2,18 +2,22 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from typing import Any
 from collections.abc import Callable
 
-from langchain_core.messages import AIMessage, ToolMessage
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langgraph.graph import END, START, StateGraph
 from langgraph.prebuilt import ToolNode
+from pydantic import BaseModel
 
 from app.database.repository import ProfileRepository, profile_repository
 from app.graph.checkpoint import get_default_checkpointer
 from app.llm.model import get_llm
+from app.prompts import ROUTING_CLASSIFIER_VERSION, ROUTING_PROMPT_VERSION
 from app.services.context_manager import ContextManager, context_manager
 from app.services.errors import safe_provider_message, sanitize_diagnostic
+from app.services.memory_signals import detect_memory_signals, merge_memory_signals
 from app.services.skill_registry import SkillRegistry, skill_registry
 from app.services.trajectory import TrajectoryRecorder
 from app.services.token_accounting import ModelCallObserver
@@ -69,11 +73,134 @@ ALLOWED_TOOLS_BY_INTENT = {
     },
 }
 SOURCE_TOOLS = {"search_jobs", "search_people"}
+OPPORTUNITY_NOUNS = r"(?:jobs?|internships?|openings?|positions?|roles?|opportunities)"
+
+
+def _has_explicit_job_retrieval_intent(request: str) -> bool:
+    """Require an action to retrieve actual opportunities, not a role noun."""
+
+    value = " ".join(request.casefold().split())
+    patterns = (
+        rf"\b(?:find|search(?:\s+for)?|look\s+for|locate|retrieve)\b.{{0,100}}\b{OPPORTUNITY_NOUNS}\b",
+        rf"\b(?:show|list|give)\s+(?:me\s+)?(?:\d+\s+)?(?:\w+\s+){{0,6}}{OPPORTUNITY_NOUNS}\b",
+        r"\b(?:current|open|available|live|actual)\s+(?:\w+\s+){0,5}(?:jobs?|internships?|openings?|positions?|opportunities)\b",
+        rf"\b{OPPORTUNITY_NOUNS}\b.{{0,60}}\b(?:i\s+can\s+apply\s+to|apply\s+to|accepting\s+applications)\b",
+    )
+    return any(re.search(pattern, value) for pattern in patterns)
+
+
+def _is_role_guidance_request(request: str) -> bool:
+    """Recognize advisory role-fit questions without treating nouns as search."""
+
+    value = " ".join(request.casefold().split())
+    patterns = (
+        r"\b(?:which|what)\b.{0,80}\b(?:role|job|internship|career\s+path)s?\b.{0,80}\b(?:fit|fits|best|better|suit|sense)\b",
+        r"\b(?:fit|fits|fitting)\b.{0,50}\b(?:me|my\s+(?:profile|background|skills|experience))\b",
+        r"\b(?:should\s+i|compare|stronger\s+fit|best\s+fit|career\s+path)\b",
+        r"\bwhat\b.{0,40}\b(?:skills?|requirements?)\b.{0,60}\b(?:missing|need|for)\b",
+        r"\b(?:skills?\s+gaps?|requirements?)\s+for\b",
+        r"\bwhat\s+should\s+i\s+prioritize\b",
+        r"\bwhat\s+kinds?\s+of\s+(?:jobs?|internships?|roles?)\b",
+        r"\b(?:realistic\s+goal|make\s+the\s+most\s+sense)\b",
+    )
+    return any(re.search(pattern, value) for pattern in patterns)
+
+
+def enforce_intent_boundaries(
+    request: str, decision: IntentDecision
+) -> tuple[IntentDecision, bool]:
+    """Prevent uncertain or non-retrieval requests from entering source workflows."""
+
+    value = " ".join(request.casefold().split())
+    if re.fullmatch(
+        r"(?:please\s+)?(?:help|advise|guide)\s+me(?:\s+with|\s+on|\s+about)?\s+(?:my\s+)?career[.!?]?",
+        value,
+    ):
+        return decision.model_copy(
+            update={
+                "intent": CareerIntent.CLARIFICATION,
+                "needs_user_input": True,
+                "clarification_question": (
+                    "Would you like career guidance, a job search, resume help, or outreach help?"
+                ),
+            }
+        ), True
+    requested_actions = {
+        action
+        for action, patterns in {
+            CareerIntent.JOB_SEARCH: (
+                rf"\b(?:find|search|show|list|locate)\b.{{0,100}}\b{OPPORTUNITY_NOUNS}\b",
+            ),
+            CareerIntent.PEOPLE_SEARCH: (
+                r"\b(?:find|search|show|locate)\b.{0,100}\b(?:people|person|alumni|recruiters?|mentors?|professionals?)\b",
+            ),
+            CareerIntent.RESUME_REVISION: (
+                r"\b(?:edit|revise|rewrite|tailor|improve|update)\b.{0,80}\b(?:resume|cv)\b",
+            ),
+            CareerIntent.OUTREACH: (
+                r"\b(?:draft|write|compose|create)\b.{0,80}\b(?:message|email|outreach|note)\b",
+            ),
+        }.items()
+        if any(re.search(pattern, value) for pattern in patterns)
+    }
+    if len(requested_actions) > 1:
+        return decision.model_copy(
+            update={
+                "intent": CareerIntent.CLARIFICATION,
+                "needs_user_input": True,
+                "clarification_question": (
+                    "Which action should I handle first?"
+                ),
+            }
+        ), True
+
+    if decision.intent != CareerIntent.JOB_SEARCH:
+        return decision, False
+    if _has_explicit_job_retrieval_intent(request):
+        return decision, False
+    if _is_role_guidance_request(request) or re.search(
+        rf"\b{OPPORTUNITY_NOUNS}\b", request.casefold()
+    ):
+        return decision.model_copy(
+            update={"intent": CareerIntent.CONCISE_GUIDANCE}
+        ), True
+    return decision, False
+
+
+def parse_structured_job_request(
+    request: str, profile: dict[str, Any] | None
+) -> JobSearchRequest | None:
+    """Use a deterministic fast path only for clearly structured job searches."""
+
+    text = " ".join(request.strip().split())
+    lowered = text.casefold()
+    count_match = re.search(r"\b(?:find|show|give me)\s+(\d{1,2})\b", lowered)
+    location_match = re.search(r"\bin\s+([A-Za-z][A-Za-z .-]{1,50})[.!?]?$", text)
+    employment = ["Internship"] if "intern" in lowered else []
+    if not count_match or not location_match or not employment:
+        return None
+    role_text = re.sub(r"^(?:find|show|give me)\s+\d{1,2}\s+", "", text, flags=re.I)
+    role_text = re.sub(r"\s+in\s+[A-Za-z][A-Za-z .-]{1,50}[.!?]?$", "", role_text, flags=re.I)
+    role_text = re.sub(r"\b(internships?|roles?|jobs?)\b", "", role_text, flags=re.I).strip()
+    if not role_text:
+        return None
+    profile = profile or {}
+    return JobSearchRequest(
+        target_roles=[role_text],
+        locations=[location_match.group(1).strip().rstrip(".!?")],
+        employment_types=employment,
+        graduation_year=profile.get("graduation_year"),
+        work_authorization_requirement=profile.get("work_authorization"),
+        profile_skills=list(profile.get("skills") or []),
+        requested_count=min(int(count_match.group(1)), 10),
+        max_results=10,
+    )
 
 
 def _fallback_intent(request: str) -> IntentDecision:
+    memory_signals = detect_memory_signals(request)
     value = request.casefold()
-    if any(term in value for term in ("find job", "search job", "opening", "internship")):
+    if _has_explicit_job_retrieval_intent(request):
         intent = CareerIntent.JOB_SEARCH
     elif "resume" in value and any(
         term in value for term in ("revise", "improve", "tailor", "rewrite", "edit")
@@ -95,15 +222,8 @@ def _fallback_intent(request: str) -> IntentDecision:
         intent = CareerIntent.PEOPLE_SEARCH
     elif any(term in value for term in ("career plan", "career timeline", "action plan")):
         intent = CareerIntent.ACTION_PLAN
-    elif any(
-        term in value
-        for term in (
-            "what role",
-            "which role",
-            "career advice",
-            "career guidance",
-            "what should i prioritize",
-        )
+    elif _is_role_guidance_request(request) or any(
+        term in value for term in ("career advice", "career guidance")
     ):
         intent = CareerIntent.CONCISE_GUIDANCE
     else:
@@ -115,8 +235,11 @@ def _fallback_intent(request: str) -> IntentDecision:
                 "Would you like career guidance, a job search, a people search, "
                 "a resume revision, or an outreach draft?"
             ),
+            memory_signals=memory_signals,
         )
-    return IntentDecision(intent=intent, goal=request.strip())
+    return IntentDecision(
+        intent=intent, goal=request.strip(), memory_signals=memory_signals
+    )
 
 
 class CareerAgentGraph:
@@ -167,7 +290,7 @@ class CareerAgentGraph:
         )
         graph.add_conditional_edges(
             "prepare_workflow",
-            lambda state: "action" if state.get("intent") in ACTION_INTENTS else "respond",
+            self._route_after_prepare,
             {"action": "plan_action", "respond": "agent_model"},
         )
         graph.add_conditional_edges(
@@ -268,6 +391,42 @@ class CareerAgentGraph:
                 f"diagnostic={diagnostic}",
                 "completed",
             )
+        if routing_source in {"llm", "llm_retry"}:
+            decision, boundary_overrode = enforce_intent_boundaries(
+                request, decision
+            )
+            if boundary_overrode:
+                routing_source = "llm_boundary_override"
+        routing_diagnostics = {
+            "classifier_version": ROUTING_CLASSIFIER_VERSION,
+            "prompt_version": ROUTING_PROMPT_VERSION,
+            "model_role": "cheap",
+            "validation_result": (
+                "deterministic_fallback"
+                if routing_source in {
+                    "deterministic_fallback", "clarification_after_failure"
+                }
+                else "overridden"
+                if routing_source == "llm_boundary_override"
+                else "accepted"
+            ),
+            "escalated": False,
+            "final_intent": decision.intent.value,
+        }
+        decision.memory_signals = merge_memory_signals(
+            decision.memory_signals, detect_memory_signals(request)
+        )
+        decision.memory_worthy = bool(decision.memory_signals)
+        signal_payload = [
+            item.model_dump(mode="json") for item in decision.memory_signals
+        ]
+        if signal_payload and state.get("user_message_id"):
+            self.repository.record_conversation_memory_signals(
+                state["user_id"],
+                state["conversation_id"],
+                state["user_message_id"],
+                signal_payload,
+            )
         self.repository.update_agent_run(
             state["user_id"],
             state["run_id"],
@@ -277,7 +436,13 @@ class CareerAgentGraph:
         )
         TrajectoryRecorder(state["user_id"], state["run_id"], self.repository).step(
             "classify_intent",
-            f"Routed request to {decision.intent.value}; routing_source={routing_source}.",
+            (
+                f"Routed request to {decision.intent.value}; "
+                f"classifier_version={ROUTING_CLASSIFIER_VERSION}; "
+                f"prompt_version={ROUTING_PROMPT_VERSION}; "
+                f"validation={routing_diagnostics['validation_result']}; "
+                "escalated=false."
+            ),
         )
         return {
             "intent": decision.intent,
@@ -286,6 +451,9 @@ class CareerAgentGraph:
             "final_response": decision.clarification_question or "",
             "workflow_stage": "preparing_workflow",
             "routing_source": routing_source,
+            "routing_diagnostics": routing_diagnostics,
+            "memory_worthy": decision.memory_worthy,
+            "memory_signals": signal_payload,
             "warnings": warnings,
         }
 
@@ -323,7 +491,21 @@ class CareerAgentGraph:
     def plan_action(self, state: CareerAgentState) -> dict[str, Any]:
         intent = CareerIntent(state["intent"])
         tool_name, schema, argument_name = TOOL_BY_INTENT[intent]
-        profile = self.repository.get_profile(state["user_id"])
+        profile, profile_references, conversation_context = (
+            self.context.memory_service.profile_projection(
+                user_id=state["user_id"],
+                conversation_id=state["conversation_id"],
+                intent=intent,
+                query=state["current_request"],
+            )
+        )
+        if conversation_context["current_thread_memories"]:
+            profile = {
+                **profile,
+                "current_thread_memories": conversation_context[
+                    "current_thread_memories"
+                ],
+            }
         routing_messages = self.context.build_routing_messages(
             user_id=state["user_id"],
             conversation_id=state["conversation_id"],
@@ -368,10 +550,16 @@ class CareerAgentGraph:
             selected=selected,
         )
         try:
-            planned = self._invoke_observed(
-                self.model_factory("reasoning").with_structured_output(schema),
-                prompt, state, stage="plan_action", model_type="reasoning",
+            planned = (
+                parse_structured_job_request(state["current_request"], profile)
+                if intent == CareerIntent.JOB_SEARCH
+                else None
             )
+            if planned is None:
+                planned = self._invoke_observed(
+                    self.model_factory("reasoning").with_structured_output(schema),
+                    prompt, state, stage="plan_action", model_type="reasoning",
+                )
             if not isinstance(planned, schema):
                 planned = schema.model_validate(planned)
             if isinstance(planned, JobSearchRequest):
@@ -390,7 +578,14 @@ class CareerAgentGraph:
                     }
                 ],
             )
-            return {"messages": [message], "workflow_stage": "executing_tools"}
+            references = dict(state.get("personalization_references") or {})
+            references["profile"] = profile_references
+            references.setdefault("approved_memories", [])
+            return {
+                "messages": [message],
+                "workflow_stage": "executing_tools",
+                "personalization_references": references,
+            }
         except Exception as error:
             diagnostic = sanitize_diagnostic(error)
             response = (
@@ -402,9 +597,14 @@ class CareerAgentGraph:
                 "current_error": diagnostic,
                 "final_response": response,
                 "workflow_stage": "needs_input",
+                "personalization_references": {
+                    "profile": profile_references,
+                    "approved_memories": [],
+                },
             }
 
     def agent_model(self, state: CareerAgentState) -> dict[str, Any]:
+        loaded_references: dict[str, Any] = {}
         messages = self.context.build_messages(
             user_id=state["user_id"],
             conversation_id=state["conversation_id"],
@@ -414,11 +614,42 @@ class CareerAgentGraph:
             loaded_skills=state.get("loaded_skills", {}),
             agent_status=state.get("status", {}),
             run_id=state.get("run_id"),
+            reference_sink=loaded_references,
         )
         messages.extend(state.get("messages", []))
         messages, _final_tokens, compression_triggered = self.context.final_preflight_messages(messages)
         base_model = self.model_factory("reasoning")
-        model = base_model.bind_tools(CAREER_AGENT_TOOLS)
+        final_max_tokens = max(128, min(int(os.getenv("AGENT_FINAL_MAX_TOKENS", "384")), 2048))
+        bounded_base_model = (
+            base_model.model_copy(update={"max_tokens": final_max_tokens})
+            if isinstance(base_model, BaseModel)
+            else base_model
+        )
+        model = bounded_base_model.bind_tools(CAREER_AGENT_TOOLS)
+        final_only_model = bounded_base_model
+        no_tool_messages = [
+            message
+            for message in messages
+            if not isinstance(message, ToolMessage)
+            and not (isinstance(message, AIMessage) and message.tool_calls)
+        ]
+        no_tool_messages.append(
+            HumanMessage(
+                content=(
+                    "Summarize the already collected structured results without calling tools. "
+                    "Do not claim demo snapshots are current.\n"
+                    + json.dumps(
+                        {
+                            "jobs": state.get("job_candidates", [])[:10],
+                            "people": state.get("people_candidates", [])[:10],
+                            "warnings": state.get("warnings", [])[:10],
+                        },
+                        ensure_ascii=False,
+                        default=str,
+                    )
+                )
+            )
+        )
         try:
             response = self._invoke_observed(
                 model, messages, state, stage="agent_model", model_type="reasoning",
@@ -426,16 +657,60 @@ class CareerAgentGraph:
             )
             if not isinstance(response, AIMessage):
                 response = self._invoke_observed(
-                    base_model, messages, state, stage="agent_model_fallback",
+                    final_only_model, no_tool_messages, state, stage="agent_model_fallback",
                     model_type="reasoning", compression_triggered=compression_triggered,
                 )
         except Exception as error:
-            return {
-                "current_error": sanitize_diagnostic(error),
-                "final_response": safe_provider_message("the model step"),
-                "workflow_stage": "failed",
-            }
-        return {"messages": [response], "iteration": state.get("iteration", 0) + 1, "workflow_stage": "reasoning"}
+            # Some Bedrock models can reject or emit an invalid ToolUse sequence even
+            # when the preceding assistant/tool-result pair is valid. The bounded
+            # no-tools fallback can still summarize already collected structured data;
+            # it cannot initiate another source call.
+            try:
+                response = self._invoke_observed(
+                    final_only_model,
+                    no_tool_messages,
+                    state,
+                    stage="agent_model_fallback",
+                    model_type="reasoning",
+                    compression_triggered=compression_triggered,
+                )
+            except Exception:
+                return {
+                    "current_error": sanitize_diagnostic(error),
+                    "final_response": safe_provider_message("the model step"),
+                    "workflow_stage": "failed",
+                    "personalization_references": self._merge_personalization_references(
+                        state.get("personalization_references") or {}, loaded_references
+                    ),
+                }
+        references = self._merge_personalization_references(
+            state.get("personalization_references") or {}, loaded_references
+        )
+        return {
+            "messages": [response],
+            "iteration": state.get("iteration", 0) + 1,
+            "workflow_stage": "reasoning",
+            "personalization_references": references,
+        }
+
+    @staticmethod
+    def _merge_personalization_references(
+        current: dict[str, Any], loaded: dict[str, Any]
+    ) -> dict[str, list[dict[str, Any]]]:
+        merged: dict[str, list[dict[str, Any]]] = {}
+        for key, identity in (
+            ("profile", lambda item: (item.get("profile_version_id"), item.get("field"))),
+            ("approved_memories", lambda item: item.get("memory_id")),
+        ):
+            values = []
+            seen = set()
+            for item in list(current.get(key) or []) + list(loaded.get(key) or []):
+                marker = identity(item)
+                if marker not in seen:
+                    seen.add(marker)
+                    values.append(dict(item))
+            merged[key] = values
+        return merged
 
     def execute_tools(self, state: CareerAgentState) -> dict[str, Any]:
         ai_message = state["messages"][-1]
@@ -680,6 +955,17 @@ class CareerAgentGraph:
     def _route_after_classify(state: CareerAgentState) -> str:
         return "clarify" if state.get("needs_user_input") else "prepare"
 
+    @staticmethod
+    def _route_after_prepare(state: CareerAgentState) -> str:
+        return (
+            "action"
+            if (
+                CareerIntent(state["intent"]) in ACTION_INTENTS
+                or (state.get("status") or {}).get("workflow_stage") == "planning"
+            )
+            else "respond"
+        )
+
     def _route_after_model(self, state: CareerAgentState) -> str:
         if state.get("current_error"):
             return "final"
@@ -756,6 +1042,8 @@ class CareerAgentGraph:
                     for item in state.get("job_candidates", [])
                 ),
                 "source_call_count": state.get("total_source_calls", 0),
+                "personalization_references": state.get("personalization_references", {}),
+                "routing_diagnostics": state.get("routing_diagnostics", {}),
             },
         )
         TrajectoryRecorder(state["user_id"], state["run_id"], self.repository).step("finalize", "Prepared observable final response.", "failed" if failed else "completed")
@@ -772,6 +1060,7 @@ class CareerAgentGraph:
             "final_response": final,
             "todo_items": todos,
             "workflow_stage": workflow_stage,
+            "personalization_references": state.get("personalization_references", {}),
         }
 
     def invoke(self, state: CareerAgentState, config: dict[str, Any] | None = None) -> dict[str, Any]:

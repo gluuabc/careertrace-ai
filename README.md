@@ -1,652 +1,228 @@
 # CareerTrace AI
 
-CareerTrace AI is a memory-powered AI career assistant that helps students discover opportunities, understand job fit, connect with alumni, personalize applications, and manage networking workflows.
+CareerTrace AI is a persistent-memory career assistant for students and early-career candidates. It turns confirmed resumes and user-approved conversation details into durable career context, then uses that context to personalize guidance, job discovery, people discovery, resume drafts, and outreach drafts without silently changing the user's profile or sending actions on the user's behalf.
 
-The project uses **LangGraph** to combine deterministic workflows with bounded AI reasoning:
+Built for the [**CockroachDB × AWS Hackathon — Build with Agentic Memory**](https://cockroachdb-ai.devpost.com/rules), CareerTrace uses CockroachDB for application state, profile history, semantic and episodic memory, hybrid retrieval, and deployed LangGraph checkpoints. AWS provides model inference, embeddings, reranking, and private document storage.
 
-- **Deterministic workflows** handle reliable business processes (profile management, database updates, approvals).
-- **AI reasoning agents** handle tasks that require flexibility (career advice, job matching explanations, personalized recommendations).
+## Demo
 
-The production architecture supports persistent memory and hybrid retrieval with **CockroachDB (SQL, full-text search, and vector search)**; SQLite remains the local development and unit-test backend.
+- **Live demo:** _Add the final public AWS deployment URL before submission._
+- **Judge access:** Select **Try Judge Demo**. No Google allowlisting is required.
+- **Test data:** Use the synthetic files in [`demo/`](demo/). Judge workspaces are empty at creation and do not contain pre-seeded personal data.
+- **Suggested flow:** upload both demo documents → confirm the extracted profile → ask Career Assistant for matching roles → state a durable preference → start another conversation to trigger extraction → approve the pending memory → ask a follow-up that uses it.
+- **Screenshots/video:** _Add the Devpost screenshots and public demo-video URL before submission._
 
----
+Judge workspaces use distinct UUID identities and the normal S3, Bedrock, SQL, retrieval, and approval paths. A one-time recovery code can reopen the same workspace; only its hash is stored.
 
-# Project Architecture
+## Problem
 
-## High-level design
+Career planning unfolds across resumes, projects, goals, constraints, applications, and many conversations. Most chat assistants lose that context or keep it as an opaque transcript.
+
+That creates repetitive and unreliable experiences:
+
+- candidates repeatedly explain their education, skills, and goals;
+- preferences such as location or work style are easily forgotten;
+- completed and planned career events become disconnected from later advice;
+- inferred facts can be mistaken for confirmed facts;
+- recommendations lack a durable, auditable source of truth.
+
+## Solution
+
+CareerTrace separates career context by trust and purpose:
+
+- **Profile facts** are structured, versioned, and linked to source documents.
+- **Semantic memories** capture approved preferences, goals, constraints, interests, values, and other durable context.
+- **Career events** record approved completed, current, planned, or unknown-status events.
+- **Conversation signals and memory candidates** remain reviewable working data until the user approves them.
+- **Hybrid retrieval** selects only relevant, user-scoped context instead of placing the entire history in every prompt.
+
+The result is an assistant that can remember useful context across sessions while preserving user control.
+
+## Architecture
 
 ```mermaid
-flowchart TD
-
-User --> LangGraph
-
-LangGraph --> Workflow
-LangGraph --> Reasoning
-
-Workflow --> Profile
-Workflow --> Jobs
-Workflow --> Networking
-
-Reasoning --> JobMatching
-Reasoning --> CareerAdvice
-Reasoning --> Outreach
-
-Profile --> Memory
-Jobs --> Memory
-Networking --> Memory
-
-Memory --> CockroachDB
+flowchart TB
+    U["User / Judge workspace"] --> UI["Streamlit UI"]
+    UI --> G["Bounded LangGraph workflows"]
+    G --> B["Amazon Bedrock\nNova / Claude"]
+    G --> M["Memory boundary\nextract → validate → review"]
+    M --> C[("CockroachDB")]
+    C --> R["Full-text + VECTOR retrieval"]
+    R --> G
+    G --> S3["Private Amazon S3\ndocuments and large evidence"]
+    G --> T["Titan Text Embeddings V2"]
+    R --> RR["Optional Amazon Rerank"]
 ```
 
----
+The agent is intentionally controlled rather than fully autonomous. LangGraph routes requests through a closed set of workflows, enforces iteration and source-call limits, and keeps deterministic validation and persistence outside the model.
 
-# Workflow Design
+## Memory Architecture
 
-The system follows an approximately:
+### Profile Memory
 
-```
-80% Controlled Workflow
-20% Autonomous Reasoning
-```
+Profile Memory contains canonical facts such as education, school, major, graduation year, skills, projects, and experience.
 
-The goal is not to create a fully autonomous agent that makes uncontrolled decisions. Instead, AI reasoning is used only where it provides value.
+- `profile_versions` stores immutable snapshots.
+- `profiles.current_version_id` selects the active version.
+- `profile_document_sources` links a version to supporting S3 documents.
+- `profile_field_revisions` provides field-level history.
+- Resume onboarding requires editable human confirmation before saving.
+- Conversation-derived profile changes become reviewable profile drafts; conversations do not directly overwrite the Profile.
 
----
+### Semantic Memory
 
-## Controlled Workflow (Deterministic)
+`semantic_memories` stores subjective, durable context that should personalize future assistance but does not belong in the canonical Profile.
 
-These steps follow predictable rules:
+- Each memory has an open, normalized `semantic_group`, such as `preference`, `goal`, `constraint`, `interest`, or `work_style`.
+- `topic_key` identifies a reusable topic when classification is specific enough.
+- Updates preserve history through same-type supersession links.
+- Source conversation, source message IDs, exact evidence text, active/revoked state, and indexing status remain attached.
 
-### Profile Management
+Semantic groups are intentionally not a closed enum; the extractor may propose a normalized new group when existing groups do not fit.
 
-- Upload resume
-- Extract resume text
-- Extract profile facts
-- Ask user for confirmation
-- Save confirmed information
-- Generate career profile
+### Episodic Career Memory
 
+`career_events` stores durable career events separately from semantic context.
 
-### Job Search
+- Events can be `completed`, `current`, `planned`, or `unknown`.
+- Temporal values are accepted only when grounded in the source statement.
+- Same-type event supersession preserves timeline history.
+- `career_paths` provides a schema for grouping events into longer-running paths. The current product retrieves career events directly; automated path grouping is not yet an end-user workflow.
 
-- Retrieve user profile
-- Apply hard filters
-- Calculate structured match scores
-- Save recommended jobs
-- Ask user for selection
+### Retrieval
 
+Approved Profile, Semantic Memory, and Career Event records are indexed into a shared `retrieval_documents` corpus:
 
-Hard filters include:
+1. Text is structure-aware chunked.
+2. Amazon Titan Text Embeddings V2 produces 1,024-dimensional embeddings.
+3. CockroachDB full-text search and distributed vector search run independently.
+4. Reciprocal Rank Fusion combines both rankings.
+5. Amazon Rerank can rerank the shortlist when enabled; retrieval still works when reranking or embeddings are unavailable.
+6. The agent receives bounded memory cards first and can load details for at most three selected memories.
 
-- Graduation year mismatch
-- Location restrictions
-- Work authorization requirements
-- Internship/full-time mismatch
+Every private retrieval query includes the trusted application `user_id`; the model cannot select or override it.
 
-
-### Networking
-
-- Retrieve alumni information
-- Check previous interactions
-- Track outreach status
-- Schedule follow-ups
-
-
----
-
-## AI Reasoning Components
-
-These tasks require flexible reasoning:
-
-### Career Intelligence
-
-- Explain why a job matches a user
-- Identify transferable skills
-- Recommend possible career directions
-- Suggest missing skills
-
-
-### Job Search Agent
-
-- Expand user requests into related roles
-- Generate better search queries
-- Rank opportunities
-- Decide which recommendations are most relevant
-
-
-### Networking Agent
-
-- Find meaningful alumni connections
-- Analyze shared experiences
-- Generate personalized outreach messages
-
-
----
-
-# Current Implementation
-
-## Completed
-
-### Profile Onboarding Workflow
-
-Current LangGraph flow:
-
-```
-START
- |
- v
-Store Original Documents in Private S3
- |
- v
-Extract and Combine Document Text
- |
- v
-LLM Extract Facts
- |
- v
-Validate Required Fields
- |
- +---- missing ----> Collect Missing Information
- |
- v
-Editable User Confirmation
- |
- v
-Save Profile to SQL
- |
- v
-Generate Career Analysis
- |
- v
-Save Career Analysis to SQL
- |
-END
-```
-
-The workflow currently supports:
-
-- Google OpenID Connect login, per-session judge users, and UUID-backed
-  multi-user isolation
-- Multi-document PDF and DOCX upload to private S3
-- Resume, portfolio, transcript, certificate, and other document classification
-- Combined extraction merged with the current confirmed SQL profile
-- Structured LLM-based profile extraction
-- Required school, major, graduation year, skills, and experience validation
-- Editable human confirmation using LangGraph interrupts
-- Persistent SQLite profile, analysis, document, and conversation storage
-- Durable SQLite LangGraph checkpoints for interrupted workflow recovery
-- Immutable profile and career-analysis versions with pointer-only rollback
-- Profile-version links to multiple source documents
-- Approved flexible memories separated from pending memory candidates
-- SQL-backed, bounded Career Agent with observable tool trajectories and no automatic profile edits
-- Official public-source job search with deterministic hard filtering and evidence
-- Permitted people search across user connections, OpenAlex, and Wikidata
-- SQL-backed resume-revision drafts and unsent outreach drafts
-- No-op profile saves that do not create false versions or duplicate analyses
-- Streamlit profile viewing and editing
-- Per-user document upload, download, and deletion
-
-Example generated information:
-
-```json
-{
-  "strengths": [],
-  "possible_roles": [],
-  "recommended_next_skills": []
-}
-```
-
-### Stateful Career Agent
-
-The Career Assistant is a thin facade over `app/graph/career_agent_graph.py`.
-Every user request creates a user-scoped `agent_runs` row, follows a closed intent
-router, loads the relevant Skill, executes a bounded structured-tool loop, and
-stores only observable steps and sanitized tool calls. Hidden model reasoning is
-neither displayed nor persisted.
-
-Supported routes:
-
-```text
-START -> initialize_run -> classify_intent -> prepare_workflow
-  ├── needs_input -> finalize
-  ├── concise_guidance / action_plan -> agent_model
-  └── job_search / people_search / resume_revision / outreach
-        -> plan_action -> execute_tools -> agent_model
-agent_model -> execute_tools (bounded) | finalize -> END
-```
-
-The model-visible tools are:
-
-- `read_skill` and `read_skill_file`
-- `read_evidence`
-- `search_jobs` and `get_job_details`
-- `search_people` and `get_person_details`
-- `save_resume_revision_draft`
-- `save_outreach_draft`
-- `update_outreach_status` (cannot mark `sent`; that requires a UI action)
-
-The LLM never selects `user_id`; identity is injected from trusted graph state.
-Tool results remain proper `ToolMessage` objects. Source, iteration, and no-new-
-result stopping conditions are enforced by code.
-
-Search requests create a user/run-scoped SQL `search_sessions` record. Provider
-cursors, source coverage, failures, calls, candidate IDs, and bounded candidate
-records survive graph iterations and process restarts. Calls reserve the shared
-budget before network I/O. The model receives a `SearchPage` of 10 summaries by
-default (maximum 20) and can request the internal next cursor without refetching
-an unchanged provider feed.
-
-Hybrid retrieval follows this bounded path:
+## Agent Workflow
 
 ```mermaid
 flowchart LR
-  Q["User-scoped query"] --> S["Cockroach full-text / SQLite sparse fallback"]
-  Q --> E["Titan Text Embeddings V2"]
-  E --> D["Cockroach VECTOR cosine / SQLite dense fallback"]
-  S --> R["Reciprocal Rank Fusion, k=60"]
-  D --> R
-  R --> A["Top 30"]
-  A --> B["Amazon Rerank 1.0, us-west-2"]
-  B --> T["Top 10"]
-  A -. "Reranker unavailable" .-> T
+    A["User message"] --> P["Persist conversation"]
+    P --> I["Closed intent routing"]
+    I --> C["Load profile + relevant approved memory"]
+    C --> X["Bounded agent / tools"]
+    X --> O["Persist answer, evidence, metrics"]
+    O --> B["Conversation boundary"]
+    B --> E["Cheap-model proposals + explicit signals"]
+    E --> V["Merge, dedupe, evidence and schema validation"]
+    V --> Q["Pending profile or memory review"]
+    Q -->|"User approves"| D["Durable memory + retrieval index"]
+    Q -->|"User rejects"| Z["No durable memory change"]
 ```
 
-Ownership, active-version, and current-search document filters are deterministic
-SQL predicates, never vector-similarity decisions. Raw retrieval queries/ranks
-are not persisted unless `RETRIEVAL_DEBUG_LOGGING=true`; debug logging is
-user-scoped, bounded, and optional. Approved
-memories use the same retrieval path; the runtime context no longer loads every
-memory.
+Key controls:
 
-#### Job sources and limitations
+- The LLM performs semantic classification; deterministic code validates evidence ownership, offsets, types, and schema boundaries.
+- LLM and explicit-signal proposals share one representation and are deduplicated before review.
+- Only exact, self-owned evidence from user messages can become a candidate.
+- Profile facts win when information belongs in the canonical Profile.
+- Pending extraction boundaries and extraction runs are persisted and recoverable after logout or restart.
+- The Career Agent has bounded iterations, bounded source calls, observable tool trajectories, and no direct database-administration tools.
+- Resume revisions and outreach messages are saved as drafts. Sending remains a separate user action.
 
-`config/job_sources.yaml` is the single version-controlled company catalog.
-Sources start disabled and unverified. On 2026-08-06, public Greenhouse GET
-endpoints were validated for the enabled catalog entries; unverified companies
-remain disabled rather than receiving guessed ATS identifiers. Lever and official
-public-page adapters are available when a validated catalog record selects them.
-Tavily is optional discovery-only input: each discovered URL is validated and
-independently fetched before it can become evidence. Playwright is a disabled-by-
-default fallback for a known validated JS-only URL. Firecrawl is not integrated.
+## CockroachDB Integration
 
-Job fields are normalized without inference. Supplied hard requirements use
-`MATCH` / `CONFLICT` / `UNKNOWN`: conflicts are excluded, while any unknown hard
-field stays in **Requirements not fully verified** and does not count toward the
-verified target. Desired skills remain soft preferences; skill gaps are only
-explicit posting requirements absent from confirmed profile skills. Eligible
-current-session candidates are indexed and ordered by sparse + Titan dense
-retrieval, RRF, and optional Amazon Rerank. No source adapter applies to a job.
+CockroachDB is the production memory and state layer—not a demonstration-only query target.
 
-#### People sources and limitations
+| Capability | CareerTrace use |
+|---|---|
+| Distributed SQL transactions | Users, profiles, immutable versions, conversations, candidates, approved memories, events, searches, drafts, and agent runs |
+| JSON | Profile snapshots, structured memory values, provenance, tool results, and retrieval metadata |
+| Full-text search | Stored `TSVECTOR` column with an inverted index over retrieval documents |
+| Distributed Vector Indexing | `VECTOR(1024)` Titan embeddings with a cosine vector index |
+| LangGraph persistence | Official `CockroachDBSaver` in an isolated checkpoint schema |
+| Alembic migrations | Additive schema evolution and legacy-memory backfill with validation and retry-safe copying |
 
-People Search accepts optional private manual/CSV connections and searches
-OpenAlex for academic discovery or Wikidata for public identity discovery. CSV
-imports are user-scoped, row-limited, field-limited, and reject executable
-spreadsheet formulas. LinkedIn, protected directories, inferred email patterns,
-phone numbers, private addresses, and data brokers are prohibited. Recruiter
-results require explicit public recruiting/talent-acquisition role evidence.
+Why CockroachDB fits CareerTrace:
 
-#### Drafts and approval boundaries
+- memory and operational state remain in one distributed SQL system, while retrieval-index failures are recorded for retry;
+- SQL, JSON, full-text, and vector retrieval avoid a separate vector database;
+- user-scoped rows and foreign keys provide clear ownership boundaries;
+- durable checkpoints and application state survive process replacement;
+- immutable versions and supersession links retain history instead of overwriting it.
 
-Resume revisions are structured SQL drafts linked to an immutable profile version
-and do not modify the profile or original S3 document. Outreach is saved with
-status `draft` and no sending side effect. Only an explicit user UI action can
-mark outreach `sent`, which records `sent_at`.
+### Hackathon CockroachDB tools
 
-#### Evidence and context
+CareerTrace uses two tools listed by the hackathon:
 
-Every external source result receives an `ev_<uuid>` evidence ID, URL, retrieval
-time, hash, excerpt, and provenance. Small evidence stays in SQL. Evidence above
-`EVIDENCE_S3_THRESHOLD_BYTES` is gzip-compressed into the existing S3 bucket at
-`agent-evidence/{user_id}/{run_id}/...`; safe SQL fallback is bounded and warnings
-are retained.
+1. **CockroachDB Distributed Vector Indexing** powers production dense retrieval alongside Cockroach full-text search.
+2. **CockroachDB Agent Skills Repo** was used as developer guidance to audit schema design, migration safety, query behavior, least-privilege boundaries, and production diagnostics. The resulting controls are recorded in [`docs/COCKROACH_AGENT_SKILLS.md`](docs/COCKROACH_AGENT_SKILLS.md).
 
-The immutable system prompt contains no user data. A fresh `<runtime_context>`
-block supplies the current profile, a small query-relevant set of approved
-memories, task, selected entities,
-loaded Skills, and one current status per model call. Adaptive compression starts
-only above the configured threshold, preserves evidence IDs and hard constraints,
-and stores a query-aware summary boundary while leaving original SQL messages
-unchanged.
+The repository also contains an optional, disabled-by-default wrapper for **CockroachDB Cloud Managed MCP**. It is limited to developer-only, read-only system metadata and is never exposed to the Career Agent; it is not required for the product workflow.
 
----
+## AWS Deployment
 
-# Persistence Foundation
+### Implemented AWS services
 
-Current local SQL storage:
+- **Amazon Bedrock:** Nova Lite for lower-cost structured work and a stronger reasoning model for agent responses.
+- **Amazon Titan Text Embeddings V2:** retrieval embeddings.
+- **Amazon Rerank 1.0:** optional final shortlist reranking in `us-west-2`.
+- **Amazon S3:** encrypted, private resume/portfolio and large-evidence storage. Public access is blocked and insecure transport is denied.
+- **AWS credential provider chain:** credentials are supplied at runtime; no AWS keys are stored in source code.
 
-```
-SQLite
- ├── users
- ├── profiles
- ├── career_preferences
- ├── skills
- ├── projects
- ├── experience
- ├── career_analysis
- ├── career_analysis_versions
- ├── profile_versions
- ├── profile_document_sources
- ├── documents
- ├── memory_candidates
- ├── memories
- ├── conversations
- ├── messages
- ├── agent_runs / agent_steps / agent_tool_calls
- ├── agent_evidence
- ├── search_sessions / search_source_progress
- ├── retrieval_documents / retrieval_query_logs
- ├── starred_qa_pairs
- ├── conversation_context_summaries
- ├── user_connections
- ├── resume_revision_drafts / resume_revision_changes
- └── outreach_drafts
+The repository includes a production Dockerfile, container health check, S3 CloudFormation template, and least-privilege S3 object policy.
+
+### Container deployment path
+
+The intended AWS container topology is:
+
+```text
+ECR image
+   ↓
+ECS service / task
+   ├── Secrets Manager → runtime configuration
+   ├── Bedrock and Titan
+   ├── private S3 bucket
+   └── CockroachDB Cloud over TLS verify-full
 ```
 
-Supported production storage:
+The committed repository does **not** currently include ECS service/task infrastructure, ECR publishing automation, or Secrets Manager wiring. Those resources must be provisioned and the public ECS URL added above before claiming ECS deployment. The currently documented public-hosting procedure is in [`docs/STREAMLIT_CLOUD_DEPLOYMENT.md`](docs/STREAMLIT_CLOUD_DEPLOYMENT.md).
 
-```
-CockroachDB
- ├── SQL application and durable search state
- ├── TSVECTOR / TSQUERY sparse retrieval
- └── VECTOR(1024) dense retrieval
-```
+Cockroach connections use `sslmode=verify-full`. A deployment CA certificate can be supplied as `COCKROACH_CA_CERT`; CareerTrace materializes it to a restrictive temporary file and uses the same resolved URL for SQLAlchemy and `CockroachDBSaver`.
 
----
+## Production Readiness
 
-# Planned Development
+- **Approval boundary:** extracted memories remain candidates until accepted; rejected candidates do not modify durable memory.
+- **Provenance:** review candidates retain their extraction run and exact offsets; approved records retain source conversation, message IDs, evidence text, and indexing status.
+- **Identity isolation:** Google and Judge identities map to UUID `user_id` values. Repository operations scope private reads and writes to the active user.
+- **Durable recovery:** CockroachDB stores product state and deployed LangGraph checkpoints; browser session state is not the source of truth.
+- **Safe failure modes:** sparse retrieval remains available when embeddings fail, indexing failures are recorded, and tool/provider errors are sanitized.
+- **Observability:** agent runs, bounded tool trajectories, search phases, token metrics, and optional LangSmith traces are persisted without hidden chain-of-thought.
+- **TLS and secrets:** secrets stay in runtime configuration; Cockroach TLS remains `verify-full`; certificates and passwords are not logged.
+- **Migration safety:** Alembic manages schema state. Migration `20260817_17` validates legacy classification, same-type supersession, counts, and orphan links. [`scripts/validate_cockroach_memory_migration.py`](scripts/validate_cockroach_memory_migration.py) runs the real migration path in a disposable Cockroach database before production rollout.
 
-## Job Search Agent
+## Local Development
 
-Flow:
+### Requirements
 
-```
-User Request
-      |
-      v
-Retrieve Profile
-      |
-      v
-Apply Filters
-      |
-      v
-Match Jobs
-      |
-      v
-Explain Fit
-      |
-      v
-Save Candidates
-```
+- Python 3.13
+- AWS credentials with access to the configured Bedrock models and private S3 bucket
+- SQLite for local development, or a separate CockroachDB database for integration testing
 
----
-
-## Alumni Networking Agent
-
-Flow:
-
-```
-Company / Job Target
-        |
-        v
-Find Alumni
-        |
-        v
-Analyze Connection
-        |
-        v
-Generate Outreach
-        |
-        v
-Track Follow-up
-```
-
----
-
-# Memory Architecture
-
-The agent will use two types of memory.
-
-## Structured Memory (SQL)
-
-Stores reliable facts:
-
-- User profile
-- Skills
-- Projects
-- Education
-- Jobs
-- Applications
-- Alumni contacts
-- Outreach history
-- User preferences
-
-
-## Semantic Memory (Vector Search)
-
-Stores information requiring similarity search:
-
-- Resume sections
-- Project descriptions
-- Job descriptions
-- Alumni profiles
-- Previous recommendations
-- User feedback/rejected suggestions
-
----
-
-# LLM Architecture
-
-The project uses different models depending on the task.
-
-```
-                 LangGraph
-
-                     |
-        +------------+------------+
-        |                         |
-        v                         v
-
-   Nova Lite              Claude Sonnet
-
- Cheap / fast             Strong reasoning
-
- Profile extraction       Job ranking
- Intent detection         Career advice
- Query parsing            Resume tailoring
- Metadata extraction      Outreach writing
-```
-
-The goal is to use cheaper models for high-volume simple tasks and stronger models only when deeper reasoning is needed.
-
----
-
-# Project Structure
-
-```
-careertrace-ai/
-
-├── app/
-│   ├── main.py
-│   │
-│   ├── graph/
-│   │   ├── checkpoint.py
-│   │   └── profile_graph.py
-│   │
-│   ├── nodes/
-│   │   ├── resume.py
-│   │   ├── extraction.py
-│   │   ├── confirmation.py
-│   │   ├── validation.py
-│   │   ├── profile.py
-│   │   └── memory.py
-│   │
-│   ├── database/
-│   │   ├── database.py
-│   │   ├── models.py
-│   │   └── repository.py
-│   ├── auth/
-│   │   ├── google_oauth.py
-│   │   └── session.py
-│   ├── services/
-│   │   ├── career_assistant.py
-│   │   └── documents.py
-│   ├── storage/
-│   │   ├── base.py
-│   │   └── s3.py
-│   │
-│   ├── ui/
-│   │   └── dashboard.py
-│   │
-│   ├── llm/
-│   │   └── model.py
-│   │
-│   └── state/
-│       └── schema.py
-│
-├── migrations/
-├── demo/
-│   ├── Demo_Resume.pdf
-│   └── Demo_Portfolio.pdf
-├── infra/
-│   ├── s3-bucket.yaml
-│   └── application-s3-policy.json
-├── data/  # local runtime files are ignored by Git
-│
-├── tests/
-├── requirements.txt
-├── README.md
-└── .gitignore
-```
-
----
-
-# Setup
-
-## 1. Clone repository
+### Setup
 
 ```bash
-git clone <repository-url>
-
+git clone https://github.com/gluuabc/careertrace-ai.git
 cd careertrace-ai
-```
 
----
-
-## 2. Create virtual environment
-
-```bash
-python -m venv .venv
-```
-
-Activate:
-
-### Mac/Linux
-
-```bash
+python3.13 -m venv .venv
 source .venv/bin/activate
-```
-
----
-
-## 3. Install dependencies
-
-```bash
 pip install -r requirements.txt
+cp .env.example .env
 ```
 
----
+Configure `.env` without committing it. At minimum, select a login path, configure the AWS region/models and S3 bucket, and keep the default SQLite URL for a local run.
 
-## 4. Configure environment variables
-
-Create:
-
-```
-.env
-```
-
-Example:
-
-```env
-# AWS Bedrock
-AWS_REGION=us-east-1
-
-BEDROCK_MODEL_CHEAP=amazon.nova-lite-v1:0
-BEDROCK_MODEL_REASONING=<claude-model-id>
-BEDROCK_EMBEDDING_MODEL=amazon.titan-embed-text-v2:0
-BEDROCK_EMBEDDING_DIMENSIONS=1024
-BEDROCK_RERANK_ENABLED=false
-BEDROCK_RERANK_REGION=us-west-2
-BEDROCK_RERANK_MODEL_ID=amazon.rerank-v1:0
-
-
-# LangSmith tracing
-LANGSMITH_TRACING=true
-LANGSMITH_API_KEY=<your-key>
-LANGSMITH_PROJECT=CareerTrace
-
-# Local SQL memory
-DATABASE_URL=sqlite:///data/careertrace.db
-LANGGRAPH_CHECKPOINT_DB=data/langgraph_checkpoints.sqlite
-
-# Private S3 document storage
-S3_BUCKET_NAME=careertrace-resumes
-S3_REGION=us-east-1
-MAX_DOCUMENT_SIZE_MIB=10
-
-# Google OpenID Connect
-GOOGLE_CLIENT_ID=<google-client-id>
-GOOGLE_CLIENT_SECRET=<google-client-secret>
-AUTH_COOKIE_SECRET=<strong-random-cookie-signing-secret>
-OAUTH_REDIRECT_URI=http://localhost:8501/oauth2callback
-
-# Optional discovery / rendering
-TAVILY_ENABLED=false
-TAVILY_API_KEY=
-PLAYWRIGHT_ENABLED=false
-
-# Developer-only read-only managed MCP diagnostics
-COCKROACH_CLOUD_MCP_ENABLED=false
-COCKROACH_CLOUD_MCP_URL=https://cockroachlabs.cloud/mcp
-COCKROACH_CLOUD_CLUSTER_ID=
-COCKROACH_CLOUD_MCP_API_KEY=
-```
-
-Register the exact `OAUTH_REDIRECT_URI` as an authorized redirect URI in the
-Google OAuth client. Generate a cookie secret with:
-
-```bash
-python -c "import secrets; print(secrets.token_urlsafe(48))"
-```
-
-Credentials stay server-side. Streamlit's native OIDC implementation validates
-authorization state and nonce; CareerTrace additionally validates the Google
-issuer, audience, authorized party, verified email, issue time, and expiration.
-
-If controlled JavaScript rendering is required, explicitly install the browser
-binary and then enable it. Application startup never performs this installation:
-
-```bash
-python -m playwright install chromium
-```
-
-See [Third-Party Integrations](docs/THIRD_PARTY_INTEGRATIONS.md) for provider,
-data, retention, terms, and regional-processing boundaries.
-
-CareerTrace uses three separate CockroachDB concepts:
-
-- **Distributed vector/full-text indexing** is a runtime retrieval capability.
-- **CockroachDB Cloud Managed MCP** is a bounded, read-only developer operations
-  integration and never enters the Career Agent tool surface.
-- **CockroachDB Agent Skills** are developer engineering guidance used to audit
-  transactions, SQL, diagnostics, and privileges. They are not runtime data,
-  model training data, or end-user Skills. The exact upstream revision and
-  findings are recorded in [the Skills audit](docs/COCKROACH_AGENT_SKILLS.md).
-
-## 5. Provision private S3 storage
-
-An AWS administrator with bucket-provisioning permissions can deploy the
-included retained, encrypted, public-access-blocked bucket:
+Provision the included private S3 bucket if needed:
 
 ```bash
 aws cloudformation deploy \
@@ -656,159 +232,49 @@ aws cloudformation deploy \
   --parameter-overrides BucketName=careertrace-resumes
 ```
 
-Attach `infra/application-s3-policy.json` to the application role or user. It
-allows only `PutObject`, `GetObject`, and `DeleteObject` beneath the bucket.
-The 10 MiB maximum is enforced before the backend sends a request to S3.
-
----
-
-# Running CareerTrace
-
-## Web interface
-
-Start the Streamlit application from the repository root:
+Initialize and run:
 
 ```bash
+alembic upgrade head
+python scripts/check_setup.py --mode local
 streamlit run app/ui/dashboard.py
 ```
 
-The web interface provides:
+Open `http://localhost:8501`. For Judge mode, set both `JUDGE_DEMO_ENABLED=true` and a private `JUDGE_DEMO_ACCESS_CODE`.
 
-- Google login, judge-demo access, and logout
-- Multi-document PDF/DOCX onboarding
-- Missing-field collection and final profile review
-- Database-backed profile viewing and editing
-- Career preferences
-- Stored career analysis and controlled regeneration
-- Starred question/answer pairs, independent from career preferences
-- Private per-user document management
-- Profile and analysis history with rollback
-- Approved-memory review and persistent Career Assistant conversations
-- Sidebar agent status, evidence-backed candidate results, saved drafts, and optional connections
-
-## Judge Testing Instructions
-
-Use the deployed CareerTrace URL supplied with the hackathon submission. For a
-local review, the demo URL is `http://localhost:8501` after starting Streamlit.
-
-1. Open the demo URL and click **Try Judge Demo**.
-2. No Google account or OAuth test-user allowlisting is required.
-3. Confirm the **Demo workspace — uses synthetic data** label is visible. This
-   refers to the supplied test documents; no profile or analysis is pre-seeded.
-4. Download `Demo_Resume.pdf` and `Demo_Portfolio.pdf` from the Document Upload
-   page.
-5. Upload both files together, select their document types, and click
-   **Analyze documents**.
-6. Complete required-field collection and review the merged profile before
-   selecting **Confirm and save**.
-7. Explore **My Profile**, **Starred Q&A**, **Documents**, **Memory** (including
-   career-analysis history), and **Career Assistant**.
-8. Use **Logout** to clear the active browser identity.
-
-Each judge browser session creates a new ordinary UUID-backed `users` row marked
-as a demo identity. It starts without a profile or analysis and uses the same S3,
-LangGraph, validation, confirmation, SQL repository, versioning, and Bedrock
-paths as a Google-authenticated user. The repository contains no demo credentials
-or hard-coded analysis. The supplied documents are wholly synthetic and contain
-no real personal information.
-
-The committed demo PDFs can be reproduced with:
+Run tests:
 
 ```bash
-python scripts/generate_demo_documents.py
+pip install -r requirements-dev.txt
+pytest -q
 ```
 
-## Command-line workflow
+Never point `COCKROACH_TEST_DATABASE_URL` or the disposable migration validator at production.
 
-The CLI also requires S3 configuration and accepts a PDF or DOCX:
+## Hackathon Requirements Mapping
 
-```
-data/
-```
+| Requirement / criterion | Implementation |
+|---|---|
+| Agentic application | Bounded LangGraph Career Agent with closed routing, structured tools, persisted runs, and recovery boundaries |
+| Persistent memory | CockroachDB Profile, Semantic Memory, Career Event, conversation, candidate, and checkpoint storage |
+| Agentic Memory Design | Profile facts, subjective semantic context, and episodic career events have separate schemas and trust rules |
+| CockroachDB tool 1 | Distributed Vector Indexing over Titan `VECTOR(1024)` embeddings |
+| CockroachDB tool 2 | Official Agent Skills Repo applied to schema, migration, security, and operations audits |
+| Technological Implementation | Cockroach full-text + vector search, RRF, optional Bedrock reranking, Alembic migrations, and official Cockroach checkpoint saver |
+| AWS service | Bedrock inference, Titan embeddings, optional Amazon Rerank, and private S3 storage |
+| Real-World Impact | Reduces repeated career-data entry and keeps advice consistent across resumes, goals, constraints, and career events |
+| Product Readiness | Approval before durable memory, exact provenance, UUID isolation, TLS verification, observability, and disposable migration validation |
+| Creativity & Originality | Treats a career as three distinct memory types with separate trust, approval, history, and retrieval rules instead of one opaque chat history |
+| Functional judge access | Recoverable UUID-backed Judge workspace using synthetic documents and the normal product path |
 
-Example:
+## Future Improvements
 
-```
-data/resume.pdf
-```
+- Provision and verify the ECS/ECR/Secrets Manager deployment path.
+- Add user-managed CareerPath grouping and timeline views.
+- Backfill missing embeddings with an operator-controlled job.
+- Add scheduled searches and notifications with explicit opt-in.
+- Add separately approved sending and application actions.
 
-Run:
+## License
 
-```bash
-python -m app.main data/resume.pdf --name "Ada Student" --email ada@example.com
-```
-
-The workflow will:
-
-1. Extract resume information
-2. Ask for required missing information
-3. Ask for final confirmation
-4. Save the profile to SQLite
-5. Generate and save career analysis
-
----
-
-# SQL Memory Design
-
-Graph nodes, authentication, document services, and the UI access SQL through
-`app/database/repository.py`; they do not issue SQLite-specific queries.
-`DATABASE_URL` and engine creation are isolated in `app/database/database.py`.
-Alembic migrations run on application startup.
-
-Relative SQLite paths are resolved against the repository root, so launching
-Streamlit from another directory does not silently open a different database.
-Completed user memory is always read from SQL. `LANGGRAPH_CHECKPOINT_DB` is a
-separate SQLite file used only to resume interrupted LangGraph workflows.
-
-Profile facts are written to immutable `profile_versions` JSON snapshots.
-`profiles.current_version_id` selects the active snapshot, and
-`profile_document_sources` records all supporting documents. Career analysis
-uses the equivalent `career_analysis.current_version_id` pointer and immutable
-`career_analysis_versions` linked to the profile version that produced them.
-Rollback changes a pointer only; the next edit receives the next unused version
-number.
-
-To run against an isolated CockroachDB database:
-
-1. Provision CockroachDB and set a Cockroach-compatible `DATABASE_URL`.
-2. Run the existing Alembic migrations against the CockroachDB URL.
-3. Run the optional `COCKROACH_TEST_DATABASE_URL` integration suite against a
-   separate disposable database before production rollout.
-4. Keep graph nodes, storage service contracts, and Streamlit views unchanged.
-
-Application-generated UUID keys and transaction-scoped profile writes are used
-to keep the schema portable to a distributed SQL deployment.
-
----
-
-# Development Notes
-
-## Developer CockroachDB operations
-
-The end-user Career Agent never receives database administration tools. Optional
-developer diagnostics use the official CockroachDB Cloud Managed MCP endpoint
-through the public MCP Python SDK, pin one configured cluster, and enforce a
-CareerTrace-side allowlist for bounded read-only `SELECT`/`EXPLAIN` operations.
-CockroachDB's official operational Skills are published at
-[`cockroachlabs/cockroachdb-skills`](https://github.com/cockroachlabs/cockroachdb-skills)
-and belong in a developer tool's `.agents/skills`/personal skill catalog—not
-`app/skills`, which contains only CareerTrace product workflows.
-
-## Current priority
-
-1. Validate transaction-retry behavior against the selected CockroachDB tier
-2. Backfill embeddings for existing approved private corpus records
-3. Add scheduled proactive searches and notifications
-4. Add PDF/DOCX resume-draft export
-5. Add separately approved sending and application actions
-
----
-
-# Technology Stack
-
-- **LangGraph** — agent workflow orchestration
-- **Amazon Bedrock** — LLM inference
-- **LangSmith** — tracing and debugging
-- **CockroachDB** — supported production persistence and retrieval schema
-- **Hybrid Search** — Cockroach full-text + Titan embeddings + RRF + Amazon Rerank
-- **Streamlit** — authenticated web interface
+CareerTrace AI is released under the [MIT License](LICENSE).

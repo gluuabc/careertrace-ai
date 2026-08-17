@@ -91,7 +91,12 @@ class BedrockTokenAccounting:
         if exact_trigger is not None and rough < exact_trigger:
             return TokenCountResult(rough, "heuristic_fallback")
         try:
-            response = self._client().count_tokens(modelId=model_id, input=self._converse_input(messages, tools))
+            # Bedrock generation inference profiles and CountTokens model support
+            # are independent. Keep generation on the configured reasoning model
+            # while allowing a provider-supported tokenizer from the same model
+            # family for exact preflight accounting.
+            count_model_id = os.getenv("BEDROCK_COUNT_TOKENS_MODEL", model_id).strip() or model_id
+            response = self._client().count_tokens(modelId=count_model_id, input=self._converse_input(messages, tools))
             return TokenCountResult(int(response["inputTokens"]), "bedrock_count_tokens")
         except Exception:
             return TokenCountResult(rough, "heuristic_fallback")

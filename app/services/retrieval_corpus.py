@@ -70,7 +70,24 @@ class RetrievalCorpusIndexer:
             source_version="1",
             title=memory["category"],
             text=memory["content"],
-            metadata={"source": memory.get("source")},
+            metadata={"source": memory.get("source"), "memory_id": memory["memory_id"]},
+        )
+
+    def index_semantic_memory(self, *, user_id: str, memory: dict[str, Any]) -> list[dict[str, Any]]:
+        return self.index_text(
+            corpus_type="semantic_memory", user_id=user_id,
+            source_entity_id=memory["semantic_memory_id"], source_version="1",
+            title=f"{memory['semantic_group']}: {memory.get('topic_key') or 'unclassified'}",
+            text=str(memory["value"]),
+            metadata={"semantic_memory_id": memory["semantic_memory_id"], "semantic_group": memory["semantic_group"], "topic_key": memory.get("topic_key")},
+        )
+
+    def index_career_event(self, *, user_id: str, event: dict[str, Any]) -> list[dict[str, Any]]:
+        return self.index_text(
+            corpus_type="episodic_event", user_id=user_id,
+            source_entity_id=event["career_event_id"], source_version="1",
+            title=f"Career event ({event['event_status']})", text=event["content"],
+            metadata={"career_event_id": event["career_event_id"], "event_status": event["event_status"], "event_time": event.get("event_time")},
         )
 
     def index_evidence(self, *, user_id: str, run_id: str, evidence_id: str, source_name: str, source_type: str, source_url: str | None, content_hash: str, text: str) -> list[dict[str, Any]]:
@@ -85,7 +102,7 @@ class RetrievalCorpusIndexer:
             evidence_ids=[evidence_id],
         )
 
-    def index_candidate(self, *, corpus_type: str, user_id: str, search_session_id: str, run_id: str, candidate_id: str, title: str, text: str, metadata: dict[str, Any], evidence_ids: list[str]) -> list[dict[str, Any]]:
+    def index_candidate(self, *, corpus_type: str, user_id: str, search_session_id: str, run_id: str, candidate_id: str, title: str, text: str, metadata: dict[str, Any], evidence_ids: list[str], phase_observer=None) -> list[dict[str, Any]]:
         if corpus_type not in {"job", "person"}:
             raise ValueError("Candidate corpus type must be job or person.")
         return self.index_text(
@@ -97,7 +114,26 @@ class RetrievalCorpusIndexer:
             text=text,
             metadata={**metadata, "search_session_id": search_session_id, "run_id": run_id, "candidate_id": candidate_id},
             evidence_ids=evidence_ids,
+            phase_observer=phase_observer,
         )
+
+    def index_candidate_batch(
+        self, *, corpus_type: str, user_id: str, search_session_id: str,
+        run_id: str, candidates: list[dict[str, Any]], max_workers: int = 4,
+    ) -> tuple[list[dict[str, Any]], dict[str, int]]:
+        if corpus_type not in {"job", "person"}:
+            raise ValueError("Candidate corpus type must be job or person.")
+        return self.retrieval_service.index_text_batch([
+            {
+                "corpus_type": corpus_type, "user_id": user_id,
+                "source_entity_id": item["candidate_id"],
+                "source_version": search_session_id, "title": item["title"],
+                "text": item["text"],
+                "metadata": {**dict(item.get("metadata") or {}), "search_session_id": search_session_id, "run_id": run_id, "candidate_id": item["candidate_id"]},
+                "evidence_ids": item.get("evidence_ids") or [],
+            }
+            for item in candidates
+        ], max_workers=min(max_workers, 4))
 
     def backfill_missing_embeddings(self, *, user_id: str, limit: int = 100) -> dict[str, int]:
         return self.retrieval_service.backfill_missing_embeddings(user_id=user_id, limit=limit)
