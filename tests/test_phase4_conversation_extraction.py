@@ -84,12 +84,13 @@ def test_short_unprocessed_segment_uses_entire_original_segment(workspace):
     assert [item["message_id"] for item in payload["messages"]] == [first["message_id"], second["message_id"]]
 
 
-def test_long_segment_uses_signal_selected_context(workspace):
+def test_long_segment_prioritizes_all_user_context(workspace):
     repository, user, _, conversation = workspace
     ids, _ = _make_long_segment(repository, user["user_id"], conversation["conversation_id"])
     payload = build_memory_extraction_input(repository, user["user_id"], conversation["conversation_id"])
-    assert payload["mode"] == "signal_selected_context"
-    assert len(payload["messages"]) < len(ids)
+    assert payload["mode"] == "user_prioritized_context"
+    selected = {item["message_id"] for item in payload["messages"]}
+    assert set(ids[::2]).issubset(selected)
 
 
 def test_profile_semantic_signal_uses_one_exchange_surrounding_context(workspace):
@@ -281,29 +282,31 @@ def test_memory_duplicate_becomes_noop(workspace):
     assert [item for item in repository.list_memory_candidates(user["user_id"]) if item["status"] == "pending"] == []
 
 
-def test_explicit_memory_correction_becomes_update(workspace):
+def test_unclassified_deterministic_correction_is_non_destructive(workspace):
     repository, user, _, conversation = workspace
     old = _approved(repository, user["user_id"], "preference", "startups")
     _signal_message(repository, user["user_id"], conversation["conversation_id"], "I no longer prefer startups; I prefer large AI labs.")
     _extract(repository, user["user_id"], conversation["conversation_id"])
     candidate = _pending(repository, user["user_id"])[0]
-    assert candidate["operation"] == "UPDATE" and candidate["existing_memory_id"] == old["memory_id"]
+    assert candidate["operation"] == "ADD" and candidate["existing_memory_id"] is None
+    assert old["active"] is True
 
 
-def test_explicit_memory_revocation_becomes_revoke(workspace):
+def test_unclassified_deterministic_revocation_does_not_revoke(workspace):
     repository, user, _, conversation = workspace
     _approved(repository, user["user_id"], "preference", "startups")
     _signal_message(repository, user["user_id"], conversation["conversation_id"], "I no longer prefer startups.")
     _extract(repository, user["user_id"], conversation["conversation_id"])
-    assert _pending(repository, user["user_id"])[0]["operation"] == "REVOKE"
+    assert _pending(repository, user["user_id"]) == []
+    assert repository.list_memories(user["user_id"])[0]["active"] is True
 
 
-def test_ambiguous_memory_conflict_requires_review(workspace):
+def test_same_group_different_topic_defaults_to_add(workspace):
     repository, user, _, conversation = workspace
     _approved(repository, user["user_id"], "preference", "startups")
     _signal_message(repository, user["user_id"], conversation["conversation_id"], "I prefer healthcare roles.")
     _extract(repository, user["user_id"], conversation["conversation_id"])
-    assert _pending(repository, user["user_id"])[0]["operation"] == "CONFLICT"
+    assert _pending(repository, user["user_id"])[0]["operation"] == "ADD"
 
 
 def test_rejected_memory_never_enters_retrieval(workspace):

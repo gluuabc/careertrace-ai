@@ -1,0 +1,21 @@
+[
+  {"class":"profile","text":"I know Python.","destination":"profile"},
+  {"class":"semantic_preference","text":"I prefer research-oriented internships over large company internships.","destination":"semantic_memory"},
+  {"class":"semantic_preference","text":"I prefer remote roles over onsite roles.","destination":"semantic_memory"},
+  {"class":"semantic_goal","text":"I want to become a machine learning engineer.","destination":"semantic_memory"},
+  {"class":"semantic_constraint","text":"I cannot relocate this summer.","destination":"semantic_memory"},
+  {"class":"semantic_interest","text":"I enjoy working with LLM and NLP projects.","destination":"semantic_memory"},
+  {"class":"episodic_completed","text":"I worked on an LLM summarization research project at AWeSoMe Lab during summer 2026.","destination":"episodic_memory"},
+  {"class":"episodic_current","text":"I am currently working on CareerTrace.","destination":"episodic_memory"},
+  {"class":"episodic_planned","text":"I plan to apply for ML internships next summer.","destination":"episodic_memory"},
+  {"class":"negative_question","text":"What skills do ML engineers usually need?","destination":"none"},
+  {"class":"negative_question","text":"What are good companies for internships?","destination":"none"},
+  {"class":"third_person","text":"My friend wants to become a machine learning engineer.","destination":"none"},
+  {"class":"hypothetical","text":"If I preferred remote roles, what would change?","destination":"none"},
+  {"class":"quoted_suggestion","text":"You said 'you should target ML engineering'; I am repeating that suggestion.","destination":"none"},
+  {"class":"different_topic","text":"I prefer remote roles.","destination":"semantic_memory"},
+  {"class":"same_topic_update","text":"I now prefer remote work instead.","destination":"semantic_memory"},
+  {"class":"revocation","text":"I no longer prefer onsite work.","destination":"semantic_memory"},
+  {"class":"duplicate","text":"I prefer research-oriented internships.","destination":"semantic_memory"},
+  {"class":"ambiguous","text":"Remote could be interesting.","destination":"none"}
+]
