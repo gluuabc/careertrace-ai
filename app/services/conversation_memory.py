@@ -390,29 +390,49 @@ class ConversationMemoryExtractor:
         if not content:
             return
         category = "event" if proposal.destination == "episodic_memory" else str(proposal.semantic_group)
+        semantic_rows = self.repository.list_semantic_memories(user_id) if proposal.destination == "semantic_memory" else []
+        same_topic = [item for item in semantic_rows if proposal.topic_key and item.get("topic_key") == proposal.topic_key]
         active = [item for item in self.repository.list_memories(user_id) if item["category"] == category]
         normalized = " ".join(content.casefold().split())
-        exact = next((item for item in active if " ".join(item["content"].casefold().split()) == normalized), None)
+        exact = next((item for item in same_topic if " ".join(str(item["value"]).casefold().split()) == normalized), None)
+        if exact is None and proposal.destination == "episodic_memory":
+            exact = next((item for item in self.repository.list_career_events(user_id) if " ".join(item["content"].casefold().split()) == normalized), None)
+        if exact is None and proposal.proposal_sources == ["deterministic"]:
+            exact = next((item for item in active if " ".join(item["content"].casefold().split()) == normalized), None)
         if exact and proposal.operation_hint != "remove":
             return  # NOOP remains visible in the extraction audit, not review UI.
         # Until structured durable rows are introduced in Phase B, never select the
         # first item in a broad category. Only exact legacy rows are safe targets.
-        existing = exact
         source_text = proposal.evidence_text.casefold()
+        replacement = any(term in source_text for term in ("actually", "instead", "no longer", "now prefer", "changed my mind"))
+        existing = exact or (same_topic[0] if same_topic and replacement else None)
         if proposal.operation_hint == "remove" and existing:
             operation = "REVOKE"
-        elif existing and any(term in source_text for term in ("actually", "instead", "no longer", "now prefer", "changed my mind")):
+        elif existing and replacement:
             operation = "UPDATE"
+        elif same_topic and proposal.topic_key == "work_mode":
+            existing = same_topic[0]
+            operation = "CONFLICT"
         else:
             operation = "ADD"
         self.repository.create_memory_candidate(
             user_id, category=category, content=content, confidence=proposal.confidence,
             source="conversation_extraction", operation=operation,
-            existing_memory_id=existing["memory_id"] if existing else None,
+            existing_memory_id=(existing["memory_id"] if existing and not existing.get("semantic_memory_id") and not existing.get("career_event_id") else None),
+            existing_entity_id=(existing.get("semantic_memory_id") or existing.get("career_event_id")) if existing else None,
             source_conversation_id=conversation_id,
             source_message_ids=[proposal.source_message_id] if proposal.source_message_id else [],
             extraction_run_id=run_id, event_time=proposal.event_time,
             raw_temporal_expression=proposal.raw_temporal_expression,
+            memory_kind="episodic" if proposal.destination == "episodic_memory" else "semantic",
+            semantic_group=proposal.semantic_group,
+            topic_key=proposal.topic_key,
+            proposed_value=proposal.value,
+            event_status=proposal.event_status,
+            evidence_text=proposal.evidence_text,
+            evidence_start=proposal.evidence_start,
+            evidence_end=proposal.evidence_end,
+            proposal_sources=proposal.proposal_sources,
         )
 
 

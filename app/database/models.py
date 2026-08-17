@@ -473,6 +473,7 @@ class MemoryCandidate(Base):
     existing_memory_id: Mapped[str | None] = mapped_column(
         ForeignKey("memories.memory_id", ondelete="SET NULL"), nullable=True, index=True
     )
+    existing_entity_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
     source_conversation_id: Mapped[str | None] = mapped_column(
         ForeignKey("conversations.conversation_id", ondelete="SET NULL"), nullable=True, index=True
     )
@@ -480,6 +481,15 @@ class MemoryCandidate(Base):
     extraction_run_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
     event_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     raw_temporal_expression: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    memory_kind: Mapped[str] = mapped_column(String(30), default="semantic", nullable=False, index=True)
+    semantic_group: Mapped[str | None] = mapped_column(String(100), nullable=True, index=True)
+    topic_key: Mapped[str | None] = mapped_column(String(200), nullable=True, index=True)
+    proposed_value: Mapped[Any | None] = mapped_column(JSON, nullable=True)
+    event_status: Mapped[str | None] = mapped_column(String(30), nullable=True, index=True)
+    evidence_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    evidence_start: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    evidence_end: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    proposal_sources: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
     status: Mapped[str] = mapped_column(String(20), default="pending", nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utc_now, nullable=False, index=True
@@ -525,6 +535,63 @@ class Memory(Base):
     )
 
     user: Mapped[User] = relationship(back_populates="memories")
+
+
+class CareerPath(TimestampMixin, Base):
+    __tablename__ = "career_paths"
+
+    career_path_id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.user_id", ondelete="CASCADE"), nullable=False, index=True)
+    name: Mapped[str] = mapped_column(String(300), nullable=False)
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False, index=True)
+
+
+class SemanticMemory(Base):
+    __tablename__ = "semantic_memories"
+
+    semantic_memory_id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.user_id", ondelete="CASCADE"), nullable=False, index=True)
+    semantic_group: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
+    topic_key: Mapped[str | None] = mapped_column(String(200), nullable=True, index=True)
+    value: Mapped[Any] = mapped_column(JSON, nullable=False)
+    source: Mapped[str] = mapped_column(String(100), nullable=False)
+    source_conversation_id: Mapped[str | None] = mapped_column(ForeignKey("conversations.conversation_id", ondelete="SET NULL"), nullable=True, index=True)
+    source_message_ids: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
+    evidence_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False, index=True)
+    supersedes_semantic_memory_id: Mapped[str | None] = mapped_column(ForeignKey("semantic_memories.semantic_memory_id", ondelete="SET NULL"), nullable=True, index=True)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    retrieval_index_status: Mapped[str] = mapped_column(String(30), default="pending", nullable=False, index=True)
+    retrieval_index_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utc_now, nullable=False, index=True)
+
+
+class CareerEvent(Base):
+    __tablename__ = "career_events"
+
+    career_event_id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.user_id", ondelete="CASCADE"), nullable=False, index=True)
+    career_path_id: Mapped[str | None] = mapped_column(ForeignKey("career_paths.career_path_id", ondelete="SET NULL"), nullable=True, index=True)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    event_status: Mapped[str] = mapped_column(String(30), default="unknown", nullable=False, index=True)
+    event_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    raw_temporal_expression: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    title: Mapped[str | None] = mapped_column(String(300), nullable=True)
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    start_date: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    end_date: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    outcome: Mapped[str | None] = mapped_column(Text, nullable=True)
+    source: Mapped[str] = mapped_column(String(100), nullable=False)
+    source_conversation_id: Mapped[str | None] = mapped_column(ForeignKey("conversations.conversation_id", ondelete="SET NULL"), nullable=True, index=True)
+    source_message_ids: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
+    evidence_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False, index=True)
+    supersedes_event_id: Mapped[str | None] = mapped_column(ForeignKey("career_events.career_event_id", ondelete="SET NULL"), nullable=True, index=True)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    retrieval_index_status: Mapped[str] = mapped_column(String(30), default="pending", nullable=False, index=True)
+    retrieval_index_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utc_now, nullable=False, index=True)
 
 
 class Conversation(TimestampMixin, Base):

@@ -581,6 +581,9 @@ def _render_profile(user_id: str) -> None:
                 st.write(f"**{change['field_key']}** · {change['operation']}")
                 st.write(f"Current: {change['before_value']}")
                 st.write(f"Proposed: {change['proposed_value']}")
+                source = change.get("source") or {}
+                if source.get("evidence_text"):
+                    st.caption(f"Supporting user evidence: “{source['evidence_text']}”")
                 if change["status"] == "pending":
                     with st.container(horizontal=True):
                         if st.button("Accept field change", key=f"accept_profile_change_{change['change_id']}"):
@@ -771,7 +774,18 @@ def _render_memory(user_id: str) -> None:
         st.info("No AI memory suggestions are waiting for review.")
     for candidate in pending:
         with st.container(border=True):
-            st.write(f"**{candidate['operation']} {candidate['category']}** — {candidate['content']}")
+            kind = candidate.get("memory_kind") or "legacy"
+            if kind == "semantic":
+                st.write(f"**{candidate['semantic_group']} · {candidate.get('topic_key') or 'Unclassified topic'}**")
+                st.write(f"Suggested value: {candidate.get('proposed_value') or candidate['content']}")
+                st.write(f"Suggested operation: {candidate['operation']}")
+            elif kind == "episodic":
+                st.write(f"**Career event · {candidate.get('event_status') or 'unknown'}**")
+                st.write(candidate["content"])
+                if candidate.get("raw_temporal_expression"):
+                    st.write(f"Time expression: {candidate['raw_temporal_expression']}")
+            else:
+                st.write(f"**{candidate['operation']} {candidate['category']}** — {candidate['content']}")
             existing = next(
                 (
                     item for item in profile_repository.list_memories(user_id, include_inactive=True)
@@ -781,15 +795,9 @@ def _render_memory(user_id: str) -> None:
             )
             if existing:
                 st.write(f"Existing: {existing['content']}")
-            confidence = (
-                candidate["confidence"]
-                if candidate["confidence"] is not None
-                else "n/a"
-            )
-            st.caption(
-                f"Source: {candidate['source']} · confidence: "
-                f"{confidence}"
-            )
+            if candidate.get("evidence_text"):
+                st.caption(f"Supporting user evidence: “{candidate['evidence_text']}”")
+            st.caption(f"Source: {candidate['source']} · Created: {candidate['created_at']}")
             with st.container(horizontal=True):
                 accept_label = {
                     "ADD": "Approve",
@@ -835,7 +843,11 @@ def _render_memory(user_id: str) -> None:
                     st.rerun()
 
     st.markdown("### Approved Memories")
-    memories = profile_repository.list_memories(user_id)
+    memories = [
+        *profile_repository.list_semantic_memories(user_id),
+        *profile_repository.list_career_events(user_id),
+        *profile_repository.list_memories(user_id),
+    ]
     if not memories:
         st.info("No approved flexible memories yet.")
     for memory in memories:
