@@ -31,3 +31,4 @@ data/profile_memory.json
 # Uploaded user files
 *.pdf
 uploads/
+*.db
