@@ -73,6 +73,23 @@ class RetrievalCorpusIndexer:
             metadata={"source": memory.get("source"), "memory_id": memory["memory_id"]},
         )
 
+    def index_semantic_memory(self, *, user_id: str, memory: dict[str, Any]) -> list[dict[str, Any]]:
+        return self.index_text(
+            corpus_type="semantic_memory", user_id=user_id,
+            source_entity_id=memory["semantic_memory_id"], source_version="1",
+            title=f"{memory['semantic_group']}: {memory.get('topic_key') or 'unclassified'}",
+            text=str(memory["value"]),
+            metadata={"semantic_memory_id": memory["semantic_memory_id"], "semantic_group": memory["semantic_group"], "topic_key": memory.get("topic_key")},
+        )
+
+    def index_career_event(self, *, user_id: str, event: dict[str, Any]) -> list[dict[str, Any]]:
+        return self.index_text(
+            corpus_type="episodic_event", user_id=user_id,
+            source_entity_id=event["career_event_id"], source_version="1",
+            title=f"Career event ({event['event_status']})", text=event["content"],
+            metadata={"career_event_id": event["career_event_id"], "event_status": event["event_status"], "event_time": event.get("event_time")},
+        )
+
     def index_evidence(self, *, user_id: str, run_id: str, evidence_id: str, source_name: str, source_type: str, source_url: str | None, content_hash: str, text: str) -> list[dict[str, Any]]:
         return self.index_text(
             corpus_type="evidence",

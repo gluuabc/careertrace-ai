@@ -12,6 +12,8 @@ from app.database.agent_repository import AgentRepositoryMixin
 from app.database.models import (
     CareerAnalysis,
     CareerAnalysisVersion,
+    CareerEvent,
+    CareerPath,
     CareerPreference,
     Conversation,
     ConversationMemorySignal,
@@ -32,6 +34,7 @@ from app.database.models import (
     Project,
     RetrievalDocument,
     Skill,
+    SemanticMemory,
     StarredQAPair,
     User,
 )
@@ -674,6 +677,16 @@ class ProfileRepository(AgentRepositoryMixin):
         extraction_run_id: str | None = None,
         event_time: datetime | None = None,
         raw_temporal_expression: str | None = None,
+        memory_kind: str = "legacy",
+        existing_entity_id: str | None = None,
+        semantic_group: str | None = None,
+        topic_key: str | None = None,
+        proposed_value: Any = None,
+        event_status: str | None = None,
+        evidence_text: str | None = None,
+        evidence_start: int | None = None,
+        evidence_end: int | None = None,
+        proposal_sources: list[str] | None = None,
     ) -> dict[str, Any]:
         if confidence is not None and not 0 <= confidence <= 1:
             raise ValueError("confidence must be between 0 and 1.")
@@ -732,6 +745,16 @@ class ProfileRepository(AgentRepositoryMixin):
                 extraction_run_id=extraction_run_id,
                 event_time=event_time,
                 raw_temporal_expression=raw_temporal_expression,
+                memory_kind=self._required_text(memory_kind, "memory kind"),
+                existing_entity_id=existing_entity_id,
+                semantic_group=semantic_group,
+                topic_key=topic_key,
+                proposed_value=proposed_value,
+                event_status=event_status,
+                evidence_text=evidence_text,
+                evidence_start=evidence_start,
+                evidence_end=evidence_end,
+                proposal_sources=list(dict.fromkeys(proposal_sources or [])),
             )
             session.add(candidate)
             session.flush()
@@ -755,6 +778,15 @@ class ProfileRepository(AgentRepositoryMixin):
         accept: bool,
         conflict_resolution: str | None = None,
     ) -> dict[str, Any] | None:
+        preview = next(
+            (item for item in self.list_memory_candidates(user_id) if item["candidate_id"] == candidate_id),
+            None,
+        )
+        if preview and preview.get("memory_kind") in {"semantic", "episodic"}:
+            return self._review_structured_memory_candidate(
+                user_id, candidate_id, accept=accept,
+                conflict_resolution=conflict_resolution,
+            )
         accepted_memory: dict[str, Any] | None = None
         with session_scope(self.session_factory) as session:
             candidate = session.scalar(
@@ -777,6 +809,46 @@ class ProfileRepository(AgentRepositoryMixin):
             if not accept or resolution in {"keep_existing", "reject_new"}:
                 candidate.status = "rejected"
                 return None
+            if candidate.memory_kind == "semantic":
+                existing_semantic = session.scalar(select(SemanticMemory).where(
+                    SemanticMemory.semantic_memory_id == candidate.existing_entity_id,
+                    SemanticMemory.user_id == user_id,
+                )) if candidate.existing_entity_id else None
+                if candidate.operation == "REVOKE":
+                    if existing_semantic is None:
+                        raise ValueError("The semantic memory selected for revocation no longer exists.")
+                    existing_semantic.active = False
+                    existing_semantic.revoked_at = datetime.now(timezone.utc)
+                    existing_semantic.retrieval_index_status = "inactive"
+                    return self._semantic_memory_dict(existing_semantic)
+                if candidate.operation in {"UPDATE", "CONFLICT"} and resolution == "use_new":
+                    if existing_semantic is None:
+                        raise ValueError("The semantic memory selected for update no longer exists.")
+                    existing_semantic.active = False
+                    existing_semantic.revoked_at = datetime.now(timezone.utc)
+                    existing_semantic.retrieval_index_status = "inactive"
+                item = SemanticMemory(
+                    user_id=user_id, semantic_group=candidate.semantic_group or candidate.category,
+                    topic_key=candidate.topic_key, value=candidate.proposed_value if candidate.proposed_value is not None else candidate.content,
+                    source=candidate.source, source_conversation_id=candidate.source_conversation_id,
+                    source_message_ids=list(candidate.source_message_ids or []), evidence_text=candidate.evidence_text,
+                    active=True, retrieval_index_status="pending",
+                    supersedes_semantic_memory_id=existing_semantic.semantic_memory_id if existing_semantic and resolution != "keep_both" else None,
+                )
+                session.add(item)
+                session.flush()
+                return self._semantic_memory_dict(item)
+            if candidate.memory_kind == "episodic":
+                item = CareerEvent(
+                    user_id=user_id, content=candidate.content, event_status=candidate.event_status or "unknown",
+                    event_time=candidate.event_time, raw_temporal_expression=candidate.raw_temporal_expression,
+                    source=candidate.source, source_conversation_id=candidate.source_conversation_id,
+                    source_message_ids=list(candidate.source_message_ids or []), evidence_text=candidate.evidence_text,
+                    active=True, retrieval_index_status="pending",
+                )
+                session.add(item)
+                session.flush()
+                return self._career_event_dict(item)
             existing = (
                 session.scalar(
                     select(Memory).where(
@@ -868,6 +940,105 @@ class ProfileRepository(AgentRepositoryMixin):
                 accepted_memory = self._memory_dict(memory)
         return accepted_memory
 
+    def _review_structured_memory_candidate(
+        self, user_id: str, candidate_id: str, *, accept: bool,
+        conflict_resolution: str | None,
+    ) -> dict[str, Any] | None:
+        result: dict[str, Any] | None = None
+        kind = ""
+        with session_scope(self.session_factory) as session:
+            candidate = session.scalar(select(MemoryCandidate).where(
+                MemoryCandidate.candidate_id == candidate_id,
+                MemoryCandidate.user_id == user_id,
+            ))
+            if candidate is None or candidate.status != "pending":
+                raise ValueError("Memory candidate was not found or has already been reviewed.")
+            resolution = conflict_resolution or ("use_new" if accept else "reject_new")
+            if candidate.operation == "CONFLICT" and resolution not in {"keep_existing", "use_new", "keep_both", "reject_new"}:
+                raise ValueError("Unsupported conflict resolution.")
+            candidate.reviewed_at = datetime.now(timezone.utc)
+            candidate.status = "accepted" if accept else "rejected"
+            if not accept or resolution in {"keep_existing", "reject_new"}:
+                candidate.status = "rejected"
+                return None
+            kind = candidate.memory_kind
+            if kind == "semantic":
+                existing = session.scalar(select(SemanticMemory).where(
+                    SemanticMemory.semantic_memory_id == candidate.existing_entity_id,
+                    SemanticMemory.user_id == user_id,
+                )) if candidate.existing_entity_id else None
+                if candidate.operation == "REVOKE":
+                    if existing is None:
+                        raise ValueError("The semantic memory selected for revocation no longer exists.")
+                    existing.active = False
+                    existing.revoked_at = datetime.now(timezone.utc)
+                    existing.retrieval_index_status = "inactive"
+                    session.execute(update(RetrievalDocument).where(
+                        RetrievalDocument.user_id == user_id,
+                        RetrievalDocument.corpus_type == "semantic_memory",
+                        RetrievalDocument.source_entity_id.like(f"{existing.semantic_memory_id}%"),
+                    ).values(active=False))
+                    return self._semantic_memory_dict(existing)
+                if candidate.operation in {"UPDATE", "CONFLICT"} and resolution == "use_new":
+                    if existing is None:
+                        raise ValueError("The semantic memory selected for update no longer exists.")
+                    existing.active = False
+                    existing.revoked_at = datetime.now(timezone.utc)
+                    existing.retrieval_index_status = "inactive"
+                    session.execute(update(RetrievalDocument).where(
+                        RetrievalDocument.user_id == user_id,
+                        RetrievalDocument.corpus_type == "semantic_memory",
+                        RetrievalDocument.source_entity_id.like(f"{existing.semantic_memory_id}%"),
+                    ).values(active=False))
+                item = SemanticMemory(
+                    user_id=user_id, semantic_group=candidate.semantic_group or candidate.category,
+                    topic_key=candidate.topic_key,
+                    value=candidate.proposed_value if candidate.proposed_value is not None else candidate.content,
+                    source=candidate.source, source_conversation_id=candidate.source_conversation_id,
+                    source_message_ids=list(candidate.source_message_ids or []), evidence_text=candidate.evidence_text,
+                    active=True, retrieval_index_status="pending",
+                    supersedes_semantic_memory_id=existing.semantic_memory_id if existing and resolution != "keep_both" else None,
+                )
+                session.add(item)
+                session.flush()
+                result = self._semantic_memory_dict(item)
+            else:
+                item = CareerEvent(
+                    user_id=user_id, content=candidate.content, event_status=candidate.event_status or "unknown",
+                    event_time=candidate.event_time, raw_temporal_expression=candidate.raw_temporal_expression,
+                    source=candidate.source, source_conversation_id=candidate.source_conversation_id,
+                    source_message_ids=list(candidate.source_message_ids or []), evidence_text=candidate.evidence_text,
+                    active=True, retrieval_index_status="pending",
+                )
+                session.add(item)
+                session.flush()
+                result = self._career_event_dict(item)
+        if result is None:
+            return None
+        error_name = None
+        try:
+            from app.database.retrieval_repository import RetrievalRepository
+            from app.services.retrieval_corpus import RetrievalCorpusIndexer
+            indexer = RetrievalCorpusIndexer(RetrievalRepository(self.session_factory))
+            if kind == "semantic":
+                indexer.index_semantic_memory(user_id=user_id, memory=result)
+            else:
+                indexer.index_career_event(user_id=user_id, event=result)
+        except Exception as error:
+            error_name = type(error).__name__
+        with session_scope(self.session_factory) as session:
+            if kind == "semantic":
+                item = session.get(SemanticMemory, result["semantic_memory_id"])
+                item.retrieval_index_status = "failed" if error_name else "synced"
+                item.retrieval_index_error = error_name
+                result = self._semantic_memory_dict(item)
+            else:
+                item = session.get(CareerEvent, result["career_event_id"])
+                item.retrieval_index_status = "failed" if error_name else "synced"
+                item.retrieval_index_error = error_name
+                result = self._career_event_dict(item)
+        return result
+
     def list_memories(
         self, user_id: str, *, include_inactive: bool = False
     ) -> list[dict[str, Any]]:
@@ -881,6 +1052,22 @@ class ProfileRepository(AgentRepositoryMixin):
                 .order_by(Memory.created_at.desc())
             ).all()
             return [self._memory_dict(item) for item in memories]
+
+    def list_semantic_memories(self, user_id: str, *, include_inactive: bool = False) -> list[dict[str, Any]]:
+        with session_scope(self.session_factory) as session:
+            self._require_user(session, user_id)
+            query = select(SemanticMemory).where(SemanticMemory.user_id == user_id)
+            if not include_inactive:
+                query = query.where(SemanticMemory.active.is_(True))
+            return [self._semantic_memory_dict(item) for item in session.scalars(query.order_by(SemanticMemory.created_at.desc())).all()]
+
+    def list_career_events(self, user_id: str, *, include_inactive: bool = False) -> list[dict[str, Any]]:
+        with session_scope(self.session_factory) as session:
+            self._require_user(session, user_id)
+            query = select(CareerEvent).where(CareerEvent.user_id == user_id)
+            if not include_inactive:
+                query = query.where(CareerEvent.active.is_(True))
+            return [self._career_event_dict(item) for item in session.scalars(query.order_by(CareerEvent.created_at.desc())).all()]
 
     # --------------------------------------------------- profile revision drafts
     def create_profile_revision_draft(
@@ -1301,12 +1488,23 @@ class ProfileRepository(AgentRepositoryMixin):
         effective_profile = dict(persisted_profile)
         flexible: dict[str, list[str]] = {}
         list_fields = {"skills", "projects", "experience", "education"}
+        newest_profile_write: dict[str, datetime] = {}
+        for revision in self.list_profile_field_revisions(user_id):
+            newest_profile_write.setdefault(
+                revision["field_key"], datetime.fromisoformat(revision["created_at"])
+            )
         for signal in self.list_conversation_memory_signals(user_id, conversation_id):
             signal_type = signal["type"]
             operation = signal["operation_hint"]
             values = list(signal["value_hint"])
             if signal_type.startswith("profile."):
                 field = signal_type.split(".", 1)[1]
+                saved_at = newest_profile_write.get(field)
+                signal_at = datetime.fromisoformat(signal["created_at"])
+                if saved_at is not None and signal_at <= saved_at:
+                    # A later explicit Profile save/approval is authoritative for
+                    # this field; stale conversation hints cannot override it.
+                    continue
                 if field in list_fields:
                     current = list(effective_profile.get(field) or [])
                     if operation == "replace":
@@ -1870,6 +2068,16 @@ class ProfileRepository(AgentRepositoryMixin):
             "extraction_run_id": item.extraction_run_id,
             "event_time": item.event_time.isoformat() if item.event_time else None,
             "raw_temporal_expression": item.raw_temporal_expression,
+            "memory_kind": item.memory_kind,
+            "existing_entity_id": item.existing_entity_id,
+            "semantic_group": item.semantic_group,
+            "topic_key": item.topic_key,
+            "proposed_value": item.proposed_value,
+            "event_status": item.event_status,
+            "evidence_text": item.evidence_text,
+            "evidence_start": item.evidence_start,
+            "evidence_end": item.evidence_end,
+            "proposal_sources": list(item.proposal_sources or []),
             "status": item.status,
             "created_at": item.created_at.isoformat(),
             "reviewed_at": item.reviewed_at.isoformat()
@@ -1895,6 +2103,39 @@ class ProfileRepository(AgentRepositoryMixin):
             "retrieval_index_status": item.retrieval_index_status,
             "retrieval_index_error": item.retrieval_index_error,
             "created_at": item.created_at.isoformat(),
+        }
+
+    @staticmethod
+    def _semantic_memory_dict(item: SemanticMemory) -> dict[str, Any]:
+        return {
+            "semantic_memory_id": item.semantic_memory_id, "memory_id": item.semantic_memory_id,
+            "user_id": item.user_id, "memory_kind": "semantic", "semantic_group": item.semantic_group,
+            "category": item.semantic_group, "topic_key": item.topic_key, "value": item.value,
+            "content": str(item.value), "source": item.source, "active": item.active,
+            "supersedes_semantic_memory_id": item.supersedes_semantic_memory_id,
+            "revoked_at": item.revoked_at.isoformat() if item.revoked_at else None,
+            "source_conversation_id": item.source_conversation_id,
+            "source_message_ids": list(item.source_message_ids or []), "evidence_text": item.evidence_text,
+            "retrieval_index_status": item.retrieval_index_status,
+            "retrieval_index_error": item.retrieval_index_error, "created_at": item.created_at.isoformat(),
+        }
+
+    @staticmethod
+    def _career_event_dict(item: CareerEvent) -> dict[str, Any]:
+        return {
+            "career_event_id": item.career_event_id, "memory_id": item.career_event_id,
+            "user_id": item.user_id, "memory_kind": "episodic", "category": "event",
+            "content": item.content, "event_status": item.event_status,
+            "event_time": item.event_time.isoformat() if item.event_time else None,
+            "raw_temporal_expression": item.raw_temporal_expression, "career_path_id": item.career_path_id,
+            "title": item.title, "description": item.description, "start_date": item.start_date.isoformat() if item.start_date else None,
+            "end_date": item.end_date.isoformat() if item.end_date else None, "outcome": item.outcome,
+            "source": item.source, "active": item.active, "supersedes_event_id": item.supersedes_event_id,
+            "revoked_at": item.revoked_at.isoformat() if item.revoked_at else None,
+            "source_conversation_id": item.source_conversation_id,
+            "source_message_ids": list(item.source_message_ids or []), "evidence_text": item.evidence_text,
+            "retrieval_index_status": item.retrieval_index_status,
+            "retrieval_index_error": item.retrieval_index_error, "created_at": item.created_at.isoformat(),
         }
 
     @staticmethod

@@ -119,7 +119,10 @@ class AgentContextTests(unittest.TestCase):
         )
         self.assertIn("climate technology", block)
         self.assertNotIn("healthcare roles", block)
-        self.assertEqual(retrieval.kwargs["corpus_types"], ["approved_memory"])
+        self.assertEqual(
+            retrieval.kwargs["corpus_types"],
+            ["semantic_memory", "episodic_event", "approved_memory"],
+        )
 
     def test_compression_preserves_original_messages_and_boundary(self):
         for index in range(6):

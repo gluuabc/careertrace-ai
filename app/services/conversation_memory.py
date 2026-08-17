@@ -7,7 +7,9 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Literal
 
 from langchain_core.messages import HumanMessage
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+
+from app.state.schema import ProfileFacts
 
 from app.database.repository import ProfileRepository, profile_repository
 from app.llm.model import get_llm
@@ -15,14 +17,28 @@ from app.services.token_accounting import heuristic_text_tokens
 
 
 class ExtractedMemoryProposal(BaseModel):
-    destination: Literal["profile", "memory"]
-    category: Literal["profile_fact", "preference", "goal", "constraint", "event"]
-    field_key: str | None = None
-    operation: Literal["add", "replace", "remove"]
-    values: list[str] = Field(default_factory=list)
-    source_message_ids: list[str] = Field(default_factory=list)
+    destination: Literal["profile", "semantic_memory", "episodic_memory", "none"]
+    source_message_id: str | None = None
+    evidence_text: str = ""
+    evidence_start: int = 0
+    evidence_end: int = 0
+    confidence: float | None = None
+    operation_hint: Literal["add", "update", "remove", "noop", "possible_conflict"] = "add"
+    self_referential: bool = False
+    profile_field: str | None = None
+    semantic_group: str | None = None
+    topic_key: str | None = None
+    value: Any = None
+    content: str | None = None
+    event_status: Literal["completed", "current", "planned", "unknown"] | None = None
     event_time: datetime | None = None
     raw_temporal_expression: str | None = None
+    proposal_sources: list[Literal["llm", "deterministic"]] = Field(default_factory=lambda: ["llm"])
+
+    @field_validator("semantic_group", "topic_key", mode="before")
+    @classmethod
+    def normalize_keys(cls, value: Any) -> str | None:
+        return normalize_topic_key(value) if value else None
 
 
 class MemoryExtractionOutput(BaseModel):
@@ -51,7 +67,7 @@ def build_memory_extraction_input(
     user_id: str,
     conversation_id: str,
 ) -> dict[str, Any]:
-    """Build original short segments or signal-selected long context within budget."""
+    """Build a bounded segment that gives every user-authored turn priority."""
 
     conversation = repository.get_conversation(user_id, conversation_id)
     state = repository.get_conversation_memory_state(user_id, conversation_id)
@@ -72,24 +88,21 @@ def build_memory_extraction_input(
         selected = segment
         mode = "entire_original_segment"
     else:
-        index_by_id = {item["message_id"]: index for index, item in enumerate(segment)}
-        required = {index_by_id[item] for item in marked_ids if item in index_by_id}
-        candidates: list[tuple[int, int]] = []
-        for signal in signals:
-            center = index_by_id.get(signal["source_message_id"])
-            if center is None:
-                continue
-            radius = 4 if signal["type"] == "memory.event" else 2
-            for index in range(max(0, center - radius), min(len(segment), center + radius + 1)):
-                if index not in required:
-                    candidates.append((abs(index - center), index))
-        selected_indexes = set(required)
-        for _, index in sorted(set(candidates)):
+        user_indexes = [index for index, item in enumerate(segment) if item["role"] == "user"]
+        selected_indexes: set[int] = set()
+        # User turns are considered chronologically and never require a regex hit.
+        for index in user_indexes:
+            trial = [segment[item] for item in sorted([*selected_indexes, index])]
+            if heuristic_text_tokens(json.dumps(trial, default=str)) <= max_tokens:
+                selected_indexes.add(index)
+        # Spend remaining budget on nearby assistant context, nearest to user turns.
+        assistant_indexes = [index for index, item in enumerate(segment) if item["role"] == "assistant"]
+        for index in sorted(assistant_indexes, key=lambda i: min((abs(i - u) for u in user_indexes), default=i)):
             trial = [segment[item] for item in sorted([*selected_indexes, index])]
             if heuristic_text_tokens(json.dumps(trial, default=str)) <= max_tokens:
                 selected_indexes.add(index)
         selected = [segment[index] for index in sorted(selected_indexes)]
-        mode = "signal_selected_context"
+        mode = "user_prioritized_context"
     # Marked statements are non-negotiable. If they alone exceed the budget, retain
     # them and report the actual count instead of deleting the user's explicit fact.
     selected_tokens = heuristic_text_tokens(json.dumps(selected, default=str))
@@ -106,6 +119,7 @@ def build_memory_extraction_input(
         item for item in repository.list_memories(user_id)
         if item["category"] in memory_types
     ][:5]
+    active_semantic = repository.list_semantic_memories(user_id)
     groups: dict[str, list[dict[str, Any]]] = {}
     for signal in signals:
         groups.setdefault(signal["type"], []).append(signal)
@@ -123,6 +137,8 @@ def build_memory_extraction_input(
         "signals_grouped_chronologically": groups,
         "relevant_profile": {field: profile.get(field) for field in referenced_fields},
         "relevant_approved_memories": relevant_memories,
+        "active_semantic_groups": sorted({item["semantic_group"] for item in active_semantic}),
+        "active_semantic_topic_keys": sorted({item["topic_key"] for item in active_semantic if item.get("topic_key")}),
         "estimated_input_tokens": selected_tokens,
         "max_input_tokens": max_tokens,
         "marked_source_message_ids": sorted(marked_ids),
@@ -138,18 +154,45 @@ def _event_time(values: list[str], source_created_at: str | None) -> tuple[datet
     return (created - timedelta(days=1) if raw == "yesterday" else created), raw
 
 
+TOPIC_ALIASES = {
+    "remote_work": "work_mode", "work_modality": "work_mode",
+    "remote_vs_onsite": "work_mode", "onsite_work": "work_mode",
+}
+
+
+def normalize_topic_key(value: Any) -> str:
+    normalized = re.sub(r"[^a-z0-9_]+", "_", str(value or "").casefold().strip().replace("-", "_"))
+    normalized = re.sub(r"_+", "_", normalized).strip("_")
+    return TOPIC_ALIASES.get(normalized, normalized)
+
+
+def _normalized_text(value: str) -> str:
+    return " ".join(value.split())
+
+
+def _signal_topic(category: str, values: list[str]) -> str:
+    text = " ".join(values).casefold()
+    if category == "preference" and any(term in text for term in ("remote", "onsite", "on-site", "hybrid")):
+        return "work_mode"
+    return ""
+
+
 def _deterministic_proposals(payload: dict[str, Any]) -> list[ExtractedMemoryProposal]:
     by_message = {item["message_id"]: item for item in payload["messages"]}
     proposals = []
     for signal_type, signals in payload["signals_grouped_chronologically"].items():
         latest = signals[-1]
-        message_ids = [item["source_message_id"] for item in signals]
+        message_id = latest["source_message_id"]
+        source = by_message.get(message_id, {})
+        evidence = str(source.get("content") or "")
+        operation = {"replace": "update", "remove": "remove"}.get(latest["operation_hint"], "add")
         if signal_type.startswith("profile."):
             proposals.append(ExtractedMemoryProposal(
-                destination="profile", category="profile_fact",
-                field_key=signal_type.split(".", 1)[1],
-                operation=latest["operation_hint"], values=latest["value_hint"],
-                source_message_ids=message_ids,
+                destination="profile", profile_field=signal_type.split(".", 1)[1],
+                operation_hint=operation, value=latest["value_hint"],
+                source_message_id=message_id, evidence_text=evidence,
+                evidence_start=0, evidence_end=len(evidence), self_referential=True,
+                proposal_sources=["deterministic"],
             ))
         else:
             category = signal_type.split(".", 1)[1]
@@ -158,22 +201,104 @@ def _deterministic_proposals(payload: dict[str, Any]) -> list[ExtractedMemoryPro
             if category == "event":
                 source = by_message.get(latest["source_message_id"], {})
                 event_time, raw_temporal = _event_time(latest["value_hint"], source.get("created_at"))
-            proposals.append(ExtractedMemoryProposal(
-                destination="memory", category=category,
-                operation=latest["operation_hint"], values=latest["value_hint"],
-                source_message_ids=message_ids, event_time=event_time,
-                raw_temporal_expression=raw_temporal,
-            ))
+            content = "; ".join(latest["value_hint"])
+            common = dict(source_message_id=message_id, evidence_text=evidence,
+                          evidence_start=0, evidence_end=len(evidence), self_referential=True,
+                          operation_hint=operation, proposal_sources=["deterministic"])
+            if category == "event":
+                status = "planned" if re.search(r"\b(?:plan|will|next)\b", evidence, re.I) else "unknown"
+                proposals.append(ExtractedMemoryProposal(
+                    destination="episodic_memory", content=content, event_status=status,
+                    event_time=event_time, raw_temporal_expression=raw_temporal, **common,
+                ))
+            else:
+                proposals.append(ExtractedMemoryProposal(
+                    destination="semantic_memory", semantic_group=category,
+                    topic_key=_signal_topic(category, latest["value_hint"]), value=content, **common,
+                ))
     return proposals
 
 
 def _validated_extraction_proposals(
     payload: dict[str, Any], proposals: list[ExtractedMemoryProposal]
 ) -> list[ExtractedMemoryProposal]:
-    """Allow only proposals backed by recorded deterministic user signals."""
+    """Merge both sources, then enforce exact evidence, ownership, and schema."""
 
-    del proposals
-    return _deterministic_proposals(payload)
+    messages = {item["message_id"]: item for item in payload["messages"]}
+    canonical_fields = set(ProfileFacts.model_fields)
+    accepted: list[ExtractedMemoryProposal] = []
+    merged: list[ExtractedMemoryProposal] = []
+    for proposal in [*proposals, *_deterministic_proposals(payload)]:
+        normalized_value = _normalized_text(str(proposal.value or proposal.content or "")).casefold()
+        duplicate = next((item for item in merged if (
+            item.source_message_id == proposal.source_message_id
+            and item.destination == proposal.destination
+            and (item.profile_field == proposal.profile_field)
+            and (not item.semantic_group or not proposal.semantic_group or item.semantic_group == proposal.semantic_group)
+            and _normalized_text(str(item.value or item.content or "")).casefold() == normalized_value
+            and (
+                item.evidence_start <= proposal.evidence_end
+                and proposal.evidence_start <= item.evidence_end
+                or _normalized_text(item.evidence_text).casefold() == _normalized_text(proposal.evidence_text).casefold()
+            )
+        )), None)
+        if duplicate:
+            duplicate.proposal_sources = list(dict.fromkeys([*duplicate.proposal_sources, *proposal.proposal_sources]))
+            if "llm" in proposal.proposal_sources:
+                richer = proposal.model_copy(deep=True)
+                richer.proposal_sources = duplicate.proposal_sources
+                merged[merged.index(duplicate)] = richer
+            continue
+        merged.append(proposal)
+    for proposal in merged:
+        if proposal.destination == "none":
+            continue
+        message = messages.get(proposal.source_message_id or "")
+        if not message or message.get("role") != "user":
+            continue
+        original = str(message.get("content") or "")
+        if not (0 <= proposal.evidence_start <= proposal.evidence_end <= len(original)):
+            continue
+        if _normalized_text(original[proposal.evidence_start:proposal.evidence_end]) != _normalized_text(proposal.evidence_text):
+            continue
+        evidence = proposal.evidence_text
+        third_party = bool(re.search(r"\b(?:my friend|my (?:sister|brother|manager)|he|she|they|their)\b", evidence, re.I))
+        first_person = bool(re.search(r"\b(?:I|I'm|I've|I'd|my|mine|me)\b", evidence, re.I))
+        if third_party or (not first_person and not proposal.self_referential):
+            continue
+        if proposal.destination == "profile":
+            if proposal.profile_field not in canonical_fields:
+                continue
+            try:
+                ProfileFacts.model_validate({proposal.profile_field: proposal.value})
+            except Exception:
+                continue
+        elif proposal.destination == "semantic_memory":
+            proposal.semantic_group = normalize_topic_key(proposal.semantic_group)
+            proposal.topic_key = normalize_topic_key(proposal.topic_key)
+            if not proposal.semantic_group or proposal.value in (None, "", []):
+                continue
+            if not proposal.topic_key:
+                if proposal.proposal_sources != ["deterministic"]:
+                    continue
+                proposal.operation_hint = "add"
+        elif proposal.destination == "episodic_memory":
+            if not str(proposal.content or "").strip():
+                continue
+            proposal.event_status = proposal.event_status or "unknown"
+            if proposal.raw_temporal_expression and _normalized_text(proposal.raw_temporal_expression).casefold() not in _normalized_text(evidence).casefold():
+                continue
+            if proposal.event_time and not proposal.raw_temporal_expression:
+                continue
+        key = (
+            proposal.destination, proposal.profile_field, proposal.semantic_group,
+            proposal.topic_key, _normalized_text(str(proposal.value or proposal.content)).casefold(),
+            proposal.operation_hint,
+        )
+        if not any(getattr(item, "_dedupe_key", None) == key for item in accepted):
+            object.__setattr__(proposal, "_dedupe_key", key)
+            accepted.append(proposal)
+    return accepted
 
 
 class ConversationMemoryExtractor:
@@ -196,9 +321,16 @@ class ConversationMemoryExtractor:
             return run
         try:
             prompt = [HumanMessage(content=(
-                "Extract only explicit durable candidate proposals from this bounded "
-                "conversation segment. Profile fields win over flexible memory. Compare "
-                "same-type statements chronologically. Do not invent values or event times.\n"
+                "Extract only explicit, self-owned durable candidate proposals from USER messages. "
+                "Use destination profile, semantic_memory, episodic_memory, or none. Profile fields "
+                "win whenever the fact fits the supplied canonical Profile schema. Semantic groups "
+                "are normalized open strings; preference, goal, constraint, interest, work_style, "
+                "value, and motivation are non-exhaustive examples. Reuse an active topic_key when "
+                "it accurately fits, otherwise propose safe snake_case. Future career plans are "
+                "episodic with planned status. Provide an exact evidence substring and character "
+                "offsets into its source user message. Never paraphrase evidence or invent temporal "
+                "values. Numeric confidence is internal only.\nCanonical Profile fields: "
+                + ", ".join(ProfileFacts.model_fields) + "\n"
                 + json.dumps(payload, ensure_ascii=False, default=str)
             ))]
             try:
@@ -230,26 +362,30 @@ class ConversationMemoryExtractor:
         profile = self.repository.get_profile(user_id) or {}
         profile_changes = []
         for proposal in proposals:
-            if proposal.destination == "profile" and proposal.field_key:
-                before = profile.get(proposal.field_key)
-                proposed: Any = proposal.values
-                if proposal.field_key not in {"skills", "projects", "experience", "education"}:
-                    proposed = proposal.values[-1] if proposal.values else None
-                    if proposal.field_key == "graduation_year" and str(proposed).isdigit():
+            if proposal.destination == "profile" and proposal.profile_field:
+                before = profile.get(proposal.profile_field)
+                raw_values = proposal.value if isinstance(proposal.value, list) else [proposal.value]
+                raw_values = [value for value in raw_values if value not in (None, "")]
+                proposed: Any = raw_values
+                if proposal.profile_field not in {"skills", "projects", "experience", "education", "courses", "achievements", "certifications", "target_roles", "preferred_locations", "employment_types"}:
+                    proposed = raw_values[-1] if raw_values else None
+                    if proposal.profile_field == "graduation_year" and str(proposed).isdigit():
                         proposed = int(proposed)
-                elif proposal.operation == "add":
+                elif proposal.operation_hint == "add":
                     current = list(before or [])
                     existing = {str(item).casefold() for item in current}
-                    proposed = [*current, *(value for value in proposal.values if value.casefold() not in existing)]
-                elif proposal.operation == "remove":
-                    removed = {value.casefold() for value in proposal.values}
+                    proposed = [*current, *(value for value in raw_values if str(value).casefold() not in existing)]
+                elif proposal.operation_hint == "remove":
+                    removed = {str(value).casefold() for value in raw_values}
                     proposed = [item for item in list(before or []) if str(item).casefold() not in removed]
                 profile_changes.append({
-                    "field_key": proposal.field_key, "operation": proposal.operation,
+                    "field_key": proposal.profile_field, "operation": proposal.operation_hint,
                     "before_value": before, "proposed_value": proposed,
-                    "source": {"extraction_run_id": run_id, "message_ids": proposal.source_message_ids},
+                    "source": {"extraction_run_id": run_id, "message_ids": [proposal.source_message_id],
+                               "evidence_text": proposal.evidence_text,
+                               "evidence_start": proposal.evidence_start, "evidence_end": proposal.evidence_end},
                 })
-            elif proposal.destination == "memory":
+            elif proposal.destination in {"semantic_memory", "episodic_memory"}:
                 self._persist_memory_candidate(user_id, conversation_id, run_id, proposal)
         if profile_changes:
             self.repository.create_profile_revision_draft(
@@ -260,33 +396,53 @@ class ConversationMemoryExtractor:
             )
 
     def _persist_memory_candidate(self, user_id: str, conversation_id: str, run_id: str, proposal: ExtractedMemoryProposal) -> None:
-        content = "; ".join(proposal.values).strip()
+        content = str(proposal.content if proposal.destination == "episodic_memory" else proposal.value or "").strip()
         if not content:
             return
-        active = [item for item in self.repository.list_memories(user_id) if item["category"] == proposal.category]
+        category = "event" if proposal.destination == "episodic_memory" else str(proposal.semantic_group)
+        semantic_rows = self.repository.list_semantic_memories(user_id) if proposal.destination == "semantic_memory" else []
+        same_topic = [item for item in semantic_rows if proposal.topic_key and item.get("topic_key") == proposal.topic_key]
+        active = [item for item in self.repository.list_memories(user_id) if item["category"] == category]
         normalized = " ".join(content.casefold().split())
-        exact = next((item for item in active if " ".join(item["content"].casefold().split()) == normalized), None)
-        if exact and proposal.operation != "remove":
+        exact = next((item for item in same_topic if " ".join(str(item["value"]).casefold().split()) == normalized), None)
+        if exact is None and proposal.destination == "episodic_memory":
+            exact = next((item for item in self.repository.list_career_events(user_id) if " ".join(item["content"].casefold().split()) == normalized), None)
+        if exact is None and proposal.proposal_sources == ["deterministic"]:
+            exact = next((item for item in active if " ".join(item["content"].casefold().split()) == normalized), None)
+        if exact and proposal.operation_hint != "remove":
             return  # NOOP remains visible in the extraction audit, not review UI.
-        existing = exact or (active[0] if active else None)
-        source_messages = self.repository.get_conversation(user_id, conversation_id)["messages"]
-        source_text = " ".join(item["content"] for item in source_messages if item["message_id"] in proposal.source_message_ids).casefold()
-        if proposal.operation == "remove":
+        # Until structured durable rows are introduced in Phase B, never select the
+        # first item in a broad category. Only exact legacy rows are safe targets.
+        source_text = proposal.evidence_text.casefold()
+        replacement = any(term in source_text for term in ("actually", "instead", "no longer", "now prefer", "changed my mind"))
+        existing = exact or (same_topic[0] if same_topic and replacement else None)
+        if proposal.operation_hint == "remove" and existing:
             operation = "REVOKE"
-        elif existing and any(term in source_text for term in ("actually", "instead", "no longer", "now prefer")):
+        elif existing and replacement:
             operation = "UPDATE"
-        elif existing:
+        elif same_topic and proposal.topic_key == "work_mode":
+            existing = same_topic[0]
             operation = "CONFLICT"
         else:
             operation = "ADD"
         self.repository.create_memory_candidate(
-            user_id, category=proposal.category, content=content, confidence=1.0,
+            user_id, category=category, content=content, confidence=proposal.confidence,
             source="conversation_extraction", operation=operation,
-            existing_memory_id=existing["memory_id"] if existing else None,
+            existing_memory_id=(existing["memory_id"] if existing and not existing.get("semantic_memory_id") and not existing.get("career_event_id") else None),
+            existing_entity_id=(existing.get("semantic_memory_id") or existing.get("career_event_id")) if existing else None,
             source_conversation_id=conversation_id,
-            source_message_ids=proposal.source_message_ids,
+            source_message_ids=[proposal.source_message_id] if proposal.source_message_id else [],
             extraction_run_id=run_id, event_time=proposal.event_time,
             raw_temporal_expression=proposal.raw_temporal_expression,
+            memory_kind="episodic" if proposal.destination == "episodic_memory" else "semantic",
+            semantic_group=proposal.semantic_group,
+            topic_key=proposal.topic_key,
+            proposed_value=proposal.value,
+            event_status=proposal.event_status,
+            evidence_text=proposal.evidence_text,
+            evidence_start=proposal.evidence_start,
+            evidence_end=proposal.evidence_end,
+            proposal_sources=proposal.proposal_sources,
         )
 
 

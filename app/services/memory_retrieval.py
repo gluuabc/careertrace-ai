@@ -21,6 +21,8 @@ PROFILE_FIELDS_BY_INTENT: dict[str, tuple[str, ...]] = {
         "skills", "courses", "achievements", "certifications", "projects", "experience",
     ),
     "outreach": ("name", "school", "major", "skills", "projects", "experience", "career_goal"),
+    "concise_guidance": ("education", "school", "major", "graduation_year", "skills", "projects", "experience", "career_goal", "target_roles"),
+    "action_plan": ("education", "school", "major", "graduation_year", "skills", "projects", "experience", "career_goal", "target_roles"),
 }
 
 MEMORY_TYPES_BY_INTENT: dict[str, tuple[str, ...]] = {
@@ -119,18 +121,34 @@ class ProgressiveMemoryService:
         limit: int = 10,
     ) -> list[dict[str, Any]]:
         requested_limit = max(1, min(int(limit), 10))
-        allowed = set(MEMORY_TYPES_BY_INTENT.get(_intent_value(intent), ()))
-        if not allowed:
-            return []
+        lowered = query.casefold()
+        semantic_only = any(phrase in lowered for phrase in (
+            "what preferences do you remember", "my preferences", "my goals",
+            "my constraints", "semantic memory",
+        ))
+        episodic_only = any(phrase in lowered for phrase in (
+            "what did i do", "what happened", "last summer", "career events",
+            "episodic memory",
+        ))
         overlay_types = {
-            key.split(".", 1)[1]
-            for key in (current_thread_memories or {})
+            key.split(".", 1)[1] for key in (current_thread_memories or {})
             if key.startswith("memory.")
         }
-        memories = [
-            item for item in self.repository.list_memories(user_id)
-            if item["category"] in allowed and item["category"] not in overlay_types
-        ]
+        if semantic_only and not episodic_only:
+            corpus_types = ["semantic_memory"]
+            memories = self.repository.list_semantic_memories(user_id)
+        elif episodic_only and not semantic_only:
+            corpus_types = ["episodic_event"]
+            memories = self.repository.list_career_events(user_id)
+        else:
+            corpus_types = ["semantic_memory", "episodic_event", "approved_memory"]
+            legacy = [item for item in self.repository.list_memories(user_id) if item["category"] not in overlay_types]
+            memories = [
+                *self.repository.list_semantic_memories(user_id),
+                *self.repository.list_career_events(user_id),
+                *legacy,
+            ]
+        memories = list({item["memory_id"]: item for item in reversed(memories)}.values())
         if not memories:
             return []
         by_id = {item["memory_id"]: item for item in memories}
@@ -140,11 +158,12 @@ class ProgressiveMemoryService:
             result = self.retrieval_service.retrieve(
                 user_id=user_id,
                 query=query,
-                corpus_types=["approved_memory"],
+                corpus_types=corpus_types,
                 top_k=10,
             )
             for index, hit in enumerate(result.items):
-                memory_id = str((getattr(hit, "metadata", {}) or {}).get("memory_id") or "")
+                metadata = getattr(hit, "metadata", {}) or {}
+                memory_id = str(metadata.get("semantic_memory_id") or metadata.get("career_event_id") or metadata.get("memory_id") or "")
                 if not memory_id:
                     memory_id = next(
                         (
@@ -165,11 +184,9 @@ class ProgressiveMemoryService:
 
         ordered = sorted(memories, key=relevance)
         if rank:
-            ordered = [item for item in ordered if item["memory_id"] in rank]
+            ordered = sorted(ordered, key=lambda item: (rank.get(item["memory_id"], 1000), relevance(item)))
         cards = []
         for item in ordered[:requested_limit]:
-            if item["category"] == "event" and not self._relevant_recent_event(item, query_tokens):
-                continue
             description = " ".join(str(item["content"]).split())
             temporal = (
                 {"event_time": item["event_time"]}
@@ -211,9 +228,12 @@ class ProgressiveMemoryService:
         unique_ids = list(dict.fromkeys(memory_ids))
         if len(unique_ids) > 3:
             raise ValueError("At most three memory IDs may be loaded at once.")
-        current = {
-            item["memory_id"]: item for item in self.repository.list_memories(user_id)
-        }
+        all_memories = [
+            *self.repository.list_semantic_memories(user_id),
+            *self.repository.list_career_events(user_id),
+            *self.repository.list_memories(user_id),
+        ]
+        current = {item["memory_id"]: item for item in all_memories}
         details = []
         for memory_id in unique_ids:
             item = current.get(memory_id)
@@ -240,7 +260,11 @@ class ProgressiveMemoryService:
             raise ValueError("Memory source context is limited to two ranges.")
         details = self.get_memory_details(user_id=user_id, memory_ids=[memory_id])[0]
         memory = next(
-            item for item in self.repository.list_memories(user_id)
+            item for item in [
+                *self.repository.list_semantic_memories(user_id),
+                *self.repository.list_career_events(user_id),
+                *self.repository.list_memories(user_id),
+            ]
             if item["memory_id"] == details["memory_id"]
         )
         conversation_id = memory.get("source_conversation_id")
@@ -338,6 +362,7 @@ class ProgressiveMemoryService:
             "resume_revision": {"resume", "cv", "tailor", "revise"},
             "outreach": {"outreach", "message", "email", "follow", "contact"},
             "action_plan": {"plan", "career", "goal", "next"},
+            "concise_guidance": {"role", "roles", "career", "fit", "job", "internship"},
         }.get(intent_value, set())
         workflow_is_explicit = bool(query_tokens & workflow_terms)
         overlapping = [
@@ -348,6 +373,8 @@ class ProgressiveMemoryService:
         ]
         if overlapping:
             return overlapping[:3]
+        if workflow_is_explicit:
+            return cards[:3]
         selected = []
         for card in cards:
             if workflow_is_explicit and card["type"] in {
