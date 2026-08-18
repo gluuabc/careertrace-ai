@@ -31,6 +31,8 @@ from app.state.agent_schema import (
     OutreachDraftInput,
     PeopleSearchRequest,
     ResumeRevisionDraftInput,
+    TaskPlanItem,
+    TaskType,
 )
 from app.tools import CAREER_AGENT_TOOLS
 
@@ -73,6 +75,25 @@ ALLOWED_TOOLS_BY_INTENT = {
     },
 }
 SOURCE_TOOLS = {"search_jobs", "search_people"}
+ACTION_TASK_TYPES = {
+    TaskType.JOB_SEARCH,
+    TaskType.PEOPLE_SEARCH,
+    TaskType.RESUME_REVISION,
+    TaskType.OUTREACH,
+}
+TASK_TYPE_TO_INTENT = {
+    TaskType.JOB_SEARCH: CareerIntent.JOB_SEARCH,
+    TaskType.PEOPLE_SEARCH: CareerIntent.PEOPLE_SEARCH,
+    TaskType.RESUME_REVISION: CareerIntent.RESUME_REVISION,
+    TaskType.OUTREACH: CareerIntent.OUTREACH,
+}
+INTENT_TO_TASK_TYPE = {intent: task for task, intent in TASK_TYPE_TO_INTENT.items()}
+TASK_TYPE_TO_TOOL = {
+    TaskType.JOB_SEARCH: "search_jobs",
+    TaskType.PEOPLE_SEARCH: "search_people",
+    TaskType.RESUME_REVISION: "save_resume_revision_draft",
+    TaskType.OUTREACH: "save_outreach_draft",
+}
 OPPORTUNITY_NOUNS = r"(?:jobs?|internships?|openings?|positions?|roles?|opportunities)"
 INTERNSHIP_REQUEST_PATTERN = re.compile(
     r"\b(?:intern(?:ship)?s?|co(?:-|\s+)ops?)\b",
@@ -108,6 +129,117 @@ def _is_role_guidance_request(request: str) -> bool:
         r"\b(?:realistic\s+goal|make\s+the\s+most\s+sense)\b",
     )
     return any(re.search(pattern, value) for pattern in patterns)
+
+
+def _explicit_action_task_types(request: str) -> set[TaskType]:
+    """Recover only explicit supported actions from the original user text."""
+
+    value = " ".join(request.casefold().split())
+    actions: set[TaskType] = set()
+    if _has_explicit_job_retrieval_intent(request):
+        actions.add(TaskType.JOB_SEARCH)
+    if any(
+        re.search(pattern, value)
+        for pattern in (
+            r"\b(?:find|search(?:\s+for)?|show|locate|connect\s+(?:me\s+)?(?:to|with))\b.{0,100}\b(?:people|person|alumni|alumnus|alumna|professors?|recruiters?|mentors?|professionals?)\b",
+            r"\b(?:alumni|alumnus|alumna|professors?|recruiters?)\b.{0,60}\b(?:connect|contact|reach\s+out)\b",
+        )
+    ):
+        actions.add(TaskType.PEOPLE_SEARCH)
+    if re.search(
+        r"\b(?:edit|revise|rewrite|tailor|improve|update)\b.{0,80}\b(?:resume|cv)\b",
+        value,
+    ):
+        actions.add(TaskType.RESUME_REVISION)
+    if re.search(
+        r"\b(?:draft|write|compose|create)\b.{0,80}\b(?:message|email|outreach|note)\b",
+        value,
+    ):
+        actions.add(TaskType.OUTREACH)
+    return actions
+
+
+def _has_explicit_guidance_request(request: str) -> bool:
+    """Detect advisory/explanatory work without classifying arbitrary semantics."""
+
+    value = " ".join(request.casefold().split())
+    patterns = (
+        r"\b(?:advice|advise|guidance|recommend(?:ation|ations)?|explain)\b",
+        r"\bwhat\s+should\s+i\s+do\b",
+        r"\bhow\s+(?:can|could|should|do)\s+i\b",
+        r"\btell\s+me\s+how\b",
+        r"\bhow\s+to\s+(?:prepare|improve|become|transition|break\s+into)\b",
+        r"\b(?:improve|increase|strengthen)\s+my\s+(?:chances|skills|profile)\b",
+        r"\b(?:one\s+day|career\s+path|prepare\s+for)\b",
+    )
+    return _is_role_guidance_request(request) or any(
+        re.search(pattern, value) for pattern in patterns
+    )
+
+
+def build_validated_task_plan(
+    request: str, decision: IntentDecision
+) -> tuple[list[TaskPlanItem], set[TaskType]]:
+    """Merge LLM proposals with explicit signals under a one-action boundary."""
+
+    explicit_actions = _explicit_action_task_types(request)
+    guidance_requested = _has_explicit_guidance_request(request)
+    if len(explicit_actions) > 1:
+        return [], explicit_actions
+
+    accepted: list[tuple[TaskType, str]] = []
+    for proposed in decision.task_plan:
+        task_type = TaskType(proposed.task_type)
+        if task_type in ACTION_TASK_TYPES and task_type not in explicit_actions:
+            continue
+        if task_type == TaskType.GUIDANCE and not guidance_requested:
+            continue
+        accepted.append((task_type, proposed.goal))
+
+    for task_type in explicit_actions:
+        if not any(item_type == task_type for item_type, _goal in accepted):
+            accepted.append((task_type, request.strip()))
+    if guidance_requested and not any(
+        item_type == TaskType.GUIDANCE for item_type, _goal in accepted
+    ):
+        accepted.insert(0, (TaskType.GUIDANCE, request.strip()))
+
+    if not accepted and decision.intent in {
+        CareerIntent.CONCISE_GUIDANCE,
+        CareerIntent.ACTION_PLAN,
+    }:
+        accepted.append((TaskType.GUIDANCE, decision.goal or request.strip()))
+    if not accepted and decision.intent in INTENT_TO_TASK_TYPE:
+        task_type = INTENT_TO_TASK_TYPE[decision.intent]
+        if task_type in explicit_actions:
+            accepted.append((task_type, decision.goal or request.strip()))
+
+    plan: list[TaskPlanItem] = []
+    seen: set[tuple[TaskType, str]] = set()
+    type_counts: dict[TaskType, int] = {}
+    for task_type, goal in accepted:
+        normalized_goal = " ".join(str(goal).casefold().split())
+        marker = (task_type, normalized_goal)
+        if marker in seen:
+            continue
+        if task_type in ACTION_TASK_TYPES and any(
+            item.task_type in ACTION_TASK_TYPES for item in plan
+        ):
+            continue
+        if task_type == TaskType.GUIDANCE and sum(
+            item.task_type == TaskType.GUIDANCE for item in plan
+        ) >= 3:
+            continue
+        seen.add(marker)
+        type_counts[task_type] = type_counts.get(task_type, 0) + 1
+        plan.append(
+            TaskPlanItem(
+                task_id=f"{task_type.value}_{type_counts[task_type]}",
+                task_type=task_type,
+                goal=str(goal).strip() or request.strip(),
+            )
+        )
+    return plan, explicit_actions
 
 
 def enforce_intent_boundaries(
@@ -290,6 +422,7 @@ class CareerAgentGraph:
         graph.add_node("plan_action", self.plan_action)
         graph.add_node("agent_model", self.agent_model)
         graph.add_node("execute_tools", self.execute_tools)
+        graph.add_node("observe_completion", self.observe_completion)
         graph.add_node("finalize", self.finalize)
         graph.add_edge(START, "initialize_run")
         graph.add_edge("initialize_run", "classify_intent")
@@ -305,18 +438,21 @@ class CareerAgentGraph:
         )
         graph.add_conditional_edges(
             "plan_action",
-            lambda state: "tools" if state.get("messages") and isinstance(state["messages"][-1], AIMessage) and state["messages"][-1].tool_calls else "final",
-            {"tools": "execute_tools", "final": "finalize"},
+            lambda state: "tools" if state.get("messages") and isinstance(state["messages"][-1], AIMessage) and state["messages"][-1].tool_calls else "observe",
+            {"tools": "execute_tools", "observe": "observe_completion"},
         )
+        graph.add_edge("execute_tools", "observe_completion")
+        graph.add_edge("agent_model", "observe_completion")
         graph.add_conditional_edges(
-            "execute_tools",
-            self._route_after_tools,
-            {"continue": "agent_model", "final": "finalize"},
-        )
-        graph.add_conditional_edges(
-            "agent_model",
-            self._route_after_model,
-            {"tools": "execute_tools", "final": "finalize"},
+            "observe_completion",
+            self._route_after_completion,
+            {
+                "tools": "execute_tools",
+                "action": "plan_action",
+                "respond": "agent_model",
+                "continue": "agent_model",
+                "final": "finalize",
+            },
         )
         graph.add_edge("finalize", END)
         return graph.compile(checkpointer=checkpointer)
@@ -342,6 +478,9 @@ class CareerAgentGraph:
             "people_candidates": [],
             "evidence_ids": [],
             "loaded_skills": {},
+            "task_plan": [],
+            "active_task_id": None,
+            "guidance_response": "",
             "status": status.model_dump(mode="json"),
             "stop_after_tools": False,
             "partial_result": False,
@@ -407,6 +546,44 @@ class CareerAgentGraph:
             )
             if boundary_overrode:
                 routing_source = "llm_boundary_override"
+        task_plan, explicit_actions = build_validated_task_plan(request, decision)
+        if len(explicit_actions) > 1:
+            decision = decision.model_copy(
+                update={
+                    "intent": CareerIntent.CLARIFICATION,
+                    "needs_user_input": True,
+                    "clarification_question": "Which search should I handle first: people or jobs?",
+                    "task_plan": [],
+                }
+            )
+            task_plan = []
+            routing_source = "llm_boundary_override"
+        elif task_plan:
+            action_task = next(
+                (item for item in task_plan if item.task_type in ACTION_TASK_TYPES),
+                None,
+            )
+            validated_intent = (
+                TASK_TYPE_TO_INTENT[action_task.task_type]
+                if action_task is not None
+                else decision.intent
+                if decision.intent
+                in {CareerIntent.CONCISE_GUIDANCE, CareerIntent.ACTION_PLAN}
+                else CareerIntent.CONCISE_GUIDANCE
+            )
+            if (
+                decision.intent != validated_intent
+                or decision.needs_user_input
+            ):
+                routing_source = "llm_boundary_override"
+            decision = decision.model_copy(
+                update={
+                    "intent": validated_intent,
+                    "needs_user_input": False,
+                    "clarification_question": None,
+                    "task_plan": task_plan,
+                }
+            )
         routing_diagnostics = {
             "classifier_version": ROUTING_CLASSIFIER_VERSION,
             "prompt_version": ROUTING_PROMPT_VERSION,
@@ -464,11 +641,36 @@ class CareerAgentGraph:
             "routing_diagnostics": routing_diagnostics,
             "memory_worthy": decision.memory_worthy,
             "memory_signals": signal_payload,
+            "task_plan": [item.model_dump(mode="json") for item in task_plan],
             "warnings": warnings,
         }
 
     def prepare_workflow(self, state: CareerAgentState) -> dict[str, Any]:
         intent = CareerIntent(state["intent"])
+        task_plan = [dict(item) for item in state.get("task_plan", [])]
+        if not task_plan:
+            fallback_type = INTENT_TO_TASK_TYPE.get(intent, TaskType.GUIDANCE)
+            task_plan = [
+                TaskPlanItem(
+                    task_id=f"{fallback_type.value}_1",
+                    task_type=fallback_type,
+                    goal=state.get("current_goal") or state["current_request"],
+                ).model_dump(mode="json")
+            ]
+        action_task = next(
+            (
+                item
+                for item in task_plan
+                if TaskType(item["task_type"]) in ACTION_TASK_TYPES
+                and item.get("status") == "pending"
+            ),
+            None,
+        )
+        active_task = action_task or next(
+            (item for item in task_plan if item.get("status") == "pending"), None
+        )
+        if active_task is not None:
+            active_task["status"] = "in_progress"
         skill_name = INTENT_SKILLS.get(intent)
         loaded: dict[str, str] = {}
         todo_content = {
@@ -496,6 +698,8 @@ class CareerAgentGraph:
             "todo_items": [item.model_dump(mode="json") for item in todos],
             "status": status.model_dump(mode="json"),
             "workflow_stage": status.workflow_stage,
+            "task_plan": task_plan,
+            "active_task_id": active_task.get("task_id") if active_task else None,
         }
 
     def plan_action(self, state: CareerAgentState) -> dict[str, Any]:
@@ -615,11 +819,38 @@ class CareerAgentGraph:
 
     def agent_model(self, state: CareerAgentState) -> dict[str, Any]:
         loaded_references: dict[str, Any] = {}
+        task_plan = [dict(item) for item in state.get("task_plan", [])]
+        pending_guidance = [
+            item
+            for item in task_plan
+            if item.get("task_type") == TaskType.GUIDANCE.value
+            and item.get("status") in {"pending", "in_progress"}
+        ]
+        terminal_action = next(
+            (
+                item
+                for item in task_plan
+                if item.get("task_type") != TaskType.GUIDANCE.value
+                and item.get("status") in {"completed", "partial", "blocked"}
+            ),
+            None,
+        )
         messages = self.context.build_messages(
             user_id=state["user_id"],
             conversation_id=state["conversation_id"],
             current_request=state["current_request"],
-            current_task={"intent": str(state.get("intent")), "goal": state.get("current_goal")},
+            current_task={
+                "intent": str(state.get("intent")),
+                "goal": state.get("current_goal"),
+                "tasks": [
+                    {
+                        "task_type": item.get("task_type"),
+                        "goal": item.get("goal"),
+                        "status": item.get("status"),
+                    }
+                    for item in task_plan
+                ],
+            },
             selected_entities={"job_ids": state.get("selected_job_ids", []), "people_ids": state.get("selected_people_ids", [])},
             loaded_skills=state.get("loaded_skills", {}),
             agent_status=state.get("status", {}),
@@ -660,11 +891,36 @@ class CareerAgentGraph:
                 )
             )
         )
-        try:
-            response = self._invoke_observed(
-                model, messages, state, stage="agent_model", model_type="reasoning",
-                tools=list(CAREER_AGENT_TOOLS), compression_triggered=compression_triggered,
+        if pending_guidance and terminal_action is not None:
+            no_tool_messages.append(
+                HumanMessage(
+                    content=(
+                        "Answer only the remaining career-guidance requests listed below. "
+                        "Do not restate individual search candidate fields because the "
+                        "evidence-backed results are displayed separately. Do not mention "
+                        "internal workflow, node, routing, intent, or tool execution terms.\n"
+                        + json.dumps(
+                            [item.get("goal") for item in pending_guidance],
+                            ensure_ascii=False,
+                        )
+                    )
+                )
             )
+        try:
+            if pending_guidance and terminal_action is not None:
+                response = self._invoke_observed(
+                    final_only_model,
+                    no_tool_messages,
+                    state,
+                    stage="agent_model_guidance_completion",
+                    model_type="reasoning",
+                    compression_triggered=compression_triggered,
+                )
+            else:
+                response = self._invoke_observed(
+                    model, messages, state, stage="agent_model", model_type="reasoning",
+                    tools=list(CAREER_AGENT_TOOLS), compression_triggered=compression_triggered,
+                )
             if not isinstance(response, AIMessage):
                 response = self._invoke_observed(
                     final_only_model, no_tool_messages, state, stage="agent_model_fallback",
@@ -700,6 +956,13 @@ class CareerAgentGraph:
             "messages": [response],
             "iteration": state.get("iteration", 0) + 1,
             "workflow_stage": "reasoning",
+            "guidance_response": (
+                str(response.content).strip()
+                if pending_guidance
+                and isinstance(response, AIMessage)
+                and not response.tool_calls
+                else state.get("guidance_response", "")
+            ),
             "personalization_references": references,
         }
 
@@ -958,6 +1221,148 @@ class CareerAgentGraph:
                 break
         return result
 
+    @staticmethod
+    def _latest_tool_result(
+        state: CareerAgentState, tool_name: str
+    ) -> dict[str, Any] | None:
+        for message in reversed(state.get("messages", [])):
+            if not isinstance(message, ToolMessage) or message.name != tool_name:
+                continue
+            try:
+                payload = (
+                    json.loads(message.content)
+                    if isinstance(message.content, str)
+                    else message.content
+                )
+            except (TypeError, json.JSONDecodeError):
+                return None
+            return payload if isinstance(payload, dict) else None
+        return None
+
+    def observe_completion(self, state: CareerAgentState) -> dict[str, Any]:
+        """Deterministically prevent finalization while planned work is pending."""
+
+        plan = [dict(item) for item in state.get("task_plan", [])]
+        if not plan:
+            return {"workflow_stage": state.get("workflow_stage", "reasoning")}
+        last = state.get("messages", [])[-1] if state.get("messages") else None
+        final_ai_response = (
+            isinstance(last, AIMessage)
+            and not last.tool_calls
+            and bool(str(last.content).strip())
+        )
+        failed = bool(state.get("current_error"))
+        needs_input = bool(state.get("needs_user_input"))
+        counts = state.get("tool_call_counts", {})
+
+        for task in plan:
+            if task.get("status") in {"completed", "partial", "blocked"}:
+                continue
+            task_type = TaskType(task["task_type"])
+            if task_type == TaskType.GUIDANCE:
+                if final_ai_response:
+                    task["status"] = "completed"
+                    task["result_summary"] = str(last.content).strip()[:1000]
+                elif failed or needs_input:
+                    task["status"] = "blocked"
+                    task["result_summary"] = "More user input is required."
+                continue
+
+            tool_name = TASK_TYPE_TO_TOOL[task_type]
+            call_count = int(counts.get(tool_name, 0))
+            if failed or needs_input:
+                task["status"] = "blocked"
+                task["result_summary"] = "The requested action needs more information."
+                continue
+            if call_count == 0:
+                task["status"] = "in_progress"
+                continue
+
+            if task_type == TaskType.JOB_SEARCH:
+                candidate_count = len(state.get("job_candidates", []))
+                if state.get("is_sufficient"):
+                    task["status"] = "completed"
+                elif state.get("stop_after_tools") or final_ai_response:
+                    task["status"] = "partial"
+                task["result_summary"] = (
+                    f"Found {candidate_count} evidence-backed job candidate"
+                    f"{'s' if candidate_count != 1 else ''}."
+                )
+            elif task_type == TaskType.PEOPLE_SEARCH:
+                candidate_count = len(state.get("people_candidates", []))
+                if state.get("is_sufficient"):
+                    task["status"] = "completed"
+                elif state.get("stop_after_tools") or final_ai_response:
+                    task["status"] = "partial"
+                task["result_summary"] = (
+                    f"Found {candidate_count} evidence-backed people match"
+                    f"{'es' if candidate_count != 1 else ''}."
+                )
+            else:
+                payload = self._latest_tool_result(state, tool_name)
+                if payload and payload.get("ok"):
+                    task["status"] = "completed"
+                    task["result_summary"] = "Prepared the requested reversible draft."
+                elif final_ai_response or state.get("stop_after_tools"):
+                    task["status"] = "partial"
+                    task["result_summary"] = "The requested draft could not be fully prepared."
+
+        terminal = all(
+            item.get("status") in {"completed", "partial", "blocked"}
+            for item in plan
+        )
+        active = next(
+            (
+                item
+                for item in plan
+                if item.get("status") in {"in_progress", "pending"}
+            ),
+            None,
+        )
+        guidance_response = state.get("guidance_response", "")
+        if final_ai_response and any(
+            item.get("task_type") == TaskType.GUIDANCE.value
+            and item.get("status") == "completed"
+            for item in plan
+        ):
+            guidance_response = str(last.content).strip()
+        return {
+            "task_plan": plan,
+            "active_task_id": active.get("task_id") if active else None,
+            "guidance_response": guidance_response,
+            "workflow_stage": "ready_to_finalize" if terminal else "executing_tasks",
+        }
+
+    @staticmethod
+    def _route_after_completion(state: CareerAgentState) -> str:
+        last = state.get("messages", [])[-1] if state.get("messages") else None
+        if isinstance(last, AIMessage) and last.tool_calls:
+            return "tools"
+        if state.get("needs_user_input") or state.get("current_error"):
+            return "final"
+        plan = state.get("task_plan", [])
+        if not plan:
+            return "final"
+        action = next(
+            (
+                item
+                for item in plan
+                if item.get("task_type") != TaskType.GUIDANCE.value
+                and item.get("status") in {"pending", "in_progress"}
+            ),
+            None,
+        )
+        if action is not None:
+            tool_name = TASK_TYPE_TO_TOOL[TaskType(action["task_type"])]
+            return "continue" if state.get("tool_call_counts", {}).get(tool_name) else "action"
+        if any(
+            item.get("task_type") == TaskType.GUIDANCE.value
+            and item.get("status") in {"pending", "in_progress"}
+            for item in plan
+        ):
+            return "respond"
+        return "final"
+
     def _route_after_tools(self, state: CareerAgentState) -> str:
         return "final" if state.get("stop_after_tools") else "continue"
 
@@ -984,6 +1389,77 @@ class CareerAgentGraph:
             return "tools"
         return "final"
 
+    @staticmethod
+    def _public_response_text(value: str) -> str:
+        """Remove internal orchestration vocabulary from user-visible text."""
+
+        replacements = (
+            (r"\btool execution\b", "search process"),
+            (r"\bworkflows?\b", "process"),
+            (r"\bnodes?\b", "steps"),
+            (r"\brouting\b", "selection"),
+            (r"\bintents?\b", "requests"),
+        )
+        result = value
+        for pattern, replacement in replacements:
+            result = re.sub(pattern, replacement, result, flags=re.I)
+        return result.strip()
+
+    def _compose_multi_task_response(
+        self, state: CareerAgentState, fallback: str
+    ) -> str:
+        plan = state.get("task_plan", [])
+        guidance_tasks = [
+            item for item in plan if item.get("task_type") == TaskType.GUIDANCE.value
+        ]
+        action_task = next(
+            (
+                item
+                for item in plan
+                if item.get("task_type") != TaskType.GUIDANCE.value
+            ),
+            None,
+        )
+        if not guidance_tasks or action_task is None:
+            return self._public_response_text(fallback)
+
+        guidance = str(state.get("guidance_response") or "").strip()
+        if not guidance:
+            guidance = "I could not complete the requested guidance without more detail."
+        action_type = TaskType(action_task["task_type"])
+        action_status = action_task.get("status")
+        if action_type == TaskType.JOB_SEARCH:
+            count = len(state.get("job_candidates", []))
+            noun = "job opportunity" if count == 1 else "job opportunities"
+        elif action_type == TaskType.PEOPLE_SEARCH:
+            count = len(state.get("people_candidates", []))
+            noun = "people match" if count == 1 else "people matches"
+        else:
+            count = 0
+            noun = "saved draft"
+
+        if action_type in {TaskType.JOB_SEARCH, TaskType.PEOPLE_SEARCH}:
+            if count:
+                action_summary = (
+                    f"I found {count} evidence-backed {noun}. "
+                    "Their structured details and sources are shown in the results section."
+                )
+            elif action_status == "blocked":
+                action_summary = "I need more information before I can complete the requested search."
+            else:
+                action_summary = "I could not verify any matching results within the current search limits."
+        else:
+            action_summary = str(action_task.get("result_summary") or fallback).strip()
+
+        section_title = (
+            "Search result"
+            if action_type in {TaskType.JOB_SEARCH, TaskType.PEOPLE_SEARCH}
+            else "Requested action"
+        )
+        return self._public_response_text(
+            f"Career guidance\n\n{guidance}\n\n{section_title}\n\n{action_summary}"
+        )
+
     def finalize(self, state: CareerAgentState) -> dict[str, Any]:
         final = state.get("final_response") or ""
         if not final and state.get("messages"):
@@ -997,8 +1473,19 @@ class CareerAgentGraph:
                 final = f"I found {len(state['people_candidates'])} evidence-backed people candidates. Review the sources below."
             else:
                 final = "I could not complete the workflow. Please provide one more specific target and try again."
+        task_plan = [dict(item) for item in state.get("task_plan", [])]
+        for item in task_plan:
+            if item.get("status") in {"pending", "in_progress"}:
+                item["status"] = "blocked"
+                item["result_summary"] = (
+                    item.get("result_summary")
+                    or "This part of the request could not be completed."
+                )
+        final = self._compose_multi_task_response(state, final)
         failed = bool(state.get("current_error")) and not state.get("needs_user_input")
-        partial = bool(state.get("partial_result"))
+        partial = bool(state.get("partial_result")) or any(
+            item.get("status") == "partial" for item in task_plan
+        )
         run_status = (
             "failed"
             if failed
@@ -1054,6 +1541,7 @@ class CareerAgentGraph:
                 "source_call_count": state.get("total_source_calls", 0),
                 "personalization_references": state.get("personalization_references", {}),
                 "routing_diagnostics": state.get("routing_diagnostics", {}),
+                "task_plan": task_plan,
             },
         )
         TrajectoryRecorder(state["user_id"], state["run_id"], self.repository).step("finalize", "Prepared observable final response.", "failed" if failed else "completed")
@@ -1069,6 +1557,7 @@ class CareerAgentGraph:
         return {
             "final_response": final,
             "todo_items": todos,
+            "task_plan": task_plan,
             "workflow_stage": workflow_stage,
             "personalization_references": state.get("personalization_references", {}),
         }

@@ -30,6 +30,34 @@ class CareerIntent(StrEnum):
     UNSUPPORTED = "unsupported"
 
 
+class TaskType(StrEnum):
+    GUIDANCE = "guidance"
+    JOB_SEARCH = "job_search"
+    PEOPLE_SEARCH = "people_search"
+    RESUME_REVISION = "resume_revision"
+    OUTREACH = "outreach"
+
+
+class TaskPlanItem(BaseModel):
+    """One bounded request-level task; never an autonomous agent assignment."""
+
+    task_id: str = Field(default_factory=lambda: str(uuid4()))
+    task_type: TaskType
+    goal: str
+    status: Literal[
+        "pending", "in_progress", "completed", "partial", "blocked"
+    ] = "pending"
+    result_summary: str | None = None
+
+    @field_validator("task_id", "goal")
+    @classmethod
+    def require_task_text(cls, value: str) -> str:
+        cleaned = str(value).strip()
+        if not cleaned:
+            raise ValueError("Task identifiers and goals are required.")
+        return cleaned
+
+
 class MemorySignal(BaseModel):
     type: Literal[
         "profile.school",
@@ -60,6 +88,7 @@ class IntentDecision(BaseModel):
     clarification_question: str | None = None
     memory_worthy: bool = False
     memory_signals: list[MemorySignal] = Field(default_factory=list)
+    task_plan: list[TaskPlanItem] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def align_memory_worthy(self):
@@ -430,6 +459,9 @@ class CareerAgentState(TypedDict, total=False):
     current_request: str
     workflow_stage: str
     todo_items: list[dict[str, Any]]
+    task_plan: list[dict[str, Any]]
+    active_task_id: str | None
+    guidance_response: str
     active_skill: str | None
     loaded_skills: dict[str, str]
     hard_constraints: dict[str, Any]

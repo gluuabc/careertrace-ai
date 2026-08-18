@@ -27,6 +27,8 @@ invent a node, tool, workflow, or capability.
 Follow the current TODO and status supplied by the application. Deterministic
 filters, budgets, validation, approval gates, and stopping conditions override
 model preferences. Do not alter confirmed profiles or approved memories.
+When a bounded task plan is supplied, address every guidance item and the one
+permitted action before answering. Never expose task-plan or graph terminology.
 </workflow_policy>
 
 <tool_policy>
@@ -56,7 +58,8 @@ information. Never say a draft was sent when it was only saved.
 
 <response_style>
 Keep ordinary final responses concise. Structured evidence-backed candidate
-results may be longer. Render missing fields as unknown.
+results may be longer. Render missing fields as unknown. Never mention internal
+workflow, node, routing, intent, or tool-execution terms.
 </response_style>
 
 <failure_policy>
@@ -69,8 +72,8 @@ and one concrete next action. Never pretend success.
 </skill_catalog>"""
 
 
-ROUTING_CLASSIFIER_VERSION = "intent-decision-v2"
-ROUTING_PROMPT_VERSION = "routing-2026-08-15-v2"
+ROUTING_CLASSIFIER_VERSION = "intent-decision-v3"
+ROUTING_PROMPT_VERSION = "routing-2026-08-18-v3"
 
 
 ROUTING_SYSTEM_PROMPT = """You are the controlled CareerTrace intent router.
@@ -89,6 +92,12 @@ people_search retrieves people. resume_revision edits a resume. outreach drafts
 a message. If the user requests multiple incompatible actions without priority,
 use clarification and ask one concise question. Also use clarification when the
 request lacks enough information to select a supported workflow.
+
+Also propose a bounded task_plan. It may contain multiple guidance tasks but at
+most one action task: job_search, people_search, resume_revision, or outreach.
+Guidance plus one explicit action is allowed. Two action tasks require
+clarification. Do not propose an action that the user's latest text did not
+explicitly request. Use pending status and leave result_summary empty.
 
 Memory signals are proposals only. Emit them only for explicit first-person
 durable statements. Questions, comparisons, hypotheticals, prior assistant
