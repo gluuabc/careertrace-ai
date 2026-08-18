@@ -32,7 +32,7 @@ TOP_LEVEL_PAGE_LABELS = (
     "Documents",
     "My profile",
     "Starred Q&A",
-    "Memory",
+    "Memory Universe",
     "Career Assistant",
 )
 DOCUMENT_PAGE_SECTIONS = ("Upload & Analyze", "Stored Documents")
@@ -419,18 +419,24 @@ def _render_upload(user_id: str, *, is_demo: bool = False) -> None:
             "used by Google-authenticated users."
         )
         with st.container(horizontal=True):
-            for filename, label in (
-                ("Demo_Resume.pdf", "Download demo resume"),
-                ("Demo_Portfolio.pdf", "Download demo portfolio"),
+            for filename, label, mime in (
+                ("Demo_Resume.pdf", "Download demo resume", "application/pdf"),
+                ("Demo_Portfolio.pdf", "Download demo portfolio", "application/pdf"),
+                (
+                    "Example_Alumni_Connections.csv",
+                    "Download example alumni connections",
+                    "text/csv",
+                ),
             ):
                 path = ROOT / "demo" / filename
                 st.download_button(
                     label,
                     data=path.read_bytes(),
                     file_name=filename,
-                    mime="application/pdf",
+                    mime=mime,
                     key=f"download_{filename}",
                     on_click="ignore",
+                    icon=":material/download:",
                 )
     max_size_mib = min(int(os.getenv("MAX_DOCUMENT_SIZE_MIB", "10")), 10)
     uploaded_files = st.file_uploader(
@@ -501,6 +507,65 @@ def _render_upload(user_id: str, *, is_demo: bool = False) -> None:
     _render_workflow(user_id)
 
 
+def _render_pending_profile_updates(
+    user_id: str,
+    *,
+    key_prefix: str,
+    heading: str,
+    drafts: list[dict[str, Any]] | None = None,
+) -> None:
+    st.markdown(heading)
+    profile_drafts = drafts or profile_repository.list_profile_revision_drafts(user_id)
+    pending_profile_drafts = [
+        item for item in profile_drafts if item["status"] == "pending"
+    ]
+    if not pending_profile_drafts:
+        st.info("No conversation-derived profile changes are waiting for review.")
+    for draft in pending_profile_drafts:
+        with st.container(border=True):
+            st.caption("Profile change proposal — reviewed one field at a time")
+            for change in draft["changes"]:
+                st.write(f"**{change['field_key']}** · {change['operation']}")
+                st.write(f"Current: {change['before_value']}")
+                st.write(f"Proposed: {change['proposed_value']}")
+                source = change.get("source") or {}
+                if source.get("evidence_text"):
+                    st.caption(f"Supporting user evidence: “{source['evidence_text']}”")
+                if change["status"] == "pending":
+                    with st.container(horizontal=True):
+                        if st.button(
+                            "Accept field change",
+                            key=f"{key_prefix}_accept_profile_change_{change['change_id']}",
+                        ):
+                            profile_repository.review_profile_revision_change(
+                                user_id, change["change_id"], accept=True
+                            )
+                            st.rerun()
+                        if st.button(
+                            "Reject field change",
+                            key=f"{key_prefix}_reject_profile_change_{change['change_id']}",
+                        ):
+                            profile_repository.review_profile_revision_change(
+                                user_id, change["change_id"], accept=False
+                            )
+                            st.rerun()
+                else:
+                    st.caption(f"Status: {change['status']}")
+            if any(change["status"] == "accepted" for change in draft["changes"]):
+                if st.button(
+                    "Apply accepted changes",
+                    key=f"{key_prefix}_apply_profile_draft_{draft['draft_id']}",
+                ):
+                    try:
+                        profile_repository.apply_profile_revision_draft(
+                            user_id, draft["draft_id"]
+                        )
+                        st.success("Accepted profile fields were applied.")
+                        st.rerun()
+                    except ValueError as error:
+                        st.error(str(error))
+
+
 def _render_profile(user_id: str) -> None:
     profile = profile_repository.get_profile(user_id)
     if profile is None:
@@ -567,41 +632,11 @@ def _render_profile(user_id: str) -> None:
                 else:
                     st.info("No changes detected. Profile version was not updated.")
 
-    st.markdown("### Pending Profile Updates")
-    profile_drafts = profile_repository.list_profile_revision_drafts(user_id)
-    pending_profile_drafts = [
-        item for item in profile_drafts if item["status"] == "pending"
-    ]
-    if not pending_profile_drafts:
-        st.info("No conversation-derived profile changes are waiting for review.")
-    for draft in pending_profile_drafts:
-        with st.container(border=True):
-            st.caption("Profile change proposal — reviewed one field at a time")
-            for change in draft["changes"]:
-                st.write(f"**{change['field_key']}** · {change['operation']}")
-                st.write(f"Current: {change['before_value']}")
-                st.write(f"Proposed: {change['proposed_value']}")
-                source = change.get("source") or {}
-                if source.get("evidence_text"):
-                    st.caption(f"Supporting user evidence: “{source['evidence_text']}”")
-                if change["status"] == "pending":
-                    with st.container(horizontal=True):
-                        if st.button("Accept field change", key=f"accept_profile_change_{change['change_id']}"):
-                            profile_repository.review_profile_revision_change(user_id, change["change_id"], accept=True)
-                            st.rerun()
-                        if st.button("Reject field change", key=f"reject_profile_change_{change['change_id']}"):
-                            profile_repository.review_profile_revision_change(user_id, change["change_id"], accept=False)
-                            st.rerun()
-                else:
-                    st.caption(f"Status: {change['status']}")
-            if any(change["status"] == "accepted" for change in draft["changes"]):
-                if st.button("Apply accepted changes", key=f"apply_profile_draft_{draft['draft_id']}"):
-                    try:
-                        profile_repository.apply_profile_revision_draft(user_id, draft["draft_id"])
-                        st.success("Accepted profile fields were applied.")
-                        st.rerun()
-                    except ValueError as error:
-                        st.error(str(error))
+    _render_pending_profile_updates(
+        user_id,
+        key_prefix="profile",
+        heading="### Pending Profile Updates",
+    )
 
     st.markdown("### Field History")
     history = profile_repository.list_profile_field_history(user_id)
@@ -760,18 +795,181 @@ def _render_documents_page(user_id: str, *, is_demo: bool) -> None:
         _render_documents(user_id)
 
 
-def _render_memory(user_id: str) -> None:
-    st.subheader("Memory")
-    st.caption(
-        "Structured career facts are managed in My Profile. Review flexible "
-        "long-term context here."
+def _render_memory_universe_overview(
+    *, semantic_count: int, event_count: int, review_count: int
+) -> None:
+    """Render a static, theme-independent map of the durable memory layers."""
+
+    st.html(
+        f"""
+        <style>
+          .ct-memory-universe {{
+            position: relative;
+            min-height: 280px;
+            overflow: hidden;
+            border: 1px solid rgba(99, 102, 241, 0.18);
+            border-radius: 24px;
+            background:
+              radial-gradient(circle at 50% 48%, rgba(255,255,255,.94) 0 15%, transparent 16%),
+              linear-gradient(135deg, #f5f3ff 0%, #eef7ff 48%, #f3fbf8 100%);
+            color: #172033;
+          }}
+          .ct-memory-universe .ct-orbit {{
+            position: absolute;
+            left: 50%; top: 50%;
+            border: 1px solid rgba(79, 70, 229, .20);
+            border-radius: 50%;
+            transform: translate(-50%, -50%) rotate(-8deg);
+          }}
+          .ct-memory-universe .ct-orbit-one {{ width: 58%; height: 62%; }}
+          .ct-memory-universe .ct-orbit-two {{ width: 86%; height: 86%; transform: translate(-50%, -50%) rotate(9deg); }}
+          .ct-memory-universe .ct-core {{
+            position: absolute; left: 50%; top: 50%;
+            width: 148px; height: 92px;
+            transform: translate(-50%, -50%);
+            display: flex; align-items: center; justify-content: center;
+            text-align: center; font-weight: 700; line-height: 1.25;
+            border-radius: 50%;
+            background: linear-gradient(145deg, #ffffff, #ede9fe);
+            box-shadow: 0 12px 30px rgba(76, 67, 150, .14);
+          }}
+          .ct-memory-universe .ct-node {{
+            position: absolute;
+            min-width: 140px;
+            padding: 14px 18px;
+            border-radius: 18px;
+            background: rgba(255,255,255,.88);
+            box-shadow: 0 8px 24px rgba(49, 57, 92, .10);
+            backdrop-filter: blur(5px);
+          }}
+          .ct-memory-universe .ct-node strong {{ display: block; margin-bottom: 3px; }}
+          .ct-memory-universe .ct-node span {{ color: #59647a; font-size: .84rem; }}
+          .ct-memory-universe .ct-semantic {{ left: 7%; top: 18%; }}
+          .ct-memory-universe .ct-episodic {{ right: 7%; top: 18%; }}
+          .ct-memory-universe .ct-review {{ left: 50%; bottom: 8%; transform: translateX(-50%); }}
+          @media (max-width: 700px) {{
+            .ct-memory-universe {{ min-height: 390px; }}
+            .ct-memory-universe .ct-orbit {{ display: none; }}
+            .ct-memory-universe .ct-core {{ top: 22%; }}
+            .ct-memory-universe .ct-node {{ left: 8%; right: 8%; min-width: 0; text-align: center; transform: none; }}
+            .ct-memory-universe .ct-semantic {{ top: 43%; }}
+            .ct-memory-universe .ct-episodic {{ top: 62%; }}
+            .ct-memory-universe .ct-review {{ top: 81%; bottom: auto; }}
+          }}
+        </style>
+        <div class="ct-memory-universe" role="img" aria-label="Career identity connects semantic memories, episodic events, and review">
+          <div class="ct-orbit ct-orbit-one"></div>
+          <div class="ct-orbit ct-orbit-two"></div>
+          <div class="ct-core">Evolving<br/>career identity</div>
+          <div class="ct-node ct-semantic"><strong>Semantic memory</strong><span>{semantic_count} approved context items</span></div>
+          <div class="ct-node ct-episodic"><strong>Episodic memory</strong><span>{event_count} career events</span></div>
+          <div class="ct-node ct-review"><strong>Memory review</strong><span>{review_count} suggestions waiting</span></div>
+        </div>
+        """
     )
 
-    st.markdown("### Memory Candidates")
+
+def _render_memory(user_id: str) -> None:
+    semantic_memories = profile_repository.list_semantic_memories(user_id)
+    career_events = profile_repository.list_career_events(user_id)
     candidates = profile_repository.list_memory_candidates(user_id)
     pending = [item for item in candidates if item["status"] == "pending"]
+    profile_drafts = profile_repository.list_profile_revision_drafts(user_id)
+    pending_profile_drafts = [
+        item for item in profile_drafts if item["status"] == "pending"
+    ]
+
+    st.subheader("Memory Universe")
+    st.caption(
+        "Career identity evolves through approved long-term context, career "
+        "events, and user-reviewed suggestions. Canonical facts remain in My profile."
+    )
+    _render_memory_universe_overview(
+        semantic_count=len(semantic_memories),
+        event_count=len(career_events),
+        review_count=len(pending) + len(pending_profile_drafts),
+    )
+
+    st.markdown("### Semantic memory")
+    st.caption(
+        "Approved subjective context from semantic_memories. Profile skills are "
+        "not copied here unless an approved skill-context memory exists."
+    )
+    bucket_specs = (
+        ("Skills", {"skill", "skills"}),
+        ("Interests", {"interest", "interests"}),
+        ("Preferences", {"preference", "preferences", "work_style"}),
+        ("Goals", {"goal", "goals"}),
+    )
+    assigned_ids: set[str] = set()
+    columns = st.columns(4)
+    for column, (label, groups) in zip(columns, bucket_specs):
+        items = [
+            item
+            for item in semantic_memories
+            if str(item.get("semantic_group") or "").casefold() in groups
+        ]
+        assigned_ids.update(item["semantic_memory_id"] for item in items)
+        with column.container(border=True, height="stretch"):
+            st.markdown(f"#### {label}")
+            if not items:
+                st.caption("No approved memories yet.")
+            for item in items:
+                st.write(item.get("value"))
+                st.caption(
+                    f"{item.get('topic_key') or 'General'} · {item.get('source') or 'unknown source'}"
+                )
+                if item.get("retrieval_index_status") == "failed":
+                    st.warning("Saved in SQL; retrieval indexing needs retry.")
+    other_semantic = [
+        item
+        for item in semantic_memories
+        if item["semantic_memory_id"] not in assigned_ids
+    ]
+    if other_semantic:
+        with st.expander("Other approved long-term context"):
+            for item in other_semantic:
+                st.write(
+                    f"**{str(item.get('semantic_group') or 'context').replace('_', ' ')}** — "
+                    f"{item.get('value')}"
+                )
+                st.caption(item.get("topic_key") or "General")
+
+    st.markdown("### Episodic career memory")
+    if not career_events:
+        st.info("No approved career events yet.")
+    for event in sorted(
+        career_events,
+        key=lambda item: item.get("event_time")
+        or item.get("start_date")
+        or item.get("created_at")
+        or "",
+        reverse=True,
+    ):
+        with st.container(border=True):
+            title = event.get("title") or event.get("content") or "Career event"
+            description = event.get("description") or event.get("content")
+            event_date = (
+                event.get("event_time")
+                or event.get("start_date")
+                or event.get("created_at")
+            )
+            st.markdown(f"#### {title}")
+            st.caption(
+                f"{event.get('event_status') or 'unknown'} · {event_date or 'date unknown'}"
+            )
+            if description and description != title:
+                st.write(description)
+            if event.get("outcome"):
+                st.write(f"**Impact:** {event['outcome']}")
+            if event.get("retrieval_index_status") == "failed":
+                st.warning("Saved in SQL; retrieval indexing needs retry.")
+
+    st.markdown("### Memory review")
+    st.markdown("#### Pending memory suggestions")
     if not pending:
         st.info("No AI memory suggestions are waiting for review.")
+    legacy_memories = profile_repository.list_memories(user_id, include_inactive=True)
     for candidate in pending:
         with st.container(border=True):
             kind = candidate.get("memory_kind") or "legacy"
@@ -788,7 +986,7 @@ def _render_memory(user_id: str) -> None:
                 st.write(f"**{candidate['operation']} {candidate['category']}** — {candidate['content']}")
             existing = next(
                 (
-                    item for item in profile_repository.list_memories(user_id, include_inactive=True)
+                    item for item in legacy_memories
                     if item["memory_id"] == candidate.get("existing_memory_id")
                 ),
                 None,
@@ -841,26 +1039,12 @@ def _render_memory(user_id: str) -> None:
                         conflict_resolution="keep_both",
                     )
                     st.rerun()
-
-    st.markdown("### Approved Memories")
-    memory_rows = [
-        *profile_repository.list_semantic_memories(user_id),
-        *profile_repository.list_career_events(user_id),
-        *profile_repository.list_memories(user_id),
-    ]
-    memories = list({item["memory_id"]: item for item in reversed(memory_rows)}.values())
-    if not memories:
-        st.info("No approved flexible memories yet.")
-    for memory in memories:
-        with st.container(border=True):
-            st.write(memory["content"])
-            timestamp = memory.get("event_time") or memory["created_at"]
-            st.caption(
-                f"Type: {memory['category']} · Source: {memory['source']} · "
-                f"Date: {timestamp}"
-            )
-            if memory["retrieval_index_status"] == "failed":
-                st.warning("Saved in SQL; assistant retrieval indexing needs retry.")
+    _render_pending_profile_updates(
+        user_id,
+        key_prefix="memory",
+        heading="#### Pending profile update suggestions",
+        drafts=profile_drafts,
+    )
 
 
 def _render_connections(user_id: str) -> None:

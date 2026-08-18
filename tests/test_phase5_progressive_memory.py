@@ -252,15 +252,26 @@ def test_my_profile_has_pending_updates_and_field_history():
     assert "Current Profile" in source
     assert "Pending Profile Updates" in source
     assert "Field History" in source
-    assert "list_profile_revision_drafts" in source
+    assert "_render_pending_profile_updates" in source
 
 
-def test_memory_page_contains_candidates_and_approved_memories_only():
+def test_memory_universe_contains_durable_layers_and_review():
     source = inspect.getsource(dashboard._render_memory)
-    assert "Memory Candidates" in source
-    assert "Approved Memories" in source
-    assert "list_profile_revision_drafts" not in source
+    assert "Semantic memory" in source
+    assert "Episodic career memory" in source
+    assert "Memory review" in source
+    assert "list_semantic_memories" in source
+    assert "list_career_events" in source
+    assert "list_profile_revision_drafts" in source
     assert "list_conversations" not in source
+
+
+def test_memory_universe_overview_is_static_and_softly_styled():
+    source = inspect.getsource(dashboard._render_memory_universe_overview)
+    assert "linear-gradient" in source
+    assert "border-radius" in source
+    assert "ct-orbit" in source
+    assert "unsafe_allow_javascript" not in source
 
 
 def test_career_analysis_not_present_in_memory_or_profile_ui():

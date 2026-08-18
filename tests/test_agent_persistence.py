@@ -1,4 +1,5 @@
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 from app.database.database import create_database_engine, create_session_factory, init_db
@@ -52,6 +53,24 @@ class AgentPersistenceTests(unittest.TestCase):
         rows, errors = validate_connection_csv("name,current_role\n=CMD(),Recruiter\nAda,Engineer")
         self.assertEqual([item["name"] for item in rows], ["Ada"])
         self.assertTrue(any("formula" in item for item in errors))
+
+    def test_example_alumni_csv_role_alias_is_importable_and_searchable(self):
+        fixture = (
+            Path(__file__).resolve().parents[1]
+            / "demo"
+            / "Example_Alumni_Connections.csv"
+        )
+        rows, errors = validate_connection_csv(fixture.read_text(encoding="utf-8"))
+
+        self.assertEqual(errors, [])
+        self.assertEqual(len(rows), 3)
+        self.assertTrue(all(item["current_role"] for item in rows))
+        self.assertTrue(all(item["education"] for item in rows))
+        self.assertTrue(all(item["public_profile_url"] for item in rows))
+        for row in rows:
+            self.repository.create_connection(self.user["user_id"], row)
+        self.assertEqual(len(self.repository.list_connections(self.user["user_id"])), 3)
+        self.assertEqual(self.repository.list_connections(self.other["user_id"]), [])
 
     def test_no_response_follow_up_requires_matching_sent_draft(self):
         with self.assertRaisesRegex(ValueError, "previous outreach"):

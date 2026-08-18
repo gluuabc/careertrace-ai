@@ -3,6 +3,8 @@ from __future__ import annotations
 import hashlib
 import time
 
+import pytest
+
 from app.graph.career_agent_graph import parse_structured_job_request
 from app.llm.model import resolve_bedrock_model_id
 from app.services.demo_search_fixtures import (
@@ -183,6 +185,29 @@ def test_structured_job_request_can_skip_expensive_planner():
     assert parsed is not None
     assert parsed.requested_count == 5
     assert parsed.locations == ["California"]
+
+
+@pytest.mark.parametrize(
+    "phrase",
+    ("intern", "internship", "co-op", "co op"),
+)
+def test_structured_job_request_recognizes_exact_internship_terms(phrase):
+    parsed = parse_structured_job_request(
+        f"Find 5 machine learning {phrase} jobs in California.", {}
+    )
+
+    assert parsed is not None
+    assert parsed.employment_types == ["Internship"]
+    assert parsed.target_roles == ["machine learning"]
+
+
+def test_international_is_not_parsed_as_internship():
+    assert (
+        parse_structured_job_request(
+            "Find 5 international marketing jobs in New York.", {}
+        )
+        is None
+    )
 
 
 def test_ambiguous_job_request_still_uses_planning_when_needed():

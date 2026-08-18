@@ -1,4 +1,5 @@
 import unittest
+from pathlib import Path
 
 from app.database.database import (
     create_database_engine,
@@ -77,6 +78,18 @@ class JudgeDemoTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "not available"):
             self.repository.get_demo_user(other["user_id"])
+
+    def test_synthetic_alumni_csv_is_packaged_for_judge_download(self):
+        fixture = (
+            Path(__file__).resolve().parents[1]
+            / "demo"
+            / "Example_Alumni_Connections.csv"
+        )
+        content = fixture.read_text(encoding="utf-8")
+
+        self.assertIn("name,education,organization,role,public_profile_url", content)
+        self.assertIn("Northstar Institute of Technology", content)
+        self.assertIn("https://example.com/", content)
 
 
 if __name__ == "__main__":

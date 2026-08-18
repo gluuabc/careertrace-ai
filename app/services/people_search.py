@@ -56,7 +56,10 @@ def validate_connection_csv(content: str, *, max_rows: int = 500, max_field_leng
             break
         item: dict[str, Any] = {}
         for key in CONNECTION_FIELDS:
-            value = str(raw.get(key) or "").strip()
+            source_value = raw.get(key)
+            if key == "current_role" and not source_value:
+                source_value = raw.get("role")
+            value = str(source_value or "").strip()
             if value.startswith(("=", "+", "-", "@")):
                 errors.append(f"Row {number}, {key}: executable spreadsheet formula rejected.")
                 value = ""

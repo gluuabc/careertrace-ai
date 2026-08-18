@@ -74,6 +74,10 @@ ALLOWED_TOOLS_BY_INTENT = {
 }
 SOURCE_TOOLS = {"search_jobs", "search_people"}
 OPPORTUNITY_NOUNS = r"(?:jobs?|internships?|openings?|positions?|roles?|opportunities)"
+INTERNSHIP_REQUEST_PATTERN = re.compile(
+    r"\b(?:intern(?:ship)?s?|co(?:-|\s+)ops?)\b",
+    re.I,
+)
 
 
 def _has_explicit_job_retrieval_intent(request: str) -> bool:
@@ -176,12 +180,18 @@ def parse_structured_job_request(
     lowered = text.casefold()
     count_match = re.search(r"\b(?:find|show|give me)\s+(\d{1,2})\b", lowered)
     location_match = re.search(r"\bin\s+([A-Za-z][A-Za-z .-]{1,50})[.!?]?$", text)
-    employment = ["Internship"] if "intern" in lowered else []
+    employment = ["Internship"] if INTERNSHIP_REQUEST_PATTERN.search(text) else []
     if not count_match or not location_match or not employment:
         return None
     role_text = re.sub(r"^(?:find|show|give me)\s+\d{1,2}\s+", "", text, flags=re.I)
     role_text = re.sub(r"\s+in\s+[A-Za-z][A-Za-z .-]{1,50}[.!?]?$", "", role_text, flags=re.I)
-    role_text = re.sub(r"\b(internships?|roles?|jobs?)\b", "", role_text, flags=re.I).strip()
+    role_text = re.sub(
+        r"\b(?:intern(?:ship)?s?|co(?:-|\s+)ops?|roles?|jobs?)\b",
+        "",
+        role_text,
+        flags=re.I,
+    ).strip()
+    role_text = " ".join(role_text.split())
     if not role_text:
         return None
     profile = profile or {}
