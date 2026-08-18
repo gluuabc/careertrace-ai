@@ -6,10 +6,10 @@ Built for the [**CockroachDB × AWS Hackathon — Build with Agentic Memory**](h
 
 ## Demo
 
-- **Live demo:** _Add the final public AWS deployment URL before submission._
+- **Live demo:** [CareerTrace AI on AWS](https://ca-52d4a73a56df47e78e9405283c5d3daa.ecs.us-east-1.on.aws/)
 - **Judge access:** Select **Try Judge Demo**. No Google allowlisting is required.
-- **Test data:** Use the synthetic files in [`demo/`](demo/). Judge workspaces are empty at creation and do not contain pre-seeded personal data.
-- **Suggested flow:** upload both demo documents → confirm the extracted profile → ask Career Assistant for matching roles → state a durable preference → start another conversation to trigger extraction → approve the pending memory → ask a follow-up that uses it.
+- **Three-minute walkthrough:** follow [`docs/JUDGE_TESTING_INSTRUCTIONS.md`](docs/JUDGE_TESTING_INSTRUCTIONS.md).
+- **Test data:** use the synthetic files documented in [`demo/README.md`](demo/README.md). Judge workspaces are empty at creation and do not contain pre-seeded personal data.
 - **Screenshots/video:** _Add the Devpost screenshots and public demo-video URL before submission._
 
 Judge workspaces use distinct UUID identities and the normal S3, Bedrock, SQL, retrieval, and approval paths. A one-time recovery code can reopen the same workspace; only its hash is stored.
@@ -54,7 +54,7 @@ flowchart TB
     R --> RR["Optional Amazon Rerank"]
 ```
 
-The agent is intentionally controlled rather than fully autonomous. LangGraph routes requests through a closed set of workflows, enforces iteration and source-call limits, and keeps deterministic validation and persistence outside the model.
+The agent is intentionally controlled rather than fully autonomous. LangGraph routes requests through a closed set of workflows, enforces iteration and source-call limits, and keeps deterministic validation and persistence outside the model. See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the implementation map.
 
 ## Memory Architecture
 
@@ -121,6 +121,9 @@ flowchart LR
 
 Key controls:
 
+- A request-level task plan may contain multiple guidance subtasks and at most one tool-backed action. Requests for both people and job search ask the user which search to run first.
+- Deterministic validation recovers explicit search requests missed by the planner and removes unsupported actions that were not requested.
+- A deterministic completion observer prevents a mixed request from finalizing while guidance or the selected search remains pending.
 - The LLM performs semantic classification; deterministic code validates evidence ownership, offsets, types, and schema boundaries.
 - LLM and explicit-signal proposals share one representation and are deduplicated before review.
 - Only exact, self-owned evidence from user messages can become a candidate.
@@ -171,9 +174,13 @@ The repository also contains an optional, disabled-by-default wrapper for **Cock
 
 The repository includes a production Dockerfile, container health check, S3 CloudFormation template, and least-privilege S3 object policy.
 
-### Container deployment path
+### Current container deployment
 
-The intended AWS container topology is:
+The public judge demo is available at an operator-provided AWS ECS endpoint:
+
+<https://ca-52d4a73a56df47e78e9405283c5d3daa.ecs.us-east-1.on.aws/>
+
+Its runtime topology is:
 
 ```text
 ECR image
@@ -185,7 +192,7 @@ ECS service / task
    └── CockroachDB Cloud over TLS verify-full
 ```
 
-The committed repository does **not** currently include ECS service/task infrastructure, ECR publishing automation, or Secrets Manager wiring. Those resources must be provisioned and the public ECS URL added above before claiming ECS deployment. The currently documented public-hosting procedure is in [`docs/STREAMLIT_CLOUD_DEPLOYMENT.md`](docs/STREAMLIT_CLOUD_DEPLOYMENT.md).
+The repository contains the production Dockerfile and application-side configuration, but it does **not** contain the operator's ECS service/task provisioning, ECR publishing automation, or Secrets Manager resources. The public endpoint therefore demonstrates the running deployment; it is not evidence that deployment infrastructure is reproducible from this repository. See [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) for the supported configuration and verification checklist.
 
 Cockroach connections use `sslmode=verify-full`. A deployment CA certificate can be supplied as `COCKROACH_CA_CERT`; CareerTrace materializes it to a restrictive temporary file and uses the same resolved URL for SQLAlchemy and `CockroachDBSaver`.
 
@@ -269,7 +276,7 @@ Never point `COCKROACH_TEST_DATABASE_URL` or the disposable migration validator 
 
 ## Future Improvements
 
-- Provision and verify the ECS/ECR/Secrets Manager deployment path.
+- Codify the existing ECS/ECR/Secrets Manager resources as reproducible infrastructure and deployment automation.
 - Add user-managed CareerPath grouping and timeline views.
 - Backfill missing embeddings with an operator-controlled job.
 - Add scheduled searches and notifications with explicit opt-in.
