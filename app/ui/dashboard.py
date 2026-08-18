@@ -16,7 +16,7 @@ import streamlit as st
 
 from langgraph.types import Command
 
-from app.auth import require_authenticated_user
+from app.auth.session import require_authenticated_user, render_account_sidebar
 from app.database import init_db, profile_repository
 from app.graph.profile_graph import profile_graph
 from app.nodes.validation import find_profile_issues
@@ -26,9 +26,40 @@ from app.services.people_search import validate_connection_csv
 from app.services.profile_mutation import profile_mutation_service
 from app.services.conversation_memory import trigger_conversation_boundary
 from app.services.agent_results import primary_job_link, resolve_agent_display_result
+from app.ui.components import (
+    render_agent_activity_intro,
+    render_assistant_header,
+    render_assistant_section,
+    render_career_planet,
+    render_career_direction,
+    render_demo_assets_intro,
+    render_document_metadata,
+    render_documents_header,
+    render_documents_section,
+    render_information_card,
+    render_insight_card,
+    render_memory_candidate_summary,
+    render_memory_page_header,
+    render_memory_universe,
+    render_metric_card,
+    render_page_header,
+    render_profile_identity,
+    render_profile_orbit,
+    render_profile_summary,
+    render_result_heading,
+    render_sidebar_navigation,
+    render_starred_empty_state,
+    render_starred_qa_content,
+    render_starred_qa_header,
+    render_semantic_memory_panel,
+    render_timeline,
+)
+from app.ui.dashboard_data import DashboardSnapshot, load_dashboard_snapshot
+from app.ui.styles import load_theme
 
 
 TOP_LEVEL_PAGE_LABELS = (
+    "Dashboard",
     "Documents",
     "My profile",
     "Starred Q&A",
@@ -36,6 +67,128 @@ TOP_LEVEL_PAGE_LABELS = (
     "Career Assistant",
 )
 DOCUMENT_PAGE_SECTIONS = ("Upload & Analyze", "Stored Documents")
+
+
+def _sorted_career_events(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return sorted(
+        events,
+        key=lambda item: item.get("event_time")
+        or item.get("start_date")
+        or item.get("created_at")
+        or "",
+        reverse=True,
+    )
+
+
+def _semantic_group_count(snapshot: DashboardSnapshot, *groups: str) -> int:
+    allowed = {group.casefold() for group in groups}
+    return sum(
+        1
+        for item in snapshot.semantic_memories
+        if str(item.get("semantic_group") or "").casefold() in allowed
+    )
+
+
+def _render_dashboard(user_id: str) -> None:
+    """Render the home view from one user-scoped, read-only data snapshot."""
+
+    snapshot = load_dashboard_snapshot(user_id)
+    profile = snapshot.profile or {}
+    display_name = str(snapshot.user.get("name") or profile.get("name") or "there")
+    render_page_header(
+        f"Welcome back, {display_name}",
+        "Your career identity is evolving.",
+        eyebrow="CareerTrace overview",
+    )
+
+    metrics = (
+        (
+            "Career identity",
+            f"{snapshot.profile_completion}%",
+            "Required profile facts complete",
+            "◉",
+            "blue",
+        ),
+        (
+            "Memories",
+            len(snapshot.semantic_memories),
+            "Approved durable context",
+            "◇",
+            "purple",
+        ),
+        (
+            "Milestones",
+            len(snapshot.career_events),
+            "Approved career events",
+            "○",
+            "peach",
+        ),
+        (
+            "Conversations",
+            len(snapshot.conversations),
+            "Saved assistant threads",
+            "◌",
+            "mint",
+        ),
+    )
+    metric_columns = st.columns(4, gap="medium")
+    for column, (label, value, metadata, icon, accent) in zip(metric_columns, metrics):
+        with column:
+            render_metric_card(
+                label, value, metadata, icon=icon, accent=accent
+            )
+
+    st.space("small")
+    planet_column, events_column = st.columns([1.65, 1], gap="medium")
+    identity = (
+        (profile.get("target_roles") or [None])[0]
+        or profile.get("major")
+        or "Building your profile"
+    )
+    with planet_column:
+        render_career_planet(
+            str(identity),
+            {
+                "Skills": len(profile.get("skills") or []),
+                "Goals": _semantic_group_count(snapshot, "goal", "goals"),
+                "Interests": _semantic_group_count(snapshot, "interest", "interests"),
+                "Experiences": len(profile.get("experience") or []),
+            },
+        )
+    with events_column:
+        with st.container(border=True, height="stretch"):
+            st.html(
+                '<div class="ct-section-heading"><h2>Recent career events</h2>'
+                '<p>Your approved episodic career memory</p></div>'
+            )
+            render_timeline(_sorted_career_events(snapshot.career_events), limit=4)
+
+    st.space("small")
+    insight_column, strengths_column, next_column = st.columns(3, gap="medium")
+    with insight_column:
+        render_insight_card("AI insight for you", snapshot.insight)
+    strengths = list((snapshot.analysis or {}).get("strengths") or [])
+    if not strengths:
+        strengths = list(profile.get("skills") or [])[:4]
+    strength_copy = (
+        " · ".join(str(item) for item in strengths[:4])
+        if strengths
+        else "Your strengths will appear after profile evidence or a saved analysis is available."
+    )
+    with strengths_column:
+        render_information_card(
+            "Top strengths",
+            strength_copy,
+            metadata="Saved analysis or confirmed profile",
+            icon="＋",
+        )
+    with next_column:
+        render_information_card(
+            "Recommended next step",
+            snapshot.recommendation,
+            metadata=snapshot.recommendation_metadata,
+            icon="→",
+        )
 
 
 def _comma_list(value: str) -> list[str]:
@@ -410,9 +563,13 @@ def _render_workflow(user_id: str) -> None:
 
 
 def _render_upload(user_id: str, *, is_demo: bool = False) -> None:
-    st.subheader("Career document onboarding")
+    render_documents_section(
+        "Upload and analyze documents",
+        "Extract structured facts, confirm them, then save your career profile.",
+    )
     _restore_pending_workflow(user_id)
     if is_demo:
+        render_demo_assets_intro()
         st.info(
             "Download the synthetic files below, then upload them together to "
             "exercise the same S3, extraction, confirmation, and SQL workflow "
@@ -568,78 +725,110 @@ def _render_pending_profile_updates(
 
 def _render_profile(user_id: str) -> None:
     profile = profile_repository.get_profile(user_id)
+    render_page_header(
+        "My Profile",
+        "Your professional identity and career foundation.",
+        eyebrow="Structured identity core",
+    )
     if profile is None:
-        st.info("Upload a resume to create your stored profile.")
+        with st.container(border=True):
+            st.info(
+                "Upload and confirm a resume in Documents to create your structured profile."
+            )
         return
 
-    st.subheader("My profile")
-    st.caption("Current values are stored in SQL; history is tracked per field.")
-    st.markdown("### Current Profile")
-    if profile.get("source_documents"):
-        st.caption(
-            "Sources: "
-            + ", ".join(
-                item["filename"] for item in profile["source_documents"]
-            )
-        )
+    account = profile_repository.get_user(user_id)
+    profile_drafts = profile_repository.list_profile_revision_drafts(user_id)
+    history = profile_repository.list_profile_field_history(user_id)
+
+    # Current Profile is a read-only, user-scoped identity view. All writes stay
+    # inside the existing validated form and review controls below.
+    render_profile_identity(account, profile)
+    st.space("small")
+    render_profile_orbit(profile)
+    st.html(
+        '<div class="ct-profile-section-heading"><h2>Structured profile</h2>'
+        '<p>Confirmed facts that form your professional identity core.</p></div>'
+    )
+    render_profile_summary(profile)
+    st.space("small")
+    render_career_direction(profile)
+
     restore_preview = st.session_state.get("profile_restore_preview") or {}
     form_profile = {**profile, **restore_preview}
-    with st.form("edit_profile"):
-        account = profile_repository.get_user(user_id)
-        updated_profile = _profile_form(
-            form_profile,
-            "edit",
-            show_required=True,
-            identity_locked=bool(account.get("google_id")),
-            collapse_preferences=True,
-        )
-        if st.form_submit_button("Save profile changes", type="primary"):
-            missing_fields, errors = find_profile_issues(updated_profile)
-            if missing_fields or errors:
-                details = ", ".join(missing_fields + errors)
-                st.error(f"Please correct the required profile fields: {details}")
-            else:
-                result = profile_mutation_service.apply_profile_field_changes(
-                    user_id,
-                    updated_profile,
-                    source_type=(
-                        "history_restore" if restore_preview else "manual"
-                    ),
-                )
-                if result["profile_changed"]:
-                    st.session_state.pop("profile_restore_preview", None)
-                    st.success("Profile changes saved.")
-                    if result.get("retrieval_index_status") in {"failed", "sparse_only"}:
-                        st.warning(
-                            "The current profile is saved, but dense retrieval indexing "
-                            "needs attention. Sparse/structured profile data remains current."
-                        )
-                    preference_labels = {
-                        "target_roles": "Target roles",
-                        "preferred_locations": "Preferred locations",
-                        "employment_types": "Employment types",
-                        "remote_preference": "Remote preference",
-                        "work_authorization": "Work authorization",
-                    }
-                    changes = []
-                    for field, label in preference_labels.items():
-                        before = profile.get(field)
-                        after = updated_profile.get(field)
-                        if before != after:
-                            changes.append(f"{label}: {before or 'none'} → {after or 'none'}")
-                    if changes:
-                        st.success("Preference updated:\n\n" + "\n\n".join(changes))
+
+    st.html(
+        '<div class="ct-profile-section-heading"><h2>Edit structured profile</h2>'
+        '<p>Update confirmed facts through the existing validation and version-history boundary.</p></div>'
+    )
+    with st.expander("Edit profile details", expanded=bool(restore_preview)):
+        with st.form("edit_profile"):
+            updated_profile = _profile_form(
+                form_profile,
+                "edit",
+                show_required=True,
+                identity_locked=bool(account.get("google_id")),
+                collapse_preferences=True,
+            )
+            if st.form_submit_button("Save profile changes", type="primary"):
+                missing_fields, errors = find_profile_issues(updated_profile)
+                if missing_fields or errors:
+                    details = ", ".join(missing_fields + errors)
+                    st.error(f"Please correct the required profile fields: {details}")
                 else:
-                    st.info("No changes detected. Profile version was not updated.")
+                    result = profile_mutation_service.apply_profile_field_changes(
+                        user_id,
+                        updated_profile,
+                        source_type=(
+                            "history_restore" if restore_preview else "manual"
+                        ),
+                    )
+                    if result["profile_changed"]:
+                        st.session_state.pop("profile_restore_preview", None)
+                        st.success("Profile changes saved.")
+                        if result.get("retrieval_index_status") in {
+                            "failed",
+                            "sparse_only",
+                        }:
+                            st.warning(
+                                "The current profile is saved, but dense retrieval indexing "
+                                "needs attention. Sparse/structured profile data remains current."
+                            )
+                        preference_labels = {
+                            "target_roles": "Target roles",
+                            "preferred_locations": "Preferred locations",
+                            "employment_types": "Employment types",
+                            "remote_preference": "Remote preference",
+                            "work_authorization": "Work authorization",
+                        }
+                        changes = []
+                        for field, label in preference_labels.items():
+                            before = profile.get(field)
+                            after = updated_profile.get(field)
+                            if before != after:
+                                changes.append(
+                                    f"{label}: {before or 'none'} → {after or 'none'}"
+                                )
+                        if changes:
+                            st.success(
+                                "Preference updated:\n\n" + "\n\n".join(changes)
+                            )
+                    else:
+                        st.info(
+                            "No changes detected. Profile version was not updated."
+                        )
 
     _render_pending_profile_updates(
         user_id,
         key_prefix="profile",
         heading="### Pending Profile Updates",
+        drafts=profile_drafts,
     )
 
-    st.markdown("### Field History")
-    history = profile_repository.list_profile_field_history(user_id)
+    st.html(
+        '<div class="ct-profile-section-heading"><h2>Field History</h2>'
+        '<p>Restore a previous value without rolling back unrelated fields.</p></div>'
+    )
     with st.expander("Previous values"):
         has_history = False
         for field_key, entries in history.items():
@@ -664,24 +853,14 @@ def _render_profile(user_id: str) -> None:
 
 
 def _render_starred_qa(user_id: str) -> None:
-    st.subheader("Starred Q&A")
     pairs = profile_repository.list_starred_qa_pairs(user_id)
+    render_starred_qa_header(len(pairs))
     if not pairs:
-        st.info(
-            "No starred Q&A yet. Star useful CareerTrace responses from a "
-            "conversation to save them here."
-        )
+        render_starred_empty_state()
         return
     for pair in pairs:
         with st.container(border=True):
-            st.markdown(f"### ★ {pair['question']}")
-            st.write(pair["answer"])
-            st.caption(
-                f"Conversation: {pair['conversation_title']} · Saved: "
-                f"{pair['created_at']}"
-            )
-            if pair.get("preference_update_summary"):
-                st.info(f"Preference updated: {pair['preference_update_summary']}")
+            render_starred_qa_content(pair)
             if st.button(
                 "Unstar",
                 key=f"unstar_page_{pair['starred_qa_id']}",
@@ -694,9 +873,9 @@ def _render_starred_qa(user_id: str) -> None:
 
 
 def _render_documents(user_id: str) -> None:
-    st.subheader("Documents")
-    st.caption(
-        "Documents are private S3 objects. SQLite stores only their metadata."
+    render_documents_section(
+        "Store document only",
+        "Upload private evidence without running profile extraction or analysis.",
     )
     max_size_mib = min(int(os.getenv("MAX_DOCUMENT_SIZE_MIB", "10")), 10)
 
@@ -738,6 +917,10 @@ def _render_documents(user_id: str) -> None:
             except Exception as error:
                 st.error(f"Document upload failed: {error}")
 
+    render_documents_section(
+        "Stored documents",
+        "Your uploaded documents remain private and linked to their profile history.",
+    )
     documents = profile_repository.list_documents(user_id)
     if not documents:
         st.info("No stored documents yet.")
@@ -745,21 +928,7 @@ def _render_documents(user_id: str) -> None:
 
     for document in documents:
         with st.container(border=True):
-            st.markdown(f"**{document['filename']}**")
-            st.caption(
-                f"{document['document_type']} · "
-                f"{document['size_bytes'] / 1024:.1f} KiB · "
-                f"uploaded {document['uploaded_at']}"
-            )
-            related_versions = document.get("profile_versions") or []
-            st.caption(
-                "Related profile versions: "
-                + (
-                    ", ".join(f"v{number}" for number in related_versions)
-                    if related_versions
-                    else "None"
-                )
-            )
+            render_document_metadata(document)
             with st.container(horizontal=True):
                 st.download_button(
                     "Download",
@@ -788,6 +957,7 @@ def _render_documents(user_id: str) -> None:
 def _render_documents_page(user_id: str, *, is_demo: bool) -> None:
     """Compose the existing upload workflow and stored-document UI in one page."""
 
+    render_documents_header()
     upload_tab, stored_tab = st.tabs(DOCUMENT_PAGE_SECTIONS)
     with upload_tab:
         _render_upload(user_id, is_demo=is_demo)
@@ -796,77 +966,17 @@ def _render_documents_page(user_id: str, *, is_demo: bool) -> None:
 
 
 def _render_memory_universe_overview(
-    *, semantic_count: int, event_count: int, review_count: int
+    *,
+    semantic_count: int,
+    event_count: int,
+    review_count: int,
+    semantic_memories: list[dict[str, Any]] | None = None,
+    career_events: list[dict[str, Any]] | None = None,
 ) -> None:
-    """Render a static, theme-independent map of the durable memory layers."""
+    """Static orbit view; theme.css supplies linear-gradient, border-radius, and ct-orbit styles."""
 
-    st.html(
-        f"""
-        <style>
-          .ct-memory-universe {{
-            position: relative;
-            min-height: 280px;
-            overflow: hidden;
-            border: 1px solid rgba(99, 102, 241, 0.18);
-            border-radius: 24px;
-            background:
-              radial-gradient(circle at 50% 48%, rgba(255,255,255,.94) 0 15%, transparent 16%),
-              linear-gradient(135deg, #f5f3ff 0%, #eef7ff 48%, #f3fbf8 100%);
-            color: #172033;
-          }}
-          .ct-memory-universe .ct-orbit {{
-            position: absolute;
-            left: 50%; top: 50%;
-            border: 1px solid rgba(79, 70, 229, .20);
-            border-radius: 50%;
-            transform: translate(-50%, -50%) rotate(-8deg);
-          }}
-          .ct-memory-universe .ct-orbit-one {{ width: 58%; height: 62%; }}
-          .ct-memory-universe .ct-orbit-two {{ width: 86%; height: 86%; transform: translate(-50%, -50%) rotate(9deg); }}
-          .ct-memory-universe .ct-core {{
-            position: absolute; left: 50%; top: 50%;
-            width: 148px; height: 92px;
-            transform: translate(-50%, -50%);
-            display: flex; align-items: center; justify-content: center;
-            text-align: center; font-weight: 700; line-height: 1.25;
-            border-radius: 50%;
-            background: linear-gradient(145deg, #ffffff, #ede9fe);
-            box-shadow: 0 12px 30px rgba(76, 67, 150, .14);
-          }}
-          .ct-memory-universe .ct-node {{
-            position: absolute;
-            min-width: 140px;
-            padding: 14px 18px;
-            border-radius: 18px;
-            background: rgba(255,255,255,.88);
-            box-shadow: 0 8px 24px rgba(49, 57, 92, .10);
-            backdrop-filter: blur(5px);
-          }}
-          .ct-memory-universe .ct-node strong {{ display: block; margin-bottom: 3px; }}
-          .ct-memory-universe .ct-node span {{ color: #59647a; font-size: .84rem; }}
-          .ct-memory-universe .ct-semantic {{ left: 7%; top: 18%; }}
-          .ct-memory-universe .ct-episodic {{ right: 7%; top: 18%; }}
-          .ct-memory-universe .ct-review {{ left: 50%; bottom: 8%; transform: translateX(-50%); }}
-          @media (max-width: 700px) {{
-            .ct-memory-universe {{ min-height: 390px; }}
-            .ct-memory-universe .ct-orbit {{ display: none; }}
-            .ct-memory-universe .ct-core {{ top: 22%; }}
-            .ct-memory-universe .ct-node {{ left: 8%; right: 8%; min-width: 0; text-align: center; transform: none; }}
-            .ct-memory-universe .ct-semantic {{ top: 43%; }}
-            .ct-memory-universe .ct-episodic {{ top: 62%; }}
-            .ct-memory-universe .ct-review {{ top: 81%; bottom: auto; }}
-          }}
-        </style>
-        <div class="ct-memory-universe" role="img" aria-label="Career identity connects semantic memories, episodic events, and review">
-          <div class="ct-orbit ct-orbit-one"></div>
-          <div class="ct-orbit ct-orbit-two"></div>
-          <div class="ct-core">Evolving<br/>career identity</div>
-          <div class="ct-node ct-semantic"><strong>Semantic memory</strong><span>{semantic_count} approved context items</span></div>
-          <div class="ct-node ct-episodic"><strong>Episodic memory</strong><span>{event_count} career events</span></div>
-          <div class="ct-node ct-review"><strong>Memory review</strong><span>{review_count} suggestions waiting</span></div>
-        </div>
-        """
-    )
+    del semantic_count, event_count, review_count
+    render_memory_universe(semantic_memories or [], career_events or [])
 
 
 def _render_memory(user_id: str) -> None:
@@ -879,176 +989,142 @@ def _render_memory(user_id: str) -> None:
         item for item in profile_drafts if item["status"] == "pending"
     ]
 
-    st.subheader("Memory Universe")
-    st.caption(
-        "Career identity evolves through approved long-term context, career "
-        "events, and user-reviewed suggestions. Canonical facts remain in My profile."
+    render_memory_page_header(
+        total_memories=len(semantic_memories) + len(career_events),
+        career_events=len(career_events),
+        pending_reviews=len(pending) + len(pending_profile_drafts),
     )
     _render_memory_universe_overview(
         semantic_count=len(semantic_memories),
         event_count=len(career_events),
         review_count=len(pending) + len(pending_profile_drafts),
+        semantic_memories=semantic_memories,
+        career_events=career_events,
     )
 
-    st.markdown("### Semantic memory")
-    st.caption(
-        "Approved subjective context from semantic_memories. Profile skills are "
-        "not copied here unless an approved skill-context memory exists."
+    st.html(
+        '<div class="ct-memory-section-header"><h2>Semantic memory</h2>'
+        '<p>Approved skills, goals, interests, preferences, and durable context.</p></div>'
     )
-    bucket_specs = (
-        ("Skills", {"skill", "skills"}),
-        ("Interests", {"interest", "interests"}),
-        ("Preferences", {"preference", "preferences", "work_style"}),
-        ("Goals", {"goal", "goals"}),
-    )
-    assigned_ids: set[str] = set()
-    columns = st.columns(4)
-    for column, (label, groups) in zip(columns, bucket_specs):
-        items = [
-            item
-            for item in semantic_memories
-            if str(item.get("semantic_group") or "").casefold() in groups
-        ]
-        assigned_ids.update(item["semantic_memory_id"] for item in items)
-        with column.container(border=True, height="stretch"):
-            st.markdown(f"#### {label}")
-            if not items:
-                st.caption("No approved memories yet.")
-            for item in items:
-                st.write(item.get("value"))
-                st.caption(
-                    f"{item.get('topic_key') or 'General'} · {item.get('source') or 'unknown source'}"
-                )
-                if item.get("retrieval_index_status") == "failed":
-                    st.warning("Saved in SQL; retrieval indexing needs retry.")
-    other_semantic = [
-        item
-        for item in semantic_memories
-        if item["semantic_memory_id"] not in assigned_ids
-    ]
-    if other_semantic:
-        with st.expander("Other approved long-term context"):
-            for item in other_semantic:
-                st.write(
-                    f"**{str(item.get('semantic_group') or 'context').replace('_', ' ')}** — "
-                    f"{item.get('value')}"
-                )
-                st.caption(item.get("topic_key") or "General")
+    render_semantic_memory_panel(semantic_memories)
 
-    st.markdown("### Episodic career memory")
-    if not career_events:
-        st.info("No approved career events yet.")
-    for event in sorted(
-        career_events,
-        key=lambda item: item.get("event_time")
-        or item.get("start_date")
-        or item.get("created_at")
-        or "",
-        reverse=True,
-    ):
-        with st.container(border=True):
-            title = event.get("title") or event.get("content") or "Career event"
-            description = event.get("description") or event.get("content")
-            event_date = (
-                event.get("event_time")
-                or event.get("start_date")
-                or event.get("created_at")
-            )
-            st.markdown(f"#### {title}")
-            st.caption(
-                f"{event.get('event_status') or 'unknown'} · {event_date or 'date unknown'}"
-            )
-            if description and description != title:
-                st.write(description)
-            if event.get("outcome"):
-                st.write(f"**Impact:** {event['outcome']}")
-            if event.get("retrieval_index_status") == "failed":
-                st.warning("Saved in SQL; retrieval indexing needs retry.")
-
-    st.markdown("### Memory review")
-    st.markdown("#### Pending memory suggestions")
-    if not pending:
-        st.info("No AI memory suggestions are waiting for review.")
-    legacy_memories = profile_repository.list_memories(user_id, include_inactive=True)
-    for candidate in pending:
-        with st.container(border=True):
-            kind = candidate.get("memory_kind") or "legacy"
-            if kind == "semantic":
-                st.write(f"**{candidate['semantic_group']} · {candidate.get('topic_key') or 'Unclassified topic'}**")
-                st.write(f"Suggested value: {candidate.get('proposed_value') or candidate['content']}")
-                st.write(f"Suggested operation: {candidate['operation']}")
-            elif kind == "episodic":
-                st.write(f"**Career event · {candidate.get('event_status') or 'unknown'}**")
-                st.write(candidate["content"])
-                if candidate.get("raw_temporal_expression"):
-                    st.write(f"Time expression: {candidate['raw_temporal_expression']}")
-            else:
-                st.write(f"**{candidate['operation']} {candidate['category']}** — {candidate['content']}")
-            existing = next(
-                (
-                    item for item in legacy_memories
-                    if item["memory_id"] == candidate.get("existing_memory_id")
-                ),
-                None,
-            )
-            if existing:
-                st.write(f"Existing: {existing['content']}")
-            if candidate.get("evidence_text"):
-                st.caption(f"Supporting user evidence: “{candidate['evidence_text']}”")
-            st.caption(f"Source: {candidate['source']} · Created: {candidate['created_at']}")
-            with st.container(horizontal=True):
-                accept_label = {
-                    "ADD": "Approve",
-                    "UPDATE": "Approve update",
-                    "REVOKE": "Approve revoke",
-                    "CONFLICT": "Use new",
-                }.get(candidate["operation"], "Approve")
-                if st.button(
-                    accept_label,
-                    key=f"accept_memory_{candidate['candidate_id']}",
-                ):
-                    result = profile_repository.review_memory_candidate(
-                        user_id, candidate["candidate_id"], accept=True
-                    )
-                    if result and result.get("retrieval_index_status") == "failed":
-                        st.warning("Saved in SQL, but assistant retrieval indexing needs retry.")
-                    st.rerun()
-                if st.button(
-                    "Reject",
-                    key=f"reject_memory_{candidate['candidate_id']}",
-                ):
-                    profile_repository.review_memory_candidate(
-                        user_id, candidate["candidate_id"], accept=False
-                    )
-                    st.rerun()
-                if candidate["operation"] == "CONFLICT" and st.button(
-                    "Keep existing",
-                    key=f"keep_existing_memory_{candidate['candidate_id']}",
-                ):
-                    profile_repository.review_memory_candidate(
-                        user_id, candidate["candidate_id"], accept=False,
-                        conflict_resolution="keep_existing",
-                    )
-                    st.rerun()
-                if candidate["operation"] == "CONFLICT" and st.button(
-                    "Keep both",
-                    key=f"keep_both_memory_{candidate['candidate_id']}",
-                ):
-                    profile_repository.review_memory_candidate(
-                        user_id, candidate["candidate_id"], accept=True,
-                        conflict_resolution="keep_both",
-                    )
-                    st.rerun()
-    _render_pending_profile_updates(
-        user_id,
-        key_prefix="memory",
-        heading="#### Pending profile update suggestions",
-        drafts=profile_drafts,
+    st.space("small")
+    timeline_column, inbox_column, control_column = st.columns(
+        [1.15, 1, .82], gap="medium"
     )
+    with timeline_column:
+        with st.container(border=True, height="stretch"):
+            st.html(
+                '<div class="ct-memory-section-header"><h2>Episodic career memory timeline</h2>'
+                '<p>Key events that shaped your career journey.</p></div>'
+            )
+            render_timeline(_sorted_career_events(career_events))
+
+    with inbox_column:
+        with st.container(border=True, height="stretch"):
+            st.html(
+                '<div class="ct-memory-section-header"><h2>Memory inbox</h2>'
+                '<p>Memory review for AI-extracted suggestions waiting for your approval.</p></div>'
+            )
+            if not pending and not pending_profile_drafts:
+                st.caption("No memory or profile suggestions are waiting for review.")
+            for candidate in pending:
+                render_memory_candidate_summary(candidate)
+                if candidate.get("evidence_text"):
+                    st.caption(f"Supporting evidence: “{candidate['evidence_text']}”")
+                with st.container(horizontal=True):
+                    accept_label = {
+                        "ADD": "Approve",
+                        "UPDATE": "Approve update",
+                        "REVOKE": "Approve revoke",
+                        "CONFLICT": "Use new",
+                    }.get(candidate["operation"], "Approve")
+                    if st.button(
+                        accept_label,
+                        key=f"accept_memory_{candidate['candidate_id']}",
+                        icon=":material/check:",
+                    ):
+                        result = profile_repository.review_memory_candidate(
+                            user_id, candidate["candidate_id"], accept=True
+                        )
+                        if result and result.get("retrieval_index_status") == "failed":
+                            st.warning("Saved in SQL, but retrieval indexing needs retry.")
+                        st.rerun()
+                    if st.button(
+                        "Reject",
+                        key=f"reject_memory_{candidate['candidate_id']}",
+                        icon=":material/close:",
+                    ):
+                        profile_repository.review_memory_candidate(
+                            user_id, candidate["candidate_id"], accept=False
+                        )
+                        st.rerun()
+                    if candidate["operation"] == "CONFLICT" and st.button(
+                        "Keep existing",
+                        key=f"keep_existing_memory_{candidate['candidate_id']}",
+                    ):
+                        profile_repository.review_memory_candidate(
+                            user_id,
+                            candidate["candidate_id"],
+                            accept=False,
+                            conflict_resolution="keep_existing",
+                        )
+                        st.rerun()
+                    if candidate["operation"] == "CONFLICT" and st.button(
+                        "Keep both",
+                        key=f"keep_both_memory_{candidate['candidate_id']}",
+                    ):
+                        profile_repository.review_memory_candidate(
+                            user_id,
+                            candidate["candidate_id"],
+                            accept=True,
+                            conflict_resolution="keep_both",
+                        )
+                        st.rerun()
+            _render_pending_profile_updates(
+                user_id,
+                key_prefix="memory",
+                heading="#### Profile update suggestions",
+                drafts=profile_drafts,
+            )
+
+    with control_column:
+        with st.container(border=True, height="stretch"):
+            st.html(
+                """
+                <div class="ct-memory-section-header"><h2>Memory control</h2><p>How AI remembers you.</p></div>
+                <div class="ct-metadata">Memory preferences</div>
+                <ul class="ct-memory-control-list">
+                  <li><span class="ct-control-check">✓</span>Automatically suggest memories</li>
+                  <li><span class="ct-control-check">✓</span>Require approval before saving</li>
+                </ul>
+                <div class="ct-metadata">Remembered categories</div>
+                <ul class="ct-memory-control-list">
+                  <li><span class="ct-control-check">✓</span>Skills</li>
+                  <li><span class="ct-control-check">✓</span>Goals</li>
+                  <li><span class="ct-control-check">✓</span>Experiences</li>
+                  <li><span class="ct-control-check">✓</span>Preferences</li>
+                </ul>
+                """
+            )
+            if st.button(
+                "Manage memory settings",
+                icon=":material/settings:",
+                key="memory_settings_placeholder",
+                width="stretch",
+            ):
+                st.session_state.show_memory_settings_placeholder = True
+            if st.session_state.get("show_memory_settings_placeholder"):
+                st.info("Memory settings controls are planned; current approval safeguards remain active.")
 
 
 def _render_connections(user_id: str) -> None:
     with st.expander("People Search connections"):
+        render_assistant_section(
+            "My connections search sources",
+            "Optional private inputs. Public-source evidence remains required for external identity claims.",
+            eyebrow="People search",
+        )
         st.caption(
             "Optional private inputs. Public-source evidence is still required for "
             "external identity claims."
@@ -1104,7 +1180,7 @@ def _render_agent_activity(
     user_id: str, conversation_id: str | None
 ) -> None:
     with st.sidebar:
-        st.subheader("CareerTrace Status")
+        render_agent_activity_intro()
         if not conversation_id:
             st.caption("No activity yet for this conversation.")
             return
@@ -1196,7 +1272,7 @@ def _render_agent_results(user_id: str, conversation_id: str) -> None:
         verified = [item for item in live_jobs if item.get("hard_constraints_met")]
         unverified = [item for item in live_jobs if not item.get("hard_constraints_met")]
         if verified:
-            st.markdown("### Live results — matching requirements")
+            render_result_heading("Live results — matching requirements")
             for item in verified:
                 with st.container(border=True):
                     st.write(f"**{item.get('title') or 'unknown'} — {item.get('company') or 'unknown'}**")
@@ -1211,10 +1287,9 @@ def _render_agent_results(user_id: str, conversation_id: str) -> None:
                         f"Retrieved: {item.get('retrieved_at')}"
                     )
         if unverified:
-            st.markdown("### Live results — requirements not fully verified")
-            st.caption(
-                "These may come from an official source, but one or more requested "
-                "requirements were not stated. They do not count toward the matching total."
+            render_result_heading(
+                "Live results — requirements not fully verified",
+                "These may come from an official source, but one or more requested requirements were not stated. They do not count toward the matching total.",
             )
             for item in unverified:
                 link = primary_job_link(item)
@@ -1227,7 +1302,7 @@ def _render_agent_results(user_id: str, conversation_id: str) -> None:
                     f"{link_markdown}"
                 )
         if demo_jobs:
-            st.markdown("### Demo snapshot suggestions")
+            render_result_heading("Demo snapshot suggestions")
             st.warning(
                 "Historical public-source samples for judge testing. These are not "
                 "claimed to be currently open postings."
@@ -1242,7 +1317,7 @@ def _render_agent_results(user_id: str, conversation_id: str) -> None:
         live_people = [item for item in people if not item.get("is_demo_sample")]
         demo_people = [item for item in people if item.get("is_demo_sample")]
         if live_people:
-            st.markdown("### Live people results")
+            render_result_heading("Live people results")
             for item in live_people:
                 with st.container(border=True):
                     st.write(f"**{item.get('name')}** — {item.get('current_role') or 'role unknown'}")
@@ -1252,7 +1327,7 @@ def _render_agent_results(user_id: str, conversation_id: str) -> None:
                     st.write("Public contact: " + (", ".join(channel.get("value", "") for channel in public_channels) or "unavailable"))
                     st.link_button("Public source", item["public_source_url"])
         if demo_people:
-            st.markdown("### Demo snapshot suggestions")
+            render_result_heading("Demo snapshot suggestions")
             st.warning(
                 "Historical OpenAlex samples for judge testing. Current roles and "
                 "affiliations are not asserted."
@@ -1266,7 +1341,7 @@ def _render_agent_results(user_id: str, conversation_id: str) -> None:
 
     resume_drafts = profile_repository.list_resume_revision_drafts(user_id)
     if resume_drafts:
-        st.markdown("### Resume revision drafts")
+        render_result_heading("Resume revision drafts")
         for draft in resume_drafts:
             with st.expander(f"Draft / Not applied — {draft['summary']}"):
                 for change in draft["changes"]:
@@ -1278,7 +1353,7 @@ def _render_agent_results(user_id: str, conversation_id: str) -> None:
                         st.warning(warning)
     outreach_drafts = profile_repository.list_outreach_drafts(user_id)
     if outreach_drafts:
-        st.markdown("### Outreach drafts")
+        render_result_heading("Outreach drafts")
         for draft in outreach_drafts:
             with st.expander(f"{draft['status'].title()} / {'Sent' if draft['sent_at'] else 'Not sent'} — {draft['recipient_name']}"):
                 st.text_input("Subject", value=draft["subject"], disabled=True, key=f"draft_subject_{draft['draft_id']}")
@@ -1296,15 +1371,13 @@ def _render_agent_results(user_id: str, conversation_id: str) -> None:
 
 
 def _render_career_assistant(user_id: str) -> None:
-    st.subheader("Career Assistant")
-    st.caption(
-        "Conversations are stored in SQL. Chat does not automatically change "
-        "your profile or memory."
-    )
-    _render_connections(user_id)
+    render_assistant_header()
     conversations = profile_repository.list_conversations(user_id)
-    st.markdown("### Previous Conversations")
-    if st.button("New conversation", icon=":material/add:"):
+    render_assistant_section(
+        "Previous Conversations",
+        "Start a new thread or continue a saved conversation with your career context.",
+    )
+    if st.button("New conversation", icon=":material/add:", type="primary"):
         previous_id = st.session_state.get("active_conversation_id")
         if previous_id:
             try:
@@ -1321,6 +1394,7 @@ def _render_career_assistant(user_id: str) -> None:
         st.rerun()
 
     if not conversations:
+        _render_connections(user_id)
         _render_agent_activity(user_id, None)
         st.info("Create a conversation to start chatting.")
         return
@@ -1367,8 +1441,8 @@ def _render_career_assistant(user_id: str) -> None:
                     st.rerun()
                 except ValueError as error:
                     st.error(str(error))
+    _render_connections(user_id)
     _render_agent_activity(user_id, active_id)
-    _render_agent_results(user_id, active_id)
     conversation = profile_repository.get_conversation(user_id, active_id)
     starred = {
         item["assistant_message_id"]: item
@@ -1394,6 +1468,8 @@ def _render_career_assistant(user_id: str) -> None:
                         )
                     st.rerun()
 
+    _render_agent_results(user_id, active_id)
+
     prompt = st.chat_input("Ask CareerTrace about your career")
     if prompt:
         try:
@@ -1417,31 +1493,37 @@ def _render_career_assistant(user_id: str) -> None:
 
 
 def main() -> None:
-    st.set_page_config(page_title="CareerTrace AI", page_icon="🧭", layout="wide")
+    st.set_page_config(
+        page_title="CareerTrace AI",
+        page_icon=":material/explore:",
+        layout="wide",
+        initial_sidebar_state="expanded",
+    )
+    load_theme()
     init_db()
 
-    current_user = require_authenticated_user()
+    current_user = require_authenticated_user(render_sidebar=False)
     if current_user is None:
         return
     user_id = current_user["user_id"]
     is_demo = current_user.get("is_demo") is True
 
-    st.title("CareerTrace AI")
-    st.caption("Persistent career profile management with bounded AI reasoning")
     if is_demo:
-        st.warning("Demo workspace — uses synthetic data")
-    documents_tab, profile_tab, starred_tab, memory_tab, assistant_tab = st.tabs(
-        TOP_LEVEL_PAGE_LABELS
-    )
-    with documents_tab:
+        st.info("Demo workspace — uses your isolated judge data.", icon=":material/science:")
+
+    selected_page = render_sidebar_navigation()
+    render_account_sidebar(current_user)
+    if selected_page == "Dashboard":
+        _render_dashboard(user_id)
+    elif selected_page == "Documents":
         _render_documents_page(user_id, is_demo=is_demo)
-    with profile_tab:
+    elif selected_page == "My profile":
         _render_profile(user_id)
-    with starred_tab:
+    elif selected_page == "Starred Q&A":
         _render_starred_qa(user_id)
-    with memory_tab:
+    elif selected_page == "Memory Universe":
         _render_memory(user_id)
-    with assistant_tab:
+    elif selected_page == "Career Assistant":
         _render_career_assistant(user_id)
 
 

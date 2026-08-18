@@ -214,6 +214,8 @@ def _render_recovery_code_once() -> None:
 
 def require_authenticated_user(
     repository: ProfileRepository = profile_repository,
+    *,
+    render_sidebar: bool = True,
 ) -> dict[str, Any] | None:
     """Resolve Google or fixed judge identity without accepting URL user IDs."""
 
@@ -244,7 +246,8 @@ def require_authenticated_user(
 
         set_active_identity(st.session_state, user, "google")
         _recover_pending_once(user, repository)
-        _render_account_sidebar(user, "google", repository)
+        if render_sidebar:
+            _render_account_sidebar(user, "google", repository)
         return user
 
     if st.session_state.get("auth_mode") == "judge":
@@ -259,12 +262,23 @@ def require_authenticated_user(
         set_active_identity(st.session_state, user, "judge")
         _recover_pending_once(user, repository)
         _render_recovery_code_once()
-        _render_account_sidebar(user, "judge", repository)
+        if render_sidebar:
+            _render_account_sidebar(user, "judge", repository)
         return user
 
     clear_auth_state(st.session_state, preserve_judge_login=True)
     _render_login_page(repository, google_client_id, google_error)
     return None
+
+
+def render_account_sidebar(
+    user: dict[str, Any],
+    repository: ProfileRepository = profile_repository,
+) -> None:
+    """Render account controls after the product navigation has been composed."""
+
+    mode = "judge" if user.get("is_demo") is True else "google"
+    _render_account_sidebar(user, mode, repository)
 
 
 def _recover_pending_once(
