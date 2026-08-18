@@ -20,6 +20,17 @@ def _offline(_kind):
     raise RuntimeError("offline")
 
 
+class _StaticExtractionModel:
+    def __init__(self, proposals):
+        self.proposals = proposals
+
+    def with_structured_output(self, _schema):
+        return self
+
+    def invoke(self, _messages):
+        return {"proposals": self.proposals}
+
+
 @pytest.fixture
 def workspace():
     engine = create_database_engine("sqlite://")
@@ -166,6 +177,88 @@ def test_logout_marks_pending_without_blocking_on_extraction(workspace):
     assert state["pending"] is True
 
 
+def test_boundary_creates_extraction_state_without_regex_signals(workspace):
+    repository, user, _, conversation = workspace
+    text = "Rust has become central to my toolkit."
+    assert detect_memory_signals(text) == []
+    message = repository.add_message(
+        user["user_id"], conversation["conversation_id"], "user", text
+    )
+
+    state = trigger_conversation_boundary(
+        user["user_id"],
+        conversation["conversation_id"],
+        process_now=False,
+        repository=repository,
+    )
+
+    assert state["pending"] is True
+    assert state["pending_boundary_message_id"] == message["message_id"]
+
+
+def test_natural_unmatched_turn_can_create_all_review_candidate_types(workspace):
+    repository, user, _, conversation = workspace
+    text = (
+        "Rust has become central to my toolkit. "
+        "Remote-first teams suit how I work. "
+        "Applying for machine learning internships next semester is my plan."
+    )
+    assert detect_memory_signals(text) == []
+    message = repository.add_message(
+        user["user_id"], conversation["conversation_id"], "user", text
+    )
+
+    def proposal(destination, evidence, **values):
+        start = text.index(evidence)
+        return {
+            "destination": destination,
+            "source_message_id": message["message_id"],
+            "evidence_text": evidence,
+            "evidence_start": start,
+            "evidence_end": start + len(evidence),
+            "self_referential": True,
+            "confidence": 0.9,
+            **values,
+        }
+
+    proposals = [
+        proposal(
+            "profile",
+            "Rust has become central to my toolkit.",
+            profile_field="skills",
+            value=["Rust"],
+        ),
+        proposal(
+            "semantic_memory",
+            "Remote-first teams suit how I work.",
+            semantic_group="work_style",
+            topic_key="work_mode",
+            value="remote-first teams",
+        ),
+        proposal(
+            "episodic_memory",
+            "Applying for machine learning internships next semester is my plan.",
+            content="Apply for machine learning internships next semester",
+            event_status="planned",
+        ),
+    ]
+    model = _StaticExtractionModel(proposals)
+
+    result = trigger_conversation_boundary(
+        user["user_id"],
+        conversation["conversation_id"],
+        process_now=True,
+        repository=repository,
+        model_factory=lambda _kind: model,
+    )
+
+    assert result["status"] == "completed"
+    drafts = repository.list_profile_revision_drafts(user["user_id"])
+    assert drafts[0]["changes"][0]["field_key"] == "skills"
+    candidates = _pending(repository, user["user_id"])
+    assert {item["memory_kind"] for item in candidates} == {"semantic", "episodic"}
+
+
 def test_next_login_recovers_pending_extraction(workspace):
     repository, user, _, conversation = workspace
     _signal_message(repository, user["user_id"], conversation["conversation_id"], "I also know Rust.")
@@ -182,6 +275,10 @@ def test_extraction_watermark_prevents_duplicate_candidates(workspace):
     repository.mark_conversation_extraction_pending(user["user_id"], conversation["conversation_id"])
     ConversationMemoryExtractor(repository, _offline).extract(user["user_id"], conversation["conversation_id"])
     assert len(repository.list_memory_candidates(user["user_id"])) == count
+    state = repository.get_conversation_memory_state(
+        user["user_id"], conversation["conversation_id"]
+    )
+    assert state["pending"] is False
 
 
 def test_failed_extraction_does_not_advance_watermark(workspace):

@@ -1372,8 +1372,6 @@ class ProfileRepository(AgentRepositoryMixin):
         with session_scope(self.session_factory) as session:
             conversation = self._owned_conversation(session, user_id, conversation_id)
             state = session.get(ConversationMemoryState, conversation_id)
-            if state is None:
-                return None
             messages = sorted(conversation.messages, key=lambda item: item.created_at)
             boundary = (
                 next((item for item in messages if item.message_id == boundary_message_id), None)
@@ -1381,6 +1379,15 @@ class ProfileRepository(AgentRepositoryMixin):
                 else (messages[-1] if messages else None)
             )
             if boundary is None:
+                return self._conversation_memory_state_dict(state) if state else None
+            if state is None:
+                state = ConversationMemoryState(
+                    user_id=user_id,
+                    conversation_id=conversation_id,
+                )
+                session.add(state)
+            if state.last_memory_extraction_message_id == boundary.message_id:
+                session.flush()
                 return self._conversation_memory_state_dict(state)
             state.pending = True
             state.pending_boundary_message_id = boundary.message_id
